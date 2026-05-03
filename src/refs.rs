@@ -1,7 +1,15 @@
-// Ref read/write/resolve. Real implementation lands in Phase 3a.
+// Ref read/write/resolve.
+//
+// On-disk layout under `<repo>/.gyt/`:
+//   HEAD                                 -- "ref: refs/heads/<name>\n" or "blake3:<hex>\n"
+//   refs/heads/<name>                    -- "<hex>\n"
+//   refs/tags/<name>                     -- "<hex>\n"
+//   refs/remotes/<remote>/<name>         -- "<hex>\n"
 
-use crate::errors::Result;
-use crate::hash::ObjectId;
+use crate::errors::{GytError, Result};
+use crate::fs_util;
+use crate::hash::{HEX_LEN, ObjectId};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub enum Head {
@@ -9,18 +17,348 @@ pub enum Head {
     Detached(ObjectId),
 }
 
-pub fn read_head(_repo: &std::path::Path) -> Result<Head> {
-    unimplemented!("phase 3a")
+const HEAD_REF_PREFIX: &str = "ref: ";
+const HEAD_DETACHED_PREFIX: &str = "blake3:";
+
+fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(GytError::Refs("empty ref name".into()));
+    }
+    if name.starts_with('/') {
+        return Err(GytError::Refs(format!(
+            "ref name must not start with '/': {name:?}"
+        )));
+    }
+    if name.ends_with('/') {
+        return Err(GytError::Refs(format!(
+            "ref name must not end with '/': {name:?}"
+        )));
+    }
+    for comp in name.split('/') {
+        if comp.is_empty() {
+            return Err(GytError::Refs(format!(
+                "ref name has empty component: {name:?}"
+            )));
+        }
+        if comp == ".." || comp == "." {
+            return Err(GytError::Refs(format!(
+                "ref name has '..' or '.' component: {name:?}"
+            )));
+        }
+        if comp.contains('\0') {
+            return Err(GytError::Refs(format!("ref name contains NUL: {name:?}")));
+        }
+    }
+    if name.contains("..") {
+        return Err(GytError::Refs(format!("ref name contains '..': {name:?}")));
+    }
+    Ok(())
 }
 
-pub fn write_head(_repo: &std::path::Path, _head: &Head) -> Result<()> {
-    unimplemented!("phase 3a")
+fn ref_path(repo_gyt_dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_ref_name(name)?;
+    Ok(repo_gyt_dir.join(name))
 }
 
-pub fn read_ref(_repo: &std::path::Path, _name: &str) -> Result<ObjectId> {
-    unimplemented!("phase 3a")
+pub fn read_head(repo_gyt_dir: &Path) -> Result<Head> {
+    let p = repo_gyt_dir.join("HEAD");
+    if !p.exists() {
+        return Err(GytError::Refs(format!("HEAD not found at {}", p.display())));
+    }
+    let bytes = fs_util::read_all(&p)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| GytError::Refs("HEAD is not valid utf-8".into()))?;
+    let line = text.trim_end_matches(['\n', '\r']);
+
+    if let Some(rest) = line.strip_prefix(HEAD_REF_PREFIX) {
+        let target = rest.trim();
+        validate_ref_name(target)?;
+        return Ok(Head::Symbolic(target.to_string()));
+    }
+    if let Some(rest) = line.strip_prefix(HEAD_DETACHED_PREFIX) {
+        let hex = rest.trim();
+        if hex.len() != HEX_LEN {
+            return Err(GytError::Refs(format!(
+                "HEAD detached hash has wrong length: {}",
+                hex.len()
+            )));
+        }
+        let id = ObjectId::from_hex(hex)
+            .map_err(|e| GytError::Refs(format!("HEAD detached hash invalid: {e}")))?;
+        return Ok(Head::Detached(id));
+    }
+    Err(GytError::Refs(format!("malformed HEAD: {line:?}")))
 }
 
-pub fn write_ref(_repo: &std::path::Path, _name: &str, _id: &ObjectId) -> Result<()> {
-    unimplemented!("phase 3a")
+pub fn write_head(repo_gyt_dir: &Path, head: &Head) -> Result<()> {
+    let p = repo_gyt_dir.join("HEAD");
+    let body = match head {
+        Head::Symbolic(name) => {
+            validate_ref_name(name)?;
+            format!("{HEAD_REF_PREFIX}{name}\n")
+        }
+        Head::Detached(id) => format!("{HEAD_DETACHED_PREFIX}{}\n", id.to_hex()),
+    };
+    fs_util::atomic_write(&p, body.as_bytes())
+}
+
+pub fn read_ref(repo_gyt_dir: &Path, name: &str) -> Result<ObjectId> {
+    let p = ref_path(repo_gyt_dir, name)?;
+    if !p.exists() {
+        return Err(GytError::Refs(format!("ref {name} not found")));
+    }
+    let bytes = fs_util::read_all(&p)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| GytError::Refs(format!("ref {name} is not valid utf-8")))?;
+    let hex = text.trim();
+    if hex.len() != HEX_LEN {
+        return Err(GytError::Refs(format!(
+            "ref {name} hash has wrong length: {}",
+            hex.len()
+        )));
+    }
+    ObjectId::from_hex(hex).map_err(|e| GytError::Refs(format!("ref {name} parse error: {e}")))
+}
+
+pub fn write_ref(repo_gyt_dir: &Path, name: &str, id: &ObjectId) -> Result<()> {
+    let p = ref_path(repo_gyt_dir, name)?;
+    let body = format!("{}\n", id.to_hex());
+    fs_util::atomic_write(&p, body.as_bytes())
+}
+
+pub fn delete_ref(repo_gyt_dir: &Path, name: &str) -> Result<()> {
+    let p = ref_path(repo_gyt_dir, name)?;
+    if !p.exists() {
+        return Err(GytError::Refs(format!("ref {name} not found")));
+    }
+    std::fs::remove_file(&p)?;
+    Ok(())
+}
+
+pub fn list_refs(repo_gyt_dir: &Path, prefix: &str) -> Result<Vec<(String, ObjectId)>> {
+    validate_ref_name(prefix)?;
+    let root = repo_gyt_dir.join(prefix);
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    walk(&root, prefix, repo_gyt_dir, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn walk(
+    dir: &Path,
+    _prefix: &str,
+    repo_gyt_dir: &Path,
+    out: &mut Vec<(String, ObjectId)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            walk(&path, _prefix, repo_gyt_dir, out)?;
+        } else if ft.is_file() {
+            // Reconstruct ref name from path relative to repo_gyt_dir.
+            let rel = path.strip_prefix(repo_gyt_dir).map_err(|_| {
+                GytError::Refs(format!(
+                    "ref path {} not under repo {}",
+                    path.display(),
+                    repo_gyt_dir.display()
+                ))
+            })?;
+            // Convert to forward-slash string.
+            let name = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let id = read_ref(repo_gyt_dir, &name)?;
+            out.push((name, id));
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve(repo_gyt_dir: &Path, head: &Head) -> Result<Option<ObjectId>> {
+    match head {
+        Head::Detached(id) => Ok(Some(*id)),
+        Head::Symbolic(name) => {
+            let p = ref_path(repo_gyt_dir, name)?;
+            if !p.exists() {
+                return Ok(None);
+            }
+            Ok(Some(read_ref(repo_gyt_dir, name)?))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash::HASH_LEN;
+
+    fn dummy_id(byte: u8) -> ObjectId {
+        ObjectId([byte; HASH_LEN])
+    }
+
+    fn setup() -> (tempdir::Dir, PathBuf) {
+        let t = tempdir::Dir::new("gyt-refs");
+        let gyt = t.path().join(".gyt");
+        std::fs::create_dir_all(gyt.join("refs/heads")).unwrap();
+        std::fs::create_dir_all(gyt.join("refs/tags")).unwrap();
+        std::fs::create_dir_all(gyt.join("refs/remotes")).unwrap();
+        (t, gyt)
+    }
+
+    #[test]
+    fn head_round_trip_symbolic() {
+        let (_t, gyt) = setup();
+        write_head(&gyt, &Head::Symbolic("refs/heads/main".into())).unwrap();
+        match read_head(&gyt).unwrap() {
+            Head::Symbolic(s) => assert_eq!(s, "refs/heads/main"),
+            other => panic!("expected symbolic, got {other:?}"),
+        }
+        // Verify file content exactly.
+        let body = std::fs::read_to_string(gyt.join("HEAD")).unwrap();
+        assert_eq!(body, "ref: refs/heads/main\n");
+    }
+
+    #[test]
+    fn head_round_trip_detached() {
+        let (_t, gyt) = setup();
+        let id = dummy_id(0xab);
+        write_head(&gyt, &Head::Detached(id)).unwrap();
+        match read_head(&gyt).unwrap() {
+            Head::Detached(got) => assert_eq!(got, id),
+            other => panic!("expected detached, got {other:?}"),
+        }
+        let body = std::fs::read_to_string(gyt.join("HEAD")).unwrap();
+        assert_eq!(body, format!("blake3:{}\n", id.to_hex()));
+    }
+
+    #[test]
+    fn unborn_head_resolves_to_none() {
+        let (_t, gyt) = setup();
+        write_head(&gyt, &Head::Symbolic("refs/heads/main".into())).unwrap();
+        let head = read_head(&gyt).unwrap();
+        let resolved = resolve(&gyt, &head).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn read_write_branch_ref() {
+        let (_t, gyt) = setup();
+        let id = dummy_id(0x42);
+        write_ref(&gyt, "refs/heads/main", &id).unwrap();
+        let got = read_ref(&gyt, "refs/heads/main").unwrap();
+        assert_eq!(got, id);
+        // Resolve via symbolic HEAD.
+        write_head(&gyt, &Head::Symbolic("refs/heads/main".into())).unwrap();
+        let head = read_head(&gyt).unwrap();
+        assert_eq!(resolve(&gyt, &head).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn list_refs_returns_branches() {
+        let (_t, gyt) = setup();
+        write_ref(&gyt, "refs/heads/main", &dummy_id(1)).unwrap();
+        write_ref(&gyt, "refs/heads/feature", &dummy_id(2)).unwrap();
+        write_ref(&gyt, "refs/heads/nested/topic", &dummy_id(3)).unwrap();
+        write_ref(&gyt, "refs/tags/v1", &dummy_id(4)).unwrap();
+
+        let heads = list_refs(&gyt, "refs/heads").unwrap();
+        let names: Vec<&str> = heads.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "refs/heads/feature",
+                "refs/heads/main",
+                "refs/heads/nested/topic"
+            ]
+        );
+        // Sanity: contents match.
+        assert_eq!(
+            heads
+                .iter()
+                .find(|(n, _)| n == "refs/heads/feature")
+                .unwrap()
+                .1,
+            dummy_id(2)
+        );
+    }
+
+    #[test]
+    fn delete_ref_removes_file() {
+        let (_t, gyt) = setup();
+        write_ref(&gyt, "refs/heads/tmp", &dummy_id(5)).unwrap();
+        assert!(gyt.join("refs/heads/tmp").exists());
+        delete_ref(&gyt, "refs/heads/tmp").unwrap();
+        assert!(!gyt.join("refs/heads/tmp").exists());
+        // Deleting again is an error.
+        assert!(delete_ref(&gyt, "refs/heads/tmp").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_ref_name() {
+        let (_t, gyt) = setup();
+        let id = dummy_id(0);
+        // Empty.
+        assert!(write_ref(&gyt, "", &id).is_err());
+        // Leading slash.
+        assert!(write_ref(&gyt, "/refs/heads/main", &id).is_err());
+        // ".." component.
+        assert!(write_ref(&gyt, "refs/../heads/main", &id).is_err());
+        // Empty component.
+        assert!(write_ref(&gyt, "refs//heads/main", &id).is_err());
+        // Trailing slash.
+        assert!(write_ref(&gyt, "refs/heads/", &id).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_head() {
+        let (_t, gyt) = setup();
+        std::fs::write(gyt.join("HEAD"), b"garbage\n").unwrap();
+        let err = read_head(&gyt).unwrap_err();
+        match err {
+            GytError::Refs(_) => {}
+            other => panic!("expected Refs error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_head_missing_is_error() {
+        let (_t, gyt) = setup();
+        // No HEAD written.
+        assert!(read_head(&gyt).is_err());
+    }
+
+    mod tempdir {
+        use std::path::{Path, PathBuf};
+
+        pub struct Dir(PathBuf);
+
+        impl Dir {
+            pub fn new(prefix: &str) -> Self {
+                let pid = std::process::id();
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
+                std::fs::create_dir_all(&p).unwrap();
+                Self(p)
+            }
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
 }
