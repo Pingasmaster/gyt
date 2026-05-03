@@ -16,4 +16,5 @@ pub mod stash;
 pub mod status;
 pub mod switch;
 pub mod tag;
+pub mod util;
 pub mod worktree;
