@@ -21,3 +21,14 @@ pub fn paint(color: &str, s: &str) -> String {
         s.to_string()
     }
 }
+
+/// Like `paint`, but with the color decision made by the caller.
+/// Lets the caller compute `use_color()` once and pass the result to many
+/// `paint_when` invocations without re-checking the terminal each time.
+pub fn paint_when(use_color: bool, color: &str, s: &str) -> String {
+    if use_color {
+        format!("{color}{s}{RESET}")
+    } else {
+        s.to_string()
+    }
+}
