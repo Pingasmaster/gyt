@@ -7,6 +7,7 @@
 mod cli;
 mod cmd;
 mod compress;
+mod config;
 mod diff;
 mod errors;
 mod fs_util;
