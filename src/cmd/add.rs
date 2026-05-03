@@ -1,5 +1,248 @@
 use crate::errors::{GytError, Result};
+use crate::ignore::IgnoreSet;
+use crate::index::{Index, IndexEntry};
+use crate::object::blob;
+use crate::repo::Repo;
+use crate::workdir::{self, WorkdirEntry};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-pub fn run(_args: &[String]) -> Result<()> {
-    Err(GytError::Unsupported("add: not yet implemented".into()))
+pub fn run(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Err(GytError::InvalidArgument(
+            "add: at least one path required".into(),
+        ));
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "gyt add <path>...\n\nStage files into the index. Use `.` to stage all non-ignored files."
+                );
+                return Ok(());
+            }
+            other if other.starts_with('-') => {
+                return Err(GytError::InvalidArgument(format!(
+                    "add: unknown flag {other}"
+                )));
+            }
+            other => paths.push(other.to_string()),
+        }
+    }
+
+    let cwd = std::env::current_dir()?;
+    let repo = Repo::open(&cwd)?;
+    let workdir = repo.workdir.clone();
+    let ignore = IgnoreSet::load_from_root(&workdir)?;
+    let mut index = Index::read(&repo.index_path())?;
+
+    let mut staged: Vec<PathBuf> = Vec::new();
+
+    for arg in &paths {
+        if arg == "." {
+            // Walk the entire workdir, excluding ignored.
+            let entries = workdir::walk(&workdir, &ignore)?;
+            for ent in entries {
+                stage_one(&repo, &workdir, &ent, &mut index, &mut staged)?;
+            }
+            continue;
+        }
+
+        // Resolve relative to cwd, then relative to workdir.
+        let arg_path = Path::new(arg);
+        let abs = if arg_path.is_absolute() {
+            arg_path.to_path_buf()
+        } else {
+            cwd.join(arg_path)
+        };
+        if !abs.exists() {
+            return Err(GytError::NotFound(format!("path {arg}")));
+        }
+        let abs = abs.canonicalize()?;
+        let rel = abs.strip_prefix(&workdir).map_err(|_| {
+            GytError::InvalidArgument(format!("path {arg} is outside the repository"))
+        })?;
+
+        let md = fs::symlink_metadata(&abs)?;
+        if md.is_dir() {
+            // Walk this subtree and stage all non-ignored files.
+            let entries = workdir::walk(&workdir, &ignore)?;
+            let rel_string = forward_slash(rel);
+            for ent in entries {
+                let p = forward_slash(&ent.path);
+                let in_subtree = if rel_string.is_empty() {
+                    true
+                } else {
+                    p == rel_string || p.starts_with(&format!("{rel_string}/"))
+                };
+                if in_subtree {
+                    stage_one(&repo, &workdir, &ent, &mut index, &mut staged)?;
+                }
+            }
+        } else {
+            // Single file/symlink. Skip if ignored.
+            let rel_str = forward_slash(rel);
+            if ignore.matched(&rel_str, false) {
+                continue;
+            }
+            let mode = mode_for(&md);
+            let ent = WorkdirEntry {
+                path: rel.to_path_buf(),
+                is_dir: false,
+                mode,
+            };
+            stage_one(&repo, &workdir, &ent, &mut index, &mut staged)?;
+        }
+    }
+
+    index.write(&repo.index_path())?;
+
+    for p in &staged {
+        println!("added: {}", forward_slash(p));
+    }
+
+    Ok(())
+}
+
+fn forward_slash(p: &Path) -> String {
+    let mut s = String::new();
+    let mut first = true;
+    for comp in p.components() {
+        let part = comp.as_os_str().to_string_lossy();
+        if !first {
+            s.push('/');
+        }
+        first = false;
+        s.push_str(part.as_ref());
+    }
+    s
+}
+
+const MODE_REGULAR: u32 = 0o100644;
+const MODE_EXEC: u32 = 0o100755;
+const MODE_SYMLINK: u32 = 0o120000;
+
+fn mode_for(meta: &fs::Metadata) -> u32 {
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return MODE_SYMLINK;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = meta.permissions().mode();
+        if perm & 0o111 != 0 {
+            return MODE_EXEC;
+        }
+    }
+    MODE_REGULAR
+}
+
+fn stage_one(
+    repo: &Repo,
+    workdir: &Path,
+    ent: &WorkdirEntry,
+    index: &mut Index,
+    staged: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if ent.is_dir {
+        return Ok(());
+    }
+    let abs = workdir.join(&ent.path);
+    let md = fs::symlink_metadata(&abs)?;
+
+    let hash = if md.file_type().is_symlink() {
+        // Hash the link target as a blob.
+        let target = fs::read_link(&abs)?;
+        let bytes = target.to_string_lossy().into_owned().into_bytes();
+        blob::write(&repo.objects_dir(), &bytes)?
+    } else {
+        let bytes = fs::read(&abs)?;
+        blob::write(&repo.objects_dir(), &bytes)?
+    };
+
+    let (mtime_secs, ctime_secs) = times(&md);
+    let entry = IndexEntry {
+        ctime_secs,
+        mtime_secs,
+        size: md.len(),
+        mode: ent.mode,
+        hash,
+        path: ent.path.clone(),
+    };
+
+    let changed = match index.find(&ent.path) {
+        Some(existing) => existing.hash != entry.hash || existing.mode != entry.mode,
+        None => true,
+    };
+    index.insert(entry);
+    if changed {
+        staged.push(ent.path.clone());
+    }
+    Ok(())
+}
+
+fn times(md: &fs::Metadata) -> (i64, i64) {
+    use std::time::UNIX_EPOCH;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ctime = {
+        use std::os::unix::fs::MetadataExt;
+        md.ctime()
+    };
+    #[cfg(not(unix))]
+    let ctime = mtime;
+    (mtime, ctime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::util::test_helpers::{lock, tmp_dir};
+
+    #[test]
+    fn add_dot_stages_all_files() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-add-dot");
+        crate::cmd::init::init_at(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/b.txt"), b"world").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&[".".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let idx = Index::read(&repo.index_path()).unwrap();
+        let paths: Vec<String> = idx.entries.iter().map(|e| forward_slash(&e.path)).collect();
+        assert!(paths.contains(&"a.txt".to_string()));
+        assert!(paths.contains(&"sub/b.txt".to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_specific_file() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-add-specific");
+        crate::cmd::init::init_at(&dir).unwrap();
+        fs::write(dir.join("only.txt"), b"yo").unwrap();
+        fs::write(dir.join("other.txt"), b"nope").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["only.txt".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let idx = Index::read(&repo.index_path()).unwrap();
+        assert_eq!(idx.entries.len(), 1);
+        assert_eq!(forward_slash(&idx.entries[0].path), "only.txt");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
