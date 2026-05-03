@@ -15,6 +15,7 @@ mod index;
 mod net;
 mod object;
 mod refs;
+mod repo;
 mod term;
 mod workdir;
 

@@ -44,3 +44,11 @@ pub struct Object {
     pub kind: ObjectKind,
     pub payload: Vec<u8>,
 }
+
+impl Object {
+    pub fn new(kind: ObjectKind, payload: Vec<u8>) -> Self {
+        let raw = store::build_raw(kind, &payload);
+        let id = crate::hash::hash_bytes(&raw);
+        Self { id, kind, payload }
+    }
+}
