@@ -1,13 +1,19 @@
-// Commit object format (utf-8 text):
-//   tree <hex>
-//   parent <hex>           (zero or more lines)
-//   author <name> <email> <unix-secs> <tz-offset>
-//   committer <name> <email> <unix-secs> <tz-offset>
+// Commit object format (utf-8 text). Header is line-based; message follows
+// a single blank line.
+//
+//   tree     <hex>
+//   parent   <hex>                                       0+ lines
+//   author   <name> <email> <unix-secs> <tz-offset>      1+ lines (multi-author)
+//   committer <name> <email> <unix-secs> <tz-offset>     exactly 1
+//   ai       <model-or-tool-id>                          0+ lines
+//   reviewer <name> <email>                              0+ lines
 //   <blank line>
 //   <message bytes>
 //
-// We keep the line shape close to git's so the structure is familiar,
-// but hashes are 64-char BLAKE3 hex.
+// `ai` records that an AI assistant materially contributed to the change;
+// the value is a free-form identifier (e.g. "claude-opus-4-7" or "auto:rustfmt").
+// Empty list means no AI assistance applied.
+// `reviewer` records human reviewers who signed off before the commit landed.
 
 use crate::errors::{GytError, Result};
 use crate::hash::{HEX_LEN, ObjectId};
@@ -18,9 +24,17 @@ use std::path::Path;
 pub struct Commit {
     pub tree: ObjectId,
     pub parents: Vec<ObjectId>,
-    pub author: String,
+    pub authors: Vec<String>,
     pub committer: String,
+    pub ai_assists: Vec<String>,
+    pub reviewers: Vec<String>,
     pub message: String,
+}
+
+impl Commit {
+    pub fn primary_author(&self) -> &str {
+        self.authors.first().map(String::as_str).unwrap_or("")
+    }
 }
 
 pub fn encode(c: &Commit) -> Vec<u8> {
@@ -29,8 +43,16 @@ pub fn encode(c: &Commit) -> Vec<u8> {
     for p in &c.parents {
         s.push_str(&format!("parent {p}\n"));
     }
-    s.push_str(&format!("author {}\n", c.author));
+    for a in &c.authors {
+        s.push_str(&format!("author {a}\n"));
+    }
     s.push_str(&format!("committer {}\n", c.committer));
+    for ai in &c.ai_assists {
+        s.push_str(&format!("ai {ai}\n"));
+    }
+    for r in &c.reviewers {
+        s.push_str(&format!("reviewer {r}\n"));
+    }
     s.push('\n');
     s.push_str(&c.message);
     s.into_bytes()
@@ -44,8 +66,10 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
         .ok_or_else(|| GytError::Object("commit: missing blank line before message".into()))?;
     let mut tree: Option<ObjectId> = None;
     let mut parents = Vec::new();
-    let mut author: Option<String> = None;
+    let mut authors = Vec::new();
     let mut committer: Option<String> = None;
+    let mut ai_assists = Vec::new();
+    let mut reviewers = Vec::new();
     for line in header.lines() {
         if let Some(rest) = line.strip_prefix("tree ") {
             if rest.len() != HEX_LEN {
@@ -55,18 +79,30 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
         } else if let Some(rest) = line.strip_prefix("parent ") {
             parents.push(ObjectId::from_hex(rest)?);
         } else if let Some(rest) = line.strip_prefix("author ") {
-            author = Some(rest.to_string());
+            authors.push(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("committer ") {
+            if committer.is_some() {
+                return Err(GytError::Object("commit: multiple committer lines".into()));
+            }
             committer = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("ai ") {
+            ai_assists.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("reviewer ") {
+            reviewers.push(rest.to_string());
         } else {
             return Err(GytError::Object(format!("commit: unknown line {line:?}")));
         }
     }
+    if authors.is_empty() {
+        return Err(GytError::Object("commit: missing author".into()));
+    }
     Ok(Commit {
         tree: tree.ok_or_else(|| GytError::Object("commit: missing tree".into()))?,
         parents,
-        author: author.ok_or_else(|| GytError::Object("commit: missing author".into()))?,
+        authors,
         committer: committer.ok_or_else(|| GytError::Object("commit: missing committer".into()))?,
+        ai_assists,
+        reviewers,
         message: message.to_string(),
     })
 }
@@ -91,30 +127,54 @@ mod tests {
     use super::*;
     use crate::hash;
 
+    fn make(authors: Vec<&str>) -> Commit {
+        Commit {
+            tree: hash::hash_bytes(b"t"),
+            parents: vec![],
+            authors: authors.into_iter().map(String::from).collect(),
+            committer: "Alice <a@x> 1700000000 +0000".into(),
+            ai_assists: vec![],
+            reviewers: vec![],
+            message: "msg".into(),
+        }
+    }
+
     #[test]
-    fn round_trip_commit() {
+    fn round_trip_commit_minimal() {
+        let c = make(vec!["Alice <a@x> 1700000000 +0000"]);
+        assert_eq!(decode(&encode(&c)).unwrap(), c);
+    }
+
+    #[test]
+    fn round_trip_commit_with_parents_authors_ai_reviewers() {
         let c = Commit {
             tree: hash::hash_bytes(b"t"),
             parents: vec![hash::hash_bytes(b"p1"), hash::hash_bytes(b"p2")],
-            author: "Alice <a@x> 1700000000 +0000".into(),
+            authors: vec![
+                "Alice <a@x> 1700000000 +0000".into(),
+                "Bob <b@x> 1700000000 +0000".into(),
+            ],
             committer: "Alice <a@x> 1700000000 +0000".into(),
+            ai_assists: vec!["claude-opus-4-7".into(), "auto:rustfmt".into()],
+            reviewers: vec!["Carol <c@x>".into()],
             message: "init\n\nbody line\n".into(),
         };
-        let bytes = encode(&c);
-        assert_eq!(decode(&bytes).unwrap(), c);
+        assert_eq!(decode(&encode(&c)).unwrap(), c);
     }
 
     #[test]
     fn root_commit_has_no_parents() {
-        let c = Commit {
-            tree: hash::hash_bytes(b"t"),
-            parents: vec![],
-            author: "A <a@x> 1 +0000".into(),
-            committer: "A <a@x> 1 +0000".into(),
-            message: "first".into(),
-        };
+        let c = make(vec!["A <a@x> 1 +0000"]);
         let back = decode(&encode(&c)).unwrap();
         assert!(back.parents.is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_author() {
+        let bytes =
+            b"tree 0000000000000000000000000000000000000000000000000000000000000000\ncommitter A <a@x> 1 +0000\n\nm".to_vec();
+        // tree hex length is correct, but no author lines -> reject
+        assert!(decode(&bytes).is_err());
     }
 
     #[test]
