@@ -41,7 +41,7 @@ pub fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
 pub fn resolve_tree(repo: &Repo, rev: &str) -> Result<ObjectId> {
     let mut id = resolve_rev(repo, rev)?;
     loop {
-        let obj = store::read(&repo.objects_dir(), &id)?;
+        let obj = store::read(&repo.gyt_dir, &id)?;
         match obj.kind {
             ObjectKind::Commit => {
                 let c = commit::decode(&obj.payload)?;
@@ -77,7 +77,7 @@ fn walk_tree(
     prefix: &Path,
     out: &mut BTreeMap<PathBuf, (u32, ObjectId)>,
 ) -> Result<()> {
-    let entries = tree::read(&repo.objects_dir(), tree_id)?;
+    let entries = tree::read(&repo.gyt_dir, tree_id)?;
     for e in entries {
         let name = std::str::from_utf8(&e.name)
             .map_err(|_| GytError::Object("tree entry name is not utf-8".into()))?;
@@ -146,7 +146,7 @@ fn write_dir(repo: &Repo, node: &DirNode) -> Result<ObjectId> {
             hash: sub_id,
         });
     }
-    tree::write(&repo.objects_dir(), &entries)
+    tree::write(&repo.gyt_dir, &entries)
 }
 
 /// Resolve the symbolic HEAD to (Option<branch-name>, Option<commit-id>).

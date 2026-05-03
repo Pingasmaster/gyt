@@ -110,7 +110,7 @@ pub fn run(args: &[String]) -> Result<()> {
         message,
     };
 
-    let id = commit::write(&repo.objects_dir(), &c)?;
+    let id = commit::write(&repo.gyt_dir, &c)?;
 
     // Update the symbolic HEAD's ref (or detached HEAD).
     let branch_label = match &head {
@@ -171,7 +171,7 @@ mod tests {
         r.unwrap();
         let repo = Repo::open(&dir).unwrap();
         let main = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        let _ = commit::read(&repo.objects_dir(), &main).unwrap();
+        let _ = commit::read(&repo.gyt_dir, &main).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -211,7 +211,7 @@ mod tests {
         r.unwrap();
         let repo = Repo::open(&dir).unwrap();
         let id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        let c = commit::read(&repo.objects_dir(), &id).unwrap();
+        let c = commit::read(&repo.gyt_dir, &id).unwrap();
         assert_eq!(c.ai_assists, vec!["claude-opus-4-7".to_string()]);
         assert_eq!(c.reviewers, vec!["Carol <c@x>".to_string()]);
         fs::remove_dir_all(&dir).unwrap();

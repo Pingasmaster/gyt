@@ -42,7 +42,7 @@ pub fn run(args: &[String]) -> Result<()> {
         if !seen.insert(id) {
             break;
         }
-        let c = commit::read(&repo.objects_dir(), &id)?;
+        let c = commit::read(&repo.gyt_dir, &id)?;
         let hex = id.to_hex();
         let short = &hex[..8];
         let first = c.message.lines().next().unwrap_or("");

@@ -79,7 +79,7 @@ fn diff_workdir_vs_index(repo: &Repo, use_color: bool) -> Result<()> {
             Vec::new()
         };
         let idx_bytes: Vec<u8> = match idx_hash {
-            Some(h) => blob::read(&repo.objects_dir(), &h)?,
+            Some(h) => blob::read(&repo.gyt_dir, &h)?,
             None => Vec::new(),
         };
         if idx_bytes == wd_bytes {
@@ -131,11 +131,11 @@ fn print_pair_diff(
             continue;
         }
         let abytes = match ah {
-            Some(h) => blob::read(&repo.objects_dir(), &h)?,
+            Some(h) => blob::read(&repo.gyt_dir, &h)?,
             None => Vec::new(),
         };
         let bbytes = match bh {
-            Some(h) => blob::read(&repo.objects_dir(), &h)?,
+            Some(h) => blob::read(&repo.gyt_dir, &h)?,
             None => Vec::new(),
         };
         let header = forward_slash(p);

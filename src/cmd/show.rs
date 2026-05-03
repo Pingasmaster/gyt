@@ -35,17 +35,17 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn show(repo: &Repo, id: &ObjectId) -> Result<()> {
-    let obj = store::read(&repo.objects_dir(), id)?;
+    let obj = store::read(&repo.gyt_dir, id)?;
     match obj.kind {
         ObjectKind::Blob => {
-            let bytes = blob::read(&repo.objects_dir(), id)?;
+            let bytes = blob::read(&repo.gyt_dir, id)?;
             match std::str::from_utf8(&bytes) {
                 Ok(s) => print!("{s}"),
                 Err(_) => println!("<binary, {} bytes>", bytes.len()),
             }
         }
         ObjectKind::Tree => {
-            let entries = tree::read(&repo.objects_dir(), id)?;
+            let entries = tree::read(&repo.gyt_dir, id)?;
             for e in entries {
                 let name = String::from_utf8_lossy(&e.name);
                 println!("{:06o} {}  {name}", e.mode, e.hash);
@@ -83,7 +83,7 @@ fn show(repo: &Repo, id: &ObjectId) -> Result<()> {
             let new_map = util::flatten_tree(repo, &c.tree)?;
             let old_map: BTreeMap<PathBuf, (u32, ObjectId)> =
                 if let Some(parent) = c.parents.first() {
-                    let pc = commit::read(&repo.objects_dir(), parent)?;
+                    let pc = commit::read(&repo.gyt_dir, parent)?;
                     util::flatten_tree(repo, &pc.tree)?
                 } else {
                     BTreeMap::new()
@@ -128,11 +128,11 @@ pub fn print_tree_diff(
             continue;
         }
         let old_bytes = match old {
-            Some((_, h)) => blob::read(&repo.objects_dir(), h)?,
+            Some((_, h)) => blob::read(&repo.gyt_dir, h)?,
             None => Vec::new(),
         };
         let new_bytes = match new {
-            Some((_, h)) => blob::read(&repo.objects_dir(), h)?,
+            Some((_, h)) => blob::read(&repo.gyt_dir, h)?,
             None => Vec::new(),
         };
         let header = forward_slash(p);

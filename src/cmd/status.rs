@@ -36,7 +36,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let head_map: BTreeMap<PathBuf, (u32, ObjectId)> = match refs::read_head(&repo.gyt_dir) {
         Ok(head) => match refs::resolve(&repo.gyt_dir, &head)? {
             Some(commit_id) => {
-                let obj = crate::object::store::read(&repo.objects_dir(), &commit_id)?;
+                let obj = crate::object::store::read(&repo.gyt_dir, &commit_id)?;
                 if obj.kind == crate::object::ObjectKind::Commit {
                     let c = crate::object::commit::decode(&obj.payload)?;
                     util::flatten_tree(&repo, &c.tree)?

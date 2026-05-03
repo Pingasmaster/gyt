@@ -156,10 +156,10 @@ fn stage_one(
         // Hash the link target as a blob.
         let target = fs::read_link(&abs)?;
         let bytes = target.to_string_lossy().into_owned().into_bytes();
-        blob::write(&repo.objects_dir(), &bytes)?
+        blob::write(&repo.gyt_dir, &bytes)?
     } else {
         let bytes = fs::read(&abs)?;
-        blob::write(&repo.objects_dir(), &bytes)?
+        blob::write(&repo.gyt_dir, &bytes)?
     };
 
     let (mtime_secs, ctime_secs) = times(&md);
