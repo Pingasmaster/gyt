@@ -18,3 +18,6 @@ pub mod switch;
 pub mod tag;
 pub mod util;
 pub mod worktree;
+
+#[cfg(test)]
+pub(crate) mod test_support;
