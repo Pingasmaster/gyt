@@ -19,7 +19,7 @@ pub enum DiffOp<'a> {
 
 /// Split a buffer on `\n`. A trailing line without a newline is included.
 /// An empty input yields an empty Vec (no spurious empty line).
-fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
+pub fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
     if buf.is_empty() {
         return Vec::new();
     }
@@ -38,7 +38,7 @@ fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Myers' diff between two slices of lines. Returns a flat ordered op list.
-fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
+pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
     let n = a.len();
     let m = b.len();
 

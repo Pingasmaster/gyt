@@ -33,6 +33,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "pull" => crate::cmd::pull::run(rest),
         "push" => crate::cmd::push::run(rest),
         "merge" => crate::cmd::merge::run(rest),
+        "serve" => crate::cmd::serve::run(rest),
         other => Err(GytError::InvalidArgument(format!(
             "unknown command: {other}"
         ))),
@@ -66,6 +67,7 @@ COMMANDS:
     pull   [<remote>]
     push   [<remote>]
     merge --ff-only <rev>
+    serve [--listen <addr>] [--repos <dir>] [--webroot <dir>]
 ",
         env!("CARGO_PKG_VERSION")
     );
