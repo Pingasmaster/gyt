@@ -347,7 +347,7 @@ mod tests {
         // Pre-populate server with c1 on refs/heads/main.
         let raw_blob = crate::object::store::build_raw(ObjectKind::Blob, b"v1\n");
         let blob1_id = hash::hash_bytes(&raw_blob);
-        let blob1_disk = crate::compress::encode(&raw_blob).unwrap();
+        let blob1_disk = crate::compress::encode(&raw_blob);
         let t1_payload = tree::encode(&[tree::TreeEntry {
             mode: tree::MODE_FILE,
             name: b"f".to_vec(),
@@ -355,7 +355,7 @@ mod tests {
         }]);
         let t1_raw = crate::object::store::build_raw(ObjectKind::Tree, &t1_payload);
         let t1_id = hash::hash_bytes(&t1_raw);
-        let t1_disk = crate::compress::encode(&t1_raw).unwrap();
+        let t1_disk = crate::compress::encode(&t1_raw);
         let c1_payload = commit::encode(&commit::Commit {
             tree: t1_id,
             parents: vec![],
@@ -367,7 +367,7 @@ mod tests {
         });
         let c1_raw = crate::object::store::build_raw(ObjectKind::Commit, &c1_payload);
         let c1_id = hash::hash_bytes(&c1_raw);
-        let c1_disk = crate::compress::encode(&c1_raw).unwrap();
+        let c1_disk = crate::compress::encode(&c1_raw);
 
         let mut state = ServerState::default();
         state.objects.insert(blob1_id, blob1_disk);

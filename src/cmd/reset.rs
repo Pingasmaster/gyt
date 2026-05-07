@@ -1,16 +1,14 @@
 use crate::cmd::util::flatten_tree;
 use crate::errors::{GytError, Result};
 use crate::index::{Index, IndexEntry};
-use crate::object::{ObjectKind, blob, commit, store};
+use crate::object::{commit, store, ObjectKind};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
-use std::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Soft,
     Mixed,
-    Hard,
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -26,7 +24,11 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         match a.as_str() {
             "--soft" => mode = Mode::Soft,
             "--mixed" => mode = Mode::Mixed,
-            "--hard" => mode = Mode::Hard,
+            "--hard" => {
+                return Err(GytError::Unsupported(
+                    "reset --hard is not supported; use `gyt restore` or `gyt switch`".into(),
+                ))
+            }
             other if !other.starts_with('-') => {
                 if rev.is_some() {
                     return Err(GytError::InvalidArgument(
@@ -65,57 +67,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     refs::write_ref(&repo.gyt_dir, &head_ref, &target)?;
 
-    let target_tree = commit::decode(&obj.payload)?.tree;
-
-    if mode == Mode::Hard {
-        // Read current index before overwriting
-        let current_index = Index::read(&repo.index_path())?;
-        let files = flatten_tree(repo, &target_tree)?;
-
-        // Remove files in working tree that are no longer in target tree
-        for entry in &current_index.entries {
-            if !files.contains_key(&entry.path) {
-                let abs = repo.workdir.join(&entry.path);
-                if abs.exists() {
-                    let _ = fs::remove_file(&abs);
-                }
-            }
-        }
-
-        // Write new index from target tree
-        let mut idx = Index::new();
-        for (p, (mode_val, hash)) in &files {
-            idx.insert(IndexEntry {
-                ctime_secs: 0,
-                mtime_secs: 0,
-                size: 0,
-                mode: *mode_val,
-                hash: *hash,
-                path: p.clone(),
-            });
-        }
-        idx.write(&repo.index_path())?;
-
-        // Materialize target tree into working tree
-        for (p, (mode_val, hash)) in &files {
-            let abs = repo.workdir.join(p);
-            if let Some(parent) = abs.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let payload = blob::read(&repo.gyt_dir, hash)?;
-            fs::write(&abs, &payload)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = if mode_val & 0o111 != 0 {
-                    std::fs::Permissions::from_mode(0o755)
-                } else {
-                    std::fs::Permissions::from_mode(0o644)
-                };
-                std::fs::set_permissions(&abs, perms)?;
-            }
-        }
-    } else if mode == Mode::Mixed {
+    if mode == Mode::Mixed {
+        let target_tree = commit::decode(&obj.payload)?.tree;
         let files = flatten_tree(repo, &target_tree)?;
         let mut idx = Index::new();
         for (p, (mode_val, hash)) in &files {
@@ -143,7 +96,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    fn local_flatten_tree(gyt_dir: &Path, tree_id: &ObjectId) -> Result<BTreeMap<String, (u32, ObjectId)>> {
+    fn local_flatten_tree(
+        gyt_dir: &Path,
+        tree_id: &ObjectId,
+    ) -> Result<BTreeMap<String, (u32, ObjectId)>> {
         let mut out = BTreeMap::new();
         walk_tree(gyt_dir, tree_id, "", &mut out)?;
         Ok(out)
@@ -174,30 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn reset_hard_resets_workdir_and_index() {
+    fn reset_hard_is_rejected() {
         let r = TestRepo::new("gyt-reset-hard");
         let repo = r.open();
-        let first = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        let first_tree = commit::read(&repo.gyt_dir, &first).unwrap().tree;
-        let (_, _) = r.commit_next(&[("hello.txt", b"v2\n", false)]);
-
-        // Modify workdir to have different content
-        let v2_path = repo.workdir.join("hello.txt");
-        fs::write(&v2_path, b"latest\n").unwrap();
-
-        run_in(&repo, &["--hard".into(), first.to_hex()]).unwrap();
-
-        assert_eq!(
-            refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap(),
-            first
-        );
-        // Workdir should be reset to first commit content
-        let content = fs::read_to_string(&v2_path).unwrap();
-        assert_eq!(content, "hello\n");
-        // Index should match first tree
-        let idx = Index::read(&repo.index_path()).unwrap();
-        let want = local_flatten_tree(&repo.gyt_dir, &first_tree).unwrap();
-        assert_eq!(idx.entries.len(), want.len());
+        run_in(&repo, &["--hard".into(), "HEAD".into()]).unwrap_err();
     }
 
     #[test]

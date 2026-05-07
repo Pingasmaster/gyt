@@ -197,10 +197,6 @@ fn walk_tree(
     Ok(())
 }
 
-fn short_hex(id: &ObjectId) -> String {
-    id.to_hex()[..8].to_string()
-}
-
 // Scaffolding: helper used during commit phase when rebase is connected.
 #[allow(dead_code)]
 #[cfg(test)]

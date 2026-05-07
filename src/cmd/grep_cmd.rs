@@ -125,7 +125,7 @@ fn grep_bytes(content: &[u8], pattern: &[u8]) -> Option<usize> {
 
 #[derive(Debug, Clone)]
 struct FlatEntry {
-    mode: u32,
+    _mode: u32,
     hash: ObjectId,
 }
 
@@ -153,7 +153,7 @@ fn walk_tree(
         if e.mode == tree::MODE_DIR {
             walk_tree(repo, &e.hash, &path, out)?;
         } else {
-            out.insert(path, FlatEntry { mode: e.mode, hash: e.hash });
+            out.insert(path, FlatEntry { _mode: e.mode, hash: e.hash });
         }
     }
     Ok(())
@@ -163,14 +163,15 @@ fn walk_tree(
 mod tests {
     use super::*;
     use crate::cmd::test_support::TestRepo;
+    use crate::cmd::util::test_helpers::lock;
     use crate::refs;
-    
 
     #[test]
     fn grep_in_working_tree() {
+        let _g = lock();
         let r = TestRepo::new("gyt-grep-wt");
         let repo = r.open();
-        
+
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
         
@@ -182,10 +183,11 @@ mod tests {
 
     #[test]
     fn grep_in_commit() {
+        let _g = lock();
         let r = TestRepo::new("gyt-grep-commit");
         let repo = r.open();
         let main_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        
+
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
         

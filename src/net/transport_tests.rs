@@ -16,7 +16,7 @@ use std::collections::HashMap;
 fn mk_object(payload: &[u8]) -> (ObjectId, Vec<u8>) {
     let raw = build_raw(ObjectKind::Blob, payload);
     let id = hash::hash_bytes(&raw);
-    let stored = compress::encode(&raw).expect("encode");
+    let stored = compress::encode(&raw);
     (id, stored)
 }
 

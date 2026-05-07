@@ -92,7 +92,7 @@ mod tests {
     fn mk_obj(kind: ObjectKind, payload: &[u8]) -> (ObjectId, Vec<u8>) {
         let raw = build_raw(kind, payload);
         let id = hash::hash_bytes(&raw);
-        let stored = compress::encode(&raw).expect("encode");
+        let stored = compress::encode(&raw);
         (id, stored)
     }
 

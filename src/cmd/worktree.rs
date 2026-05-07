@@ -323,10 +323,10 @@ fn resolve_worktree(main_gyt: &Path, target: &str) -> Result<(PathBuf, PathBuf)>
             Ok(p) => p,
             Err(_) => continue,
         };
-        if let Some(cabs) = &candidate_abs
-            && aux == *cabs
-        {
-            return Ok((wt_dir, aux));
+        if let Some(cabs) = &candidate_abs {
+            if aux == *cabs {
+                return Ok((wt_dir, aux));
+            }
         }
         if aux.file_name().map(|s| s.to_string_lossy().into_owned()) == Some(target.to_string()) {
             return Ok((wt_dir, aux));
@@ -451,10 +451,10 @@ fn short_hex(id: &ObjectId) -> String {
 
 fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
     // Accept: full hex, or branch/tag name (refs/heads/<x>, refs/tags/<x>).
-    if rev.len() == crate::hash::HEX_LEN
-        && let Ok(id) = ObjectId::from_hex(rev)
-    {
-        return Ok(id);
+    if rev.len() == crate::hash::HEX_LEN {
+        if let Ok(id) = ObjectId::from_hex(rev) {
+            return Ok(id);
+        }
     }
     if let Ok(id) = refs::read_ref(&repo.gyt_dir, &format!("refs/heads/{rev}")) {
         return Ok(id);

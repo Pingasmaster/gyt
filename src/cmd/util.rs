@@ -51,7 +51,6 @@ pub fn resolve_tree(repo: &Repo, rev: &str) -> Result<ObjectId> {
             ObjectKind::Tag => {
                 let t = tag::decode(&obj.payload)?;
                 id = t.target;
-                continue;
             }
             ObjectKind::Blob => {
                 return Err(GytError::Object(format!(

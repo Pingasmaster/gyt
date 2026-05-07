@@ -102,8 +102,7 @@ pub fn run(args: &[String]) -> Result<()> {
                             let ignore2 = IgnoreSet::load_from_root(&workdir)?;
                             if ignore2.matched(&rel_str, false) {
                                 eprintln!(
-                                    "{} is still ignored after loading defaults, skipping",
-                                    rel_str
+                                    "{rel_str} is still ignored after loading defaults, skipping"
                                 );
                                 continue;
                             }
@@ -272,7 +271,6 @@ fn prompt_ignored(path: &str, workdir: &Path) -> Option<IgnoredDecision> {
 
     match choice {
         "1" => Some(IgnoredDecision::Add),
-        "2" => Some(IgnoredDecision::Skip),
         "3" if no_existing => Some(IgnoredDecision::GetDefault),
         _ => Some(IgnoredDecision::Skip),
     }
@@ -287,8 +285,7 @@ fn write_default_gytignore(workdir: &Path) -> Result<()> {
 
     let bytes = DEFAULT_GYTIGNORE_DIR
         .get_file("default_gytignore.txt")
-        .map(|f| f.contents())
-        .map(|c| c.to_vec())
+        .map(|f| f.contents().to_vec())
         .unwrap_or_default();
 
     fs_util::atomic_write(&workdir.join(".gytignore"), &bytes)?;

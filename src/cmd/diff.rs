@@ -8,6 +8,7 @@ use crate::repo::Repo;
 use crate::term;
 use crate::workdir;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -87,7 +88,9 @@ fn diff_workdir_vs_index(repo: &Repo, use_color: bool) -> Result<()> {
         }
         let header = forward_slash(&p);
         let out = diff::render_unified(&idx_bytes, &wd_bytes, &header, &header, 3, use_color);
-        print!("{out}");
+        if std::io::stdout().write_all(out.as_bytes()).is_err() {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -140,7 +143,9 @@ fn print_pair_diff(
         };
         let header = forward_slash(p);
         let out = diff::render_unified(&abytes, &bbytes, &header, &header, 3, use_color);
-        print!("{out}");
+        if std::io::stdout().write_all(out.as_bytes()).is_err() {
+            return Ok(());
+        }
     }
     Ok(())
 }

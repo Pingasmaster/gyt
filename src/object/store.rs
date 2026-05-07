@@ -53,7 +53,7 @@ pub fn write_bytes(repo: &Path, kind: ObjectKind, payload: &[u8]) -> Result<Obje
     if path.exists() {
         return Ok(id);
     }
-    let stored = compress::encode(&raw)?;
+    let stored = compress::encode(&raw);
     fs_util::atomic_write(&path, &stored)?;
     Ok(id)
 }

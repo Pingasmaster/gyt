@@ -21,8 +21,8 @@ pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(feature = "xz"))]
-pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
-    Ok(payload.to_vec())
+pub fn encode(payload: &[u8]) -> Vec<u8> {
+    payload.to_vec()
 }
 
 pub fn decode(stored: &[u8]) -> Result<Vec<u8>> {
@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn round_trip_default() {
         let p = b"hello world";
-        let s = encode(p).unwrap();
+        let s = encode(p);
         let p2 = decode(&s).unwrap();
         assert_eq!(p2, p);
     }
