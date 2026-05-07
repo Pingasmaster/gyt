@@ -708,6 +708,7 @@ mod tests {
             user_name: Some(name.into()),
             user_email: Some(email.into()),
             remotes: Default::default(),
+            create_default_gytignore: false,
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }

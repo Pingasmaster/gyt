@@ -229,7 +229,7 @@ mod tests {
             ctime_secs: 1_700_000_000 + i64::from(byte),
             mtime_secs: 1_700_000_500 + i64::from(byte),
             size: u64::from(byte) * 13 + 7,
-            mode: 0o100644,
+            mode: 0o100_644,
             hash: dummy_id(byte),
             path: PathBuf::from(path),
         }

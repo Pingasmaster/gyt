@@ -18,6 +18,7 @@
 use crate::errors::{GytError, Result};
 use crate::hash::{HEX_LEN, ObjectId};
 use crate::object::{ObjectKind, store};
+use std::fmt::Write;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,19 +40,19 @@ impl Commit {
 
 pub fn encode(c: &Commit) -> Vec<u8> {
     let mut s = String::new();
-    s.push_str(&format!("tree {}\n", c.tree));
+    writeln!(s, "tree {}", c.tree).unwrap();
     for p in &c.parents {
-        s.push_str(&format!("parent {p}\n"));
+        writeln!(s, "parent {p}").unwrap();
     }
     for a in &c.authors {
-        s.push_str(&format!("author {a}\n"));
+        writeln!(s, "author {a}").unwrap();
     }
-    s.push_str(&format!("committer {}\n", c.committer));
+    writeln!(s, "committer {}", c.committer).unwrap();
     for ai in &c.ai_assists {
-        s.push_str(&format!("ai {ai}\n"));
+        writeln!(s, "ai {ai}").unwrap();
     }
     for r in &c.reviewers {
-        s.push_str(&format!("reviewer {r}\n"));
+        writeln!(s, "reviewer {r}").unwrap();
     }
     s.push('\n');
     s.push_str(&c.message);

@@ -19,7 +19,7 @@ pub fn json_string(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                out.push_str(&format_args!("\\u{:04x}", c as u32).to_string());
             }
             c => out.push(c),
         }
@@ -193,7 +193,7 @@ pub struct DiffHunkInfo {
 
 impl DiffHunkInfo {
     pub fn to_json(&self) -> String {
-        let lines_json: Vec<String> = self.lines.iter().map(|l| l.to_json()).collect();
+        let lines_json: Vec<String> = self.lines.iter().map(DiffLine::to_json).collect();
         json_object(&[
             ("old_start", json_u64(self.old_start)),
             ("old_count", json_u64(self.old_count)),
@@ -212,7 +212,7 @@ pub struct DiffFileInfo {
 
 impl DiffFileInfo {
     pub fn to_json(&self) -> String {
-        let hunks_json: Vec<String> = self.hunks.iter().map(|h| h.to_json()).collect();
+        let hunks_json: Vec<String> = self.hunks.iter().map(DiffHunkInfo::to_json).collect();
         json_object(&[
             ("path", json_string(&self.path)),
             ("hunks", json_array(&hunks_json)),
@@ -267,7 +267,7 @@ where
     T: JsonSerialize,
 {
     pub fn to_json(&self) -> String {
-        let items_json: Vec<String> = self.items.iter().map(|i| i.to_json()).collect();
+        let items_json: Vec<String> = self.items.iter().map(JsonSerialize::to_json).collect();
         json_object(&[
             ("items", json_array(&items_json)),
             ("page", json_u64(self.page as u64)),

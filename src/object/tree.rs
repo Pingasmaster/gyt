@@ -15,10 +15,10 @@ use crate::hash::{HASH_LEN, ObjectId};
 use crate::object::{ObjectKind, store};
 use std::path::Path;
 
-pub const MODE_FILE: u32 = 0o100644;
-pub const MODE_EXEC: u32 = 0o100755;
-pub const MODE_SYMLINK: u32 = 0o120000;
-pub const MODE_DIR: u32 = 0o040000;
+pub const MODE_FILE: u32 = 0o100_644;
+pub const MODE_EXEC: u32 = 0o100_755;
+pub const MODE_SYMLINK: u32 = 0o120_000;
+pub const MODE_DIR: u32 = 0o040_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {

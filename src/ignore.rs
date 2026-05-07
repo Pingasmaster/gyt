@@ -245,14 +245,13 @@ fn compile_tokens(pat: &str) -> Result<Vec<Tok>> {
                             }
                         }
                         continue;
-                    } else {
-                        // `**` not aligned to slashes — collapse to a single
-                        // Star. Skip both bytes; further consecutive stars
-                        // will also collapse on the next iteration.
-                        out.push(Tok::Star);
-                        i += 2;
-                        continue;
                     }
+                    // `**` not aligned to slashes — collapse to a single
+                    // Star. Skip both bytes; further consecutive stars
+                    // will also collapse on the next iteration.
+                    out.push(Tok::Star);
+                    i += 2;
+                    continue;
                 }
                 out.push(Tok::Star);
                 i += 1;

@@ -1,5 +1,5 @@
 use crate::cmd::branch as branch_cmd;
-use crate::cmd::reset as reset_cmd;
+use crate::cmd::util::resolve_rev;
 use crate::config::Config;
 use crate::errors::{GytError, Result};
 use crate::object::tag::Tag;
@@ -76,8 +76,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
 
     let target = match &rev {
-        Some(r) => reset_cmd::resolve_rev(repo, r)?,
-        None => reset_cmd::resolve_rev(repo, "HEAD")?,
+        Some(r) => resolve_rev(repo, r)?,
+        None => resolve_rev(repo, "HEAD")?,
     };
 
     let ref_name = format!("refs/tags/{name}");

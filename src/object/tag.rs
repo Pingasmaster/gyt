@@ -9,6 +9,7 @@
 use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
 use crate::object::{ObjectKind, store};
+use std::fmt::Write;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,10 +23,10 @@ pub struct Tag {
 
 pub fn encode(t: &Tag) -> Vec<u8> {
     let mut s = String::new();
-    s.push_str(&format!("object {}\n", t.target));
-    s.push_str(&format!("type {}\n", t.kind.as_str()));
-    s.push_str(&format!("tag {}\n", t.name));
-    s.push_str(&format!("tagger {}\n", t.tagger));
+    writeln!(s, "object {}", t.target).unwrap();
+    writeln!(s, "type {}", t.kind.as_str()).unwrap();
+    writeln!(s, "tag {}", t.name).unwrap();
+    writeln!(s, "tagger {}", t.tagger).unwrap();
     s.push('\n');
     s.push_str(&t.message);
     s.into_bytes()

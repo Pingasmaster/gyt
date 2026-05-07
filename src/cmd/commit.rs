@@ -135,7 +135,7 @@ pub fn run(args: &[String]) -> Result<()> {
 fn short_branch(refname: &str) -> String {
     refname
         .strip_prefix("refs/heads/")
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_else(|| refname.to_string())
 }
 

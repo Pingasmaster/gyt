@@ -206,9 +206,8 @@ fn group_hunks<'a>(ops: &[DiffOp<'a>], context: usize) -> Vec<Hunk<'a>> {
                     if has_more_changes && run_len <= 2 * context {
                         j = run_end;
                         continue;
-                    } else {
-                        break;
                     }
+                    break;
                 }
                 _ => {
                     last_change = j;

@@ -307,7 +307,7 @@ fn repo_info_from(state: &ServerState, owner: &str, name: &str) -> RepoInfo {
         refs::resolve(&repo.gyt_dir, &head)
             .ok()
             .flatten()
-            .map(|id| id.to_hex())
+            .map(super::super::hash::ObjectId::to_hex)
     });
 
     RepoInfo {
@@ -383,7 +383,7 @@ fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String
     let start_idx = (page.saturating_sub(1)) * per_page;
     let page_commits: Vec<_> = commits.into_iter().skip(start_idx).take(per_page).collect();
 
-    let items: Vec<String> = page_commits.iter().map(|c| c.to_json()).collect();
+    let items: Vec<String> = page_commits.iter().map(super::api::CommitInfo::to_json).collect();
     let body = format!(
         r#"{{"items":[{}],"page":{},"per_page":{},"total":{}}}"#,
         items.join(","),
@@ -516,12 +516,12 @@ fn list_tree(repo: &crate::repo::Repo, tree_id: &ObjectId) -> (u16, String, Vec<
             } else {
                 "blob"
             };
-            let size = if e.mode != tree::MODE_DIR {
+            let size = if e.mode == tree::MODE_DIR {
+                None
+            } else {
                 crate::object::blob::read(&repo.gyt_dir, &e.hash)
                     .map(|b| b.len() as u64)
                     .ok()
-            } else {
-                None
             };
             let info = TreeEntryInfo {
                 name,
@@ -577,7 +577,7 @@ fn refs_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         }
     }
 
-    let items: Vec<String> = all_refs.iter().map(|r| r.to_json()).collect();
+    let items: Vec<String> = all_refs.iter().map(super::api::RefInfo::to_json).collect();
     let body = format!("[{}]", items.join(","));
     json_response(&body)
 }
@@ -652,12 +652,12 @@ fn diff_revs(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         });
     }
 
-    let items: Vec<String> = files.iter().map(|f| f.to_json()).collect();
+    let items: Vec<String> = files.iter().map(super::api::DiffFileInfo::to_json).collect();
     let body = format!("[{}]", items.join(","));
     json_response(&body)
 }
 
-fn build_hunks<'a>(ops: &[diff::DiffOp<'a>]) -> Vec<DiffHunkInfo> {
+fn build_hunks(ops: &[diff::DiffOp<'_>]) -> Vec<DiffHunkInfo> {
     let mut hunks: Vec<DiffHunkInfo> = Vec::new();
     let mut old_no: u64 = 0;
     let mut new_no: u64 = 0;
@@ -668,7 +668,7 @@ fn build_hunks<'a>(ops: &[diff::DiffOp<'a>]) -> Vec<DiffHunkInfo> {
 
     for op in ops {
         match op {
-            diff::DiffOp::Equal(line) => {
+            diff::DiffOp::Equal(_line) => {
                 if in_hunk && !current_lines.is_empty() {
                     hunks.push(DiffHunkInfo {
                         old_start: hunk_old_start,
@@ -794,7 +794,7 @@ fn search_code(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, 
         Ok(h) => h,
         Err(_) => return json_response(r#"{"kind":"code","items":[]}"#),
     };
-    let start = match refs::resolve(&repo.gyt_dir, &head) {
+    let _start = match refs::resolve(&repo.gyt_dir, &head) {
         Ok(Some(id)) => id,
         _ => return json_response(r#"{"kind":"code","items":[]}"#),
     };

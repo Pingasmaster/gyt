@@ -25,7 +25,11 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "switch" => crate::cmd::switch::run(rest),
         "restore" => crate::cmd::restore::run(rest),
         "reset" => crate::cmd::reset::run(rest),
+        "rm" => crate::cmd::rm::run(rest),
         "tag" => crate::cmd::tag::run(rest),
+        "cherry-pick" => crate::cmd::cherry_pick::run(rest),
+        "rebase" => crate::cmd::rebase::run(rest),
+        "grep" => crate::cmd::grep_cmd::run(rest),
         "stash" => crate::cmd::stash::run(rest),
         "worktree" => crate::cmd::worktree::run(rest),
         "clone" => crate::cmd::clone::run(rest),
@@ -34,6 +38,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "push" => crate::cmd::push::run(rest),
         "merge" => crate::cmd::merge::run(rest),
         "serve" => crate::cmd::serve::run(rest),
+        "getthefuckoutofmyrepo" | "filter" => crate::cmd::getthefuckoutofmyrepo::run(rest),
         other => Err(GytError::InvalidArgument(format!(
             "unknown command: {other}"
         ))),

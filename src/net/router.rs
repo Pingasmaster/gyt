@@ -148,7 +148,7 @@ pub fn query_params(query: Option<&str>) -> Vec<(String, String)> {
             let (k, v) = p.split_once('=')?;
             Some((
                 k.to_string(),
-                url_decode(v).unwrap_or_else(|_| v.to_string()),
+                url_decode(v).unwrap_or_else(|()| v.to_string()),
             ))
         })
         .collect()

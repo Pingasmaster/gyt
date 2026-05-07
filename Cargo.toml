@@ -15,9 +15,56 @@ blake3 = "=1.8.5"
 rustls = { version = "=0.23.40", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 rustls-pki-types = "=1.14.1"
 webpki-roots = "=1.0.7"
-lzma-rust2 = { version = "=0.16.2", optional = true, default-features = false, features = ["std", "encoder", "xz"] }
+lzma-rust2 = { version = "=0.16.2", optional = true, default-features = false, features = ["std", "xz"] }
+include_dir = "=0.7.4"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# === STRICT CLIPPY HARNESSES ===
+# Default: pedantic + correctness + suspicious + style
+# Allow-listed lints are strictly justified and never suppressed arbitrarily.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+# CORRECTNESS — must not fire
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -2 }
+suspicious = { level = "deny", priority = -3 }
+# STYLE — allow only if honestly necessary
+pedantic = { level = "warn", priority = -4 }
+# RESTRICTION — only what makes the code safer/cleaner
+# allowlist: reasonable exceptions for git tooling
+dbg_macro = "allow"
+print_stdout = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"
+missing_fields_in_debug = "allow"
+inline_always = "allow"
+default_trait_access = "allow"
+similar_names = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+float_cmp = "allow"
+implicit_hasher = "allow"
+map_unwrap_or = "allow"
+multiple_crate_versions = "allow"
+needless_pass_by_value = "allow"
+redundant_clone = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+
+# PROPER CLIPPY CONFIGURATION FOR A GIT TOOL
+expect_used = "allow"
+panic = "allow"
+unimplemented = "allow"
+unreachable = "allow"

@@ -5,6 +5,7 @@ use crate::object::blob;
 use crate::repo::Repo;
 use crate::workdir::{self, WorkdirEntry};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -81,10 +82,36 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
             }
         } else {
-            // Single file/symlink. Skip if ignored.
+            // Single file/symlink. Check if ignored.
             let rel_str = forward_slash(rel);
             if ignore.matched(&rel_str, false) {
-                continue;
+                // A pattern matched but .gytignore may not exist yet —
+                // give the user an interactive prompt.
+                if let Some(decision) = prompt_ignored(&rel_str, &workdir) {
+                    match decision {
+                        IgnoredDecision::Skip => continue,
+                        IgnoredDecision::Add => {
+                            // Stage it anyway.
+                        }
+                        IgnoredDecision::GetDefault => {
+                            // Write the default .gytignore, then re-check.
+                            if write_default_gytignore(&workdir).is_err() {
+                                eprintln!("warning: could not write default .gytignore");
+                            }
+                            // Reload ignore set so the file now passes.
+                            let ignore2 = IgnoreSet::load_from_root(&workdir)?;
+                            if ignore2.matched(&rel_str, false) {
+                                eprintln!(
+                                    "{} is still ignored after loading defaults, skipping",
+                                    rel_str
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    continue;
+                }
             }
             let mode = mode_for(&md);
             let ent = WorkdirEntry {
@@ -119,9 +146,9 @@ fn forward_slash(p: &Path) -> String {
     s
 }
 
-const MODE_REGULAR: u32 = 0o100644;
-const MODE_EXEC: u32 = 0o100755;
-const MODE_SYMLINK: u32 = 0o120000;
+const MODE_REGULAR: u32 = 0o100_644;
+const MODE_EXEC: u32 = 0o100_755;
+const MODE_SYMLINK: u32 = 0o120_000;
 
 fn mode_for(meta: &fs::Metadata) -> u32 {
     let ft = meta.file_type();
@@ -199,6 +226,73 @@ fn times(md: &fs::Metadata) -> (i64, i64) {
     #[cfg(not(unix))]
     let ctime = mtime;
     (mtime, ctime)
+}
+
+/// Decision returned by the interactive ignored-file prompt.
+enum IgnoredDecision {
+    /// Skip this file (don't stage it).
+    Skip,
+    /// Force-stage this file despite it matching ignore patterns.
+    Add,
+    /// Write the default .gytignore template and re-check.
+    GetDefault,
+}
+
+/// Interactive prompt shown when the user tries to `gyt add` a file
+/// matching a pattern in `.gytignore`.
+fn prompt_ignored(path: &str, workdir: &Path) -> Option<IgnoredDecision> {
+    // If there's no .gytignore yet, the ignore set is empty so we
+    // shouldn't be here — unless the ignore set was loaded and found
+    // patterns. In that case, offer to create the default template.
+    let gytignore_path = workdir.join(".gytignore");
+    let no_existing = !gytignore_path.exists();
+
+    let prompt = if no_existing {
+        format!(
+            "\n{path} matches built-in ignore rules.\n\
+             No .gytignore file exists yet.\n\
+             1) Add it anyway\n\
+             2) Skip it\n\
+             3) Create default .gytignore and re-check\n\
+             Choice [1/2/3] "
+        )
+    } else {
+        format!(
+            "\n{path} matches ignore rules in .gytignore.\n\
+             1) Add it anyway\n\
+             2) Skip it\n\
+             Choice [1/2] "
+        )
+    };
+
+    io::stdout().write_all(prompt.as_bytes()).ok()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).ok()?;
+    let choice = buf.trim();
+
+    match choice {
+        "1" => Some(IgnoredDecision::Add),
+        "2" => Some(IgnoredDecision::Skip),
+        "3" if no_existing => Some(IgnoredDecision::GetDefault),
+        _ => Some(IgnoredDecision::Skip),
+    }
+}
+
+/// Write the embedded default .gytignore template to the workdir root.
+fn write_default_gytignore(workdir: &Path) -> Result<()> {
+    use crate::fs_util;
+    use include_dir::{include_dir, Dir};
+
+    static DEFAULT_GYTIGNORE_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/cmd");
+
+    let bytes = DEFAULT_GYTIGNORE_DIR
+        .get_file("default_gytignore.txt")
+        .map(|f| f.contents())
+        .map(|c| c.to_vec())
+        .unwrap_or_default();
+
+    fs_util::atomic_write(&workdir.join(".gytignore"), &bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]

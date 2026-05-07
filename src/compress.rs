@@ -11,6 +11,8 @@ use crate::errors::Result;
 pub const MAGIC: [u8; 4] = [0x67, 0x79, 0x74, 0x01];
 pub const FLAG_XZ: u8 = 0x01;
 
+// Scaffolding: threshold for xz compression, used in commit phase.
+#[allow(dead_code)]
 pub const SIZE_XZ_HIGH: usize = 10 * 1024 * 1024;
 
 #[cfg(feature = "xz")]

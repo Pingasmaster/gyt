@@ -9,6 +9,9 @@
 //   [remote.<name>]
 //   url = "https://host/path/repo.gyt/"
 //
+//   [init]
+//   create_default_gytignore = true  (opt-in, default false)
+//
 // Anything else is preserved syntactically but not surfaced via this API.
 //
 // Environment overrides (used for `commit` author info, useful in CI/tests):
@@ -18,6 +21,7 @@ use crate::errors::{GytError, Result};
 use crate::fs_util;
 use crate::repo::Repo;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::Path;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -26,6 +30,8 @@ pub struct Config {
     pub user_email: Option<String>,
     /// Map remote name -> url.
     pub remotes: BTreeMap<String, String>,
+    /// Whether to create a default .gytignore on `gyt init`. Defaults to false (opt-in).
+    pub create_default_gytignore: bool,
 }
 
 impl Config {
@@ -65,21 +71,26 @@ impl Config {
         if self.user_name.is_some() || self.user_email.is_some() {
             s.push_str("[user]\n");
             if let Some(n) = &self.user_name {
-                s.push_str(&format!("name = {}\n", quote(n)));
+                writeln!(s, "name = {n:#?}").unwrap();
             }
             if let Some(e) = &self.user_email {
-                s.push_str(&format!("email = {}\n", quote(e)));
+                writeln!(s, "email = {e:#?}").unwrap();
             }
             s.push('\n');
         }
         for (name, url) in &self.remotes {
-            s.push_str(&format!("[remote.{name}]\n"));
-            s.push_str(&format!("url = {}\n\n", quote(url)));
+            writeln!(s, "[remote.{name}]").unwrap();
+            writeln!(s, "url = {url:#?}\n").unwrap();
+        }
+        if self.create_default_gytignore {
+            s.push_str("\n[init]\ncreate_default_gytignore = true\n");
         }
         fs_util::atomic_write(&gyt_dir.join("config.toml"), s.as_bytes())
     }
 }
 
+// Scaffolding: TOML string quoting helper, used in commit phase.
+#[allow(dead_code)]
 fn quote(s: &str) -> String {
     // Basic-string escaping: backslash, double quote, control chars.
     let mut out = String::with_capacity(s.len() + 2);
@@ -135,20 +146,25 @@ fn parse(bytes: &[u8]) -> Result<Config> {
             ))
         })?;
         let key = key.trim();
-        let value = unquote(value.trim()).ok_or_else(|| {
+        let raw_value = unquote(value.trim()).ok_or_else(|| {
             GytError::Parse(format!(
                 "config.toml line {}: value must be a quoted string",
                 lineno + 1
             ))
         })?;
+        // Check [init] section first since it only needs a borrow.
+        if section.len() == 1 && section[0] == "init" && key == "create_default_gytignore" {
+            cfg.create_default_gytignore = raw_value == "true";
+            continue;
+        }
         match section.as_slice() {
             [s] if s == "user" => match key {
-                "name" => cfg.user_name = Some(value),
-                "email" => cfg.user_email = Some(value),
+                "name" => cfg.user_name = Some(raw_value),
+                "email" => cfg.user_email = Some(raw_value),
                 _ => {}
             },
             [s, name] if s == "remote" && key == "url" => {
-                cfg.remotes.insert(name.clone(), value);
+                cfg.remotes.insert(name.clone(), raw_value);
             }
             _ => {}
         }

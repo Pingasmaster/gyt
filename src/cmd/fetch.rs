@@ -184,7 +184,7 @@ mod tests {
             s.objects.insert(b2_id, b2_disk);
             s.objects.insert(t2_id, t2_disk);
             s.objects.insert(c2_id, c2_disk);
-            for r in s.refs.iter_mut() {
+            for r in &mut s.refs {
                 if r.name == "refs/heads/main" {
                     r.id = c2_id;
                 }

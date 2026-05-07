@@ -187,7 +187,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         extra_headers: &[(&str, &str)],
     ) -> Vec<u8> {
-        let mut req = Vec::with_capacity(256 + body.map(|b| b.len()).unwrap_or(0));
+        let mut req = Vec::with_capacity(256 + body.map(<[u8]>::len).unwrap_or(0));
         let _ = write!(req, "{method} {target} HTTP/1.1\r\n");
         let host_header = if (self.scheme == Scheme::Https && self.port == 443)
             || (self.scheme == Scheme::Http && self.port == 80)
@@ -405,9 +405,9 @@ fn base64_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= input.len() {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
-        let b2 = input[i + 2] as u32;
+        let b0 = u32::from(input[i]);
+        let b1 = u32::from(input[i + 1]);
+        let b2 = u32::from(input[i + 2]);
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(TBL[((n >> 18) & 0x3f) as usize] as char);
         out.push(TBL[((n >> 12) & 0x3f) as usize] as char);
@@ -417,15 +417,15 @@ fn base64_encode(input: &[u8]) -> String {
     }
     let rem = input.len() - i;
     if rem == 1 {
-        let b0 = input[i] as u32;
+        let b0 = u32::from(input[i]);
         let n = b0 << 16;
         out.push(TBL[((n >> 18) & 0x3f) as usize] as char);
         out.push(TBL[((n >> 12) & 0x3f) as usize] as char);
         out.push('=');
         out.push('=');
     } else if rem == 2 {
-        let b0 = input[i] as u32;
-        let b1 = input[i + 1] as u32;
+        let b0 = u32::from(input[i]);
+        let b1 = u32::from(input[i + 1]);
         let n = (b0 << 16) | (b1 << 8);
         out.push(TBL[((n >> 18) & 0x3f) as usize] as char);
         out.push(TBL[((n >> 12) & 0x3f) as usize] as char);
@@ -452,7 +452,7 @@ mod tests {
         // Empty reason is fine.
         assert_eq!(
             parse_status_line("HTTP/1.1 204 ").unwrap(),
-            (204, "".to_string())
+            (204, String::new())
         );
     }
 

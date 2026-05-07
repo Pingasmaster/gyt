@@ -39,10 +39,10 @@ pub struct StatusReport {
     pub entries: Vec<(PathBuf, FileState)>,
 }
 
-const MODE_REGULAR: u32 = 0o100644;
-const MODE_EXEC: u32 = 0o100755;
-const MODE_SYMLINK: u32 = 0o120000;
-const MODE_DIR: u32 = 0o040000;
+const MODE_REGULAR: u32 = 0o100_644;
+const MODE_EXEC: u32 = 0o100_755;
+const MODE_SYMLINK: u32 = 0o120_000;
+const MODE_DIR: u32 = 0o040_000;
 
 /// Convert a relative path to forward-slash form and return as a String.
 fn rel_to_forward_slash(rel: &Path) -> String {

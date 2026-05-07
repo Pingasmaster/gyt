@@ -139,8 +139,7 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     let wt_dir = repo.gyt_dir.join("worktrees").join(&wt_name);
     if wt_dir.exists() {
         return Err(GytError::InvalidArgument(format!(
-            "worktree add: {} already registered",
-            wt_name
+            "worktree add: {wt_name} already registered"
         )));
     }
     std::fs::create_dir_all(&wt_dir)?;
@@ -215,7 +214,7 @@ fn do_list_at(cwd: &Path) -> Result<()> {
     let wts_dir = main_gyt.join("worktrees");
     if wts_dir.is_dir() {
         let mut names: Vec<String> = std::fs::read_dir(&wts_dir)?
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
@@ -647,6 +646,7 @@ mod tests {
             user_name: Some(name.into()),
             user_email: Some(email.into()),
             remotes: Default::default(),
+            create_default_gytignore: false,
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }

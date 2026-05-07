@@ -1,8 +1,5 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
-// Allowed during scaffolding; remove these as modules are filled in.
-#![allow(dead_code)]
-#![allow(unused_variables)]
 
 mod cli;
 mod cmd;

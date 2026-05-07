@@ -172,7 +172,7 @@ pub mod test_helpers {
     static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn lock() -> MutexGuard<'static, ()> {
-        GLOBAL_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+        GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn tmp_dir(prefix: &str) -> PathBuf {
