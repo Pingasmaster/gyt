@@ -344,9 +344,8 @@ fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String
     };
 
     let rev = router::get_param(params, "ref").unwrap_or("HEAD");
-    let start_id = match util::resolve_rev(&repo, rev) {
-        Ok(id) => id,
-        Err(_) => return error_response(404, &format!("revision {rev} not found")),
+    let Ok(start_id) = util::resolve_rev(&repo, rev) else {
+        return error_response(404, &format!("revision {rev} not found"));
     };
 
     let page = api::parse_page(params, 1);

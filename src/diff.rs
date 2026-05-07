@@ -38,6 +38,7 @@ pub fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Myers' diff between two slices of lines. Returns a flat ordered op list.
+#[allow(clippy::many_single_char_names)]
 pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
     let n = a.len();
     let m = b.len();

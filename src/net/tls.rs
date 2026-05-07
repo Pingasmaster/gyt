@@ -29,7 +29,7 @@ fn client_config() -> Arc<ClientConfig> {
     CLIENT_CONFIG
         .get_or_init(|| {
             ensure_provider_installed();
-            let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
             let cfg = ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth();

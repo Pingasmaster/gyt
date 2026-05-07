@@ -1,3 +1,6 @@
+// Networking modules are scaffolded for future CLI wiring.
+#![allow(dead_code)]
+
 pub mod api;
 pub mod http;
 pub mod protocol;
