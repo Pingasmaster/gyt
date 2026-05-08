@@ -1,7 +1,7 @@
 use crate::cmd::util::flatten_tree;
 use crate::errors::{GytError, Result};
 use crate::index::{Index, IndexEntry};
-use crate::object::{commit, store, ObjectKind};
+use crate::object::{ObjectKind, commit, store};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
 
@@ -27,7 +27,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             "--hard" => {
                 return Err(GytError::Unsupported(
                     "reset --hard is not supported; use `gyt restore` or `gyt switch`".into(),
-                ))
+                ));
             }
             other if !other.starts_with('-') => {
                 if rev.is_some() {

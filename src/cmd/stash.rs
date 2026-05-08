@@ -599,7 +599,9 @@ fn detect_conflicts(repo: &Repo, target: &[FlatFile]) -> Result<Vec<PathBuf>> {
         }
         // Compare current workdir content to the target blob.
         let target_blob = crate::object::blob::read(&repo.gyt_dir, &f.hash)?;
-        let Ok(current) = std::fs::read(&abs) else { continue };
+        let Ok(current) = std::fs::read(&abs) else {
+            continue;
+        };
         if current == target_blob {
             continue;
         }

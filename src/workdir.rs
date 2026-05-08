@@ -21,6 +21,7 @@ pub struct WorkdirEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum FileState {
     Untracked,
     /// Workdir differs from index.
@@ -35,6 +36,7 @@ pub enum FileState {
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct StatusReport {
     pub entries: Vec<(PathBuf, FileState)>,
 }

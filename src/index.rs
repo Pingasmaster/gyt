@@ -6,27 +6,38 @@
 
 use crate::errors::{GytError, Result};
 use crate::fs_util;
-use crate::hash::{HASH_LEN, ObjectId};
+use crate::hash::{ObjectId, HASH_LEN};
 use std::path::{Path, PathBuf};
 
+/// Magic bytes that identify a GYT index file.
 pub const MAGIC: &[u8; 4] = b"GYTI";
+/// Current index format version.
 pub const VERSION: u32 = 1;
 
 const HEADER_LEN: usize = 4 + 4 + 4; // magic + version + count
 const ENTRY_FIXED_LEN: usize = 8 + 8 + 8 + 4 + HASH_LEN + 2; // 62 bytes before path
 
+/// A single entry in the index, representing one path tracked in the staging area.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
+    /// Creation time in seconds since the Unix epoch.
     pub ctime_secs: i64,
+    /// Modification time in seconds since the Unix epoch.
     pub mtime_secs: i64,
+    /// File size in bytes.
     pub size: u64,
+    /// Git-style file mode (e.g. 0o100644 for regular files).
     pub mode: u32,
+    /// BLAKE3 hash of the blob content.
     pub hash: ObjectId,
+    /// Path relative to the repository root.
     pub path: PathBuf,
 }
 
+/// The in-memory index (staging area) backed by a GYTI binary file on disk.
 #[derive(Debug, Default)]
 pub struct Index {
+    /// List of indexed entries, sorted by path on write.
     pub entries: Vec<IndexEntry>,
 }
 
@@ -67,10 +78,12 @@ fn path_storage_bytes(path: &Path) -> Vec<u8> {
 }
 
 impl Index {
+    /// Create a new, empty index.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Find the index entry for the given path, or None if absent.
     pub fn find(&self, path: &Path) -> Option<&IndexEntry> {
         let key = path_storage_bytes(path);
         self.entries
@@ -78,6 +91,7 @@ impl Index {
             .find(|e| path_storage_bytes(&e.path) == key)
     }
 
+    /// Insert or replace an entry in the index by its path.
     pub fn insert(&mut self, entry: IndexEntry) {
         let key = path_storage_bytes(&entry.path);
         if let Some(slot) = self
@@ -91,6 +105,7 @@ impl Index {
         }
     }
 
+    /// Remove the entry matching the given path. Returns true if an entry was removed.
     pub fn remove(&mut self, path: &Path) -> bool {
         let key = path_storage_bytes(path);
         let before = self.entries.len();
@@ -98,6 +113,7 @@ impl Index {
         self.entries.len() != before
     }
 
+    /// Read the index from a GYTI binary file on disk. Returns an empty index if the file does not exist.
     pub fn read(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::new());
@@ -106,6 +122,7 @@ impl Index {
         Self::parse(&data)
     }
 
+    /// Write the index as a GYTI binary file, sorted by path.
     pub fn write(&self, path: &Path) -> Result<()> {
         // Sort entries by their stored (forward-slash utf-8) bytes.
         let mut sorted: Vec<&IndexEntry> = self.entries.iter().collect();
@@ -218,7 +235,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{HASH_LEN, ObjectId};
+    use crate::hash::{ObjectId, HASH_LEN};
 
     fn dummy_id(byte: u8) -> ObjectId {
         ObjectId([byte; HASH_LEN])
@@ -268,7 +285,7 @@ mod tests {
         // Spot-check one round-tripped entry.
         let found = back.find(Path::new("dir/longer-name.rs")).unwrap();
         assert_eq!(found.size, 2 * 13 + 7);
-        assert_eq!(found.mode, 0o100644);
+        assert_eq!(found.mode, 0o100_644);
         assert_eq!(found.hash, dummy_id(2));
     }
 

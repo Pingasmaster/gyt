@@ -16,8 +16,8 @@ pub const FLAG_XZ: u8 = 0x01;
 pub const SIZE_XZ_HIGH: usize = 10 * 1024 * 1024;
 
 #[cfg(feature = "xz")]
-pub fn encode(payload: &[u8]) -> Result<Vec<u8>> {
-    xz_impl::encode(payload)
+pub fn encode(payload: &[u8]) -> Vec<u8> {
+    xz_impl::encode(payload).expect("xz encoding failed")
 }
 
 #[cfg(not(feature = "xz"))]

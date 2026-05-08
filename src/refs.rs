@@ -8,12 +8,15 @@
 
 use crate::errors::{GytError, Result};
 use crate::fs_util;
-use crate::hash::{HEX_LEN, ObjectId};
+use crate::hash::{ObjectId, HEX_LEN};
 use std::path::{Path, PathBuf};
 
+/// Current state of HEAD — either pointing at a symbolic ref or a detached commit.
 #[derive(Debug, Clone)]
 pub enum Head {
+    /// HEAD points to a symbolic reference like `refs/heads/main`.
     Symbolic(String),
+    /// HEAD is detached at the given ObjectId.
     Detached(ObjectId),
 }
 
@@ -60,6 +63,7 @@ fn ref_path(repo_gyt_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(repo_gyt_dir.join(name))
 }
 
+/// Read the HEAD file from the repository's `.gyt/` directory.
 pub fn read_head(repo_gyt_dir: &Path) -> Result<Head> {
     let p = repo_gyt_dir.join("HEAD");
     if !p.exists() {
@@ -90,6 +94,7 @@ pub fn read_head(repo_gyt_dir: &Path) -> Result<Head> {
     Err(GytError::Refs(format!("malformed HEAD: {line:?}")))
 }
 
+/// Write HEAD to the repository's `.gyt/` directory.
 pub fn write_head(repo_gyt_dir: &Path, head: &Head) -> Result<()> {
     let p = repo_gyt_dir.join("HEAD");
     let body = match head {
@@ -102,6 +107,7 @@ pub fn write_head(repo_gyt_dir: &Path, head: &Head) -> Result<()> {
     fs_util::atomic_write(&p, body.as_bytes())
 }
 
+/// Read the ObjectId pointed to by a ref (e.g. `refs/heads/main`).
 pub fn read_ref(repo_gyt_dir: &Path, name: &str) -> Result<ObjectId> {
     let p = ref_path(repo_gyt_dir, name)?;
     if !p.exists() {
@@ -120,6 +126,7 @@ pub fn read_ref(repo_gyt_dir: &Path, name: &str) -> Result<ObjectId> {
     ObjectId::from_hex(hex).map_err(|e| GytError::Refs(format!("ref {name} parse error: {e}")))
 }
 
+/// Write an ObjectId into a ref (e.g. `refs/heads/main`).
 pub fn write_ref(repo_gyt_dir: &Path, name: &str, id: &ObjectId) -> Result<()> {
     let p = ref_path(repo_gyt_dir, name)?;
     let body = format!("{}\n", id.to_hex());
@@ -147,9 +154,10 @@ pub fn list_refs(repo_gyt_dir: &Path, prefix: &str) -> Result<Vec<(String, Objec
     Ok(out)
 }
 
+#[allow(clippy::only_used_in_recursion)]
 fn walk(
     dir: &Path,
-    _prefix: &str,
+    prefix: &str,
     repo_gyt_dir: &Path,
     out: &mut Vec<(String, ObjectId)>,
 ) -> Result<()> {
@@ -158,7 +166,7 @@ fn walk(
         let path = entry.path();
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            walk(&path, _prefix, repo_gyt_dir, out)?;
+            walk(&path, prefix, repo_gyt_dir, out)?;
         } else if ft.is_file() {
             // Reconstruct ref name from path relative to repo_gyt_dir.
             let rel = path.strip_prefix(repo_gyt_dir).map_err(|_| {
@@ -218,7 +226,7 @@ mod tests {
         write_head(&gyt, &Head::Symbolic("refs/heads/main".into())).unwrap();
         match read_head(&gyt).unwrap() {
             Head::Symbolic(s) => assert_eq!(s, "refs/heads/main"),
-            other => panic!("expected symbolic, got {other:?}"),
+            other @ Head::Detached(_) => panic!("expected symbolic, got {other:?}"),
         }
         // Verify file content exactly.
         let body = std::fs::read_to_string(gyt.join("HEAD")).unwrap();
@@ -232,7 +240,7 @@ mod tests {
         write_head(&gyt, &Head::Detached(id)).unwrap();
         match read_head(&gyt).unwrap() {
             Head::Detached(got) => assert_eq!(got, id),
-            other => panic!("expected detached, got {other:?}"),
+            other @ Head::Symbolic(_) => panic!("expected detached, got {other:?}"),
         }
         let body = std::fs::read_to_string(gyt.join("HEAD")).unwrap();
         assert_eq!(body, format!("blake3:{}\n", id.to_hex()));

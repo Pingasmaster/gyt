@@ -193,7 +193,7 @@ mod tests {
         let _ = refs::read_ref(&repo.gyt_dir, "refs/heads/trunk").unwrap();
         match refs::read_head(&repo.gyt_dir).unwrap() {
             Head::Symbolic(s) => assert_eq!(s, "refs/heads/trunk"),
-            other => panic!("expected symbolic, got {other:?}"),
+            other @ Head::Detached(_) => panic!("expected symbolic, got {other:?}"),
         }
     }
 

@@ -24,9 +24,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 
+/// Repository configuration loaded from `.gyt/config.toml`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// The user's display name.
     pub user_name: Option<String>,
+    /// The user's email address.
     pub user_email: Option<String>,
     /// Map remote name -> url.
     pub remotes: BTreeMap<String, String>,
@@ -35,6 +38,8 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load repository configuration from `.gyt/config.toml`, applying
+    /// environment overrides (`GYT_AUTHOR_NAME`, `GYT_AUTHOR_EMAIL`).
     pub fn load(repo: &Repo) -> Result<Self> {
         let p = repo.gyt_dir.join("config.toml");
         let mut cfg = if p.exists() {
@@ -66,6 +71,7 @@ impl Config {
         Ok(format!("{name} <{email}>"))
     }
 
+    /// Write this configuration to `.gyt/config.toml` inside the given directory.
     pub fn write(&self, gyt_dir: &Path) -> Result<()> {
         let mut s = String::new();
         if self.user_name.is_some() || self.user_email.is_some() {

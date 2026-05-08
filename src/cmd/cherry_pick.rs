@@ -40,9 +40,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         }
     }
 
-    let rev = rev.ok_or_else(|| {
-        GytError::InvalidArgument("cherry-pick: <commit> is required".into())
-    })?;
+    let rev =
+        rev.ok_or_else(|| GytError::InvalidArgument("cherry-pick: <commit> is required".into()))?;
 
     let target_id = resolve_rev(repo, &rev)?;
     let target_obj = store::read(&repo.gyt_dir, &target_id)?;
@@ -67,12 +66,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     // Build new commit with target tree, current HEAD as parent
     let parents = match refs::read_head(&repo.gyt_dir)? {
-        Head::Symbolic(_) => {
-            match refs::resolve(&repo.gyt_dir, &head)? {
-                Some(id) => vec![id],
-                None => vec![],
-            }
-        }
+        Head::Symbolic(_) => match refs::resolve(&repo.gyt_dir, &head)? {
+            Some(id) => vec![id],
+            None => vec![],
+        },
         Head::Detached(id) => vec![id],
     };
 
@@ -161,7 +158,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn flatten_tree(repo: &Repo, tree_id: &ObjectId) -> Result<std::collections::BTreeMap<PathBuf, (u32, ObjectId)>> {
+fn flatten_tree(
+    repo: &Repo,
+    tree_id: &ObjectId,
+) -> Result<std::collections::BTreeMap<PathBuf, (u32, ObjectId)>> {
     crate::cmd::util::flatten_tree(repo, tree_id)
 }
 
@@ -188,25 +188,25 @@ mod tests {
         write_identity_config(&r.gyt_dir());
         let mut repo = r.open();
         let first_commit_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        
+
         // Create a second commit
         r.commit_next(&[("hello.txt", b"v2\n", false)]);
-        
+
         // Re-open to see the new state
         repo = Repo::open(&r.root).unwrap();
-        
+
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-        
+
         let result = run_in(&repo, &[first_commit_id.to_hex()]);
         std::env::set_current_dir(&prev).unwrap();
-        
+
         result.unwrap();
-        
+
         // Verify the commit was created
         let _head_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
         // It should be a new commit
-        
+
         // Verify the content is from first commit
         let content = fs::read_to_string(repo.workdir.join("hello.txt")).unwrap();
         assert_eq!(content, "hello\n");

@@ -35,7 +35,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             }
             _ => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
-                    "grep: unknown flag {}", args[i]
+                    "grep: unknown flag {}",
+                    args[i]
                 )));
             }
         }
@@ -113,13 +114,13 @@ fn is_binary(buf: &[u8]) -> bool {
 fn grep_bytes(content: &[u8], pattern: &[u8]) -> Option<usize> {
     let text = std::str::from_utf8(content).ok()?;
     let pattern_str = std::str::from_utf8(pattern).ok()?;
-    
+
     for (line_num, line) in text.lines().enumerate() {
         if line.contains(pattern_str) {
             return Some(line_num + 1);
         }
     }
-    
+
     None
 }
 
@@ -129,7 +130,10 @@ struct FlatEntry {
     hash: ObjectId,
 }
 
-fn flatten_tree(repo: &Repo, tree_id: &ObjectId) -> Result<std::collections::BTreeMap<String, FlatEntry>> {
+fn flatten_tree(
+    repo: &Repo,
+    tree_id: &ObjectId,
+) -> Result<std::collections::BTreeMap<String, FlatEntry>> {
     let mut out = std::collections::BTreeMap::new();
     walk_tree(repo, tree_id, "", &mut out)?;
     Ok(out)
@@ -153,7 +157,13 @@ fn walk_tree(
         if e.mode == tree::MODE_DIR {
             walk_tree(repo, &e.hash, &path, out)?;
         } else {
-            out.insert(path, FlatEntry { _mode: e.mode, hash: e.hash });
+            out.insert(
+                path,
+                FlatEntry {
+                    _mode: e.mode,
+                    hash: e.hash,
+                },
+            );
         }
     }
     Ok(())
@@ -174,10 +184,10 @@ mod tests {
 
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-        
+
         let result = run_in(&repo, &["hello".into()]);
         std::env::set_current_dir(&prev).unwrap();
-        
+
         result.unwrap(); // Should find "hello" in hello.txt
     }
 
@@ -190,10 +200,10 @@ mod tests {
 
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-        
+
         let result = run_in(&repo, &["hello".into(), main_id.to_hex()]);
         std::env::set_current_dir(&prev).unwrap();
-        
+
         result.unwrap();
     }
 
@@ -201,13 +211,13 @@ mod tests {
     fn grep_no_match() {
         let r = TestRepo::new("gyt-grep-none");
         let repo = r.open();
-        
+
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-        
+
         let result = run_in(&repo, &["nonexistent123".into()]);
         std::env::set_current_dir(&prev).unwrap();
-        
+
         assert!(result.is_ok()); // Should succeed but print no matches
     }
 }

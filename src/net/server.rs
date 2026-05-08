@@ -382,7 +382,10 @@ fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String
     let start_idx = (page.saturating_sub(1)) * per_page;
     let page_commits: Vec<_> = commits.into_iter().skip(start_idx).take(per_page).collect();
 
-    let items: Vec<String> = page_commits.iter().map(super::api::CommitInfo::to_json).collect();
+    let items: Vec<String> = page_commits
+        .iter()
+        .map(super::api::CommitInfo::to_json)
+        .collect();
     let body = format!(
         r#"{{"items":[{}],"page":{},"per_page":{},"total":{}}}"#,
         items.join(","),
@@ -651,7 +654,10 @@ fn diff_revs(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         });
     }
 
-    let items: Vec<String> = files.iter().map(super::api::DiffFileInfo::to_json).collect();
+    let items: Vec<String> = files
+        .iter()
+        .map(super::api::DiffFileInfo::to_json)
+        .collect();
     let body = format!("[{}]", items.join(","));
     json_response(&body)
 }
@@ -751,6 +757,7 @@ fn search(state: &ServerState, params: &[(String, String)]) -> (u16, String, Vec
     }
 }
 
+#[allow(clippy::manual_let_else)]
 fn search_commits(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, String) {
     let head = match refs::read_head(&repo.gyt_dir) {
         Ok(h) => h,
@@ -788,6 +795,7 @@ fn search_commits(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8
     json_response(&body)
 }
 
+#[allow(clippy::manual_let_else)]
 fn search_code(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, String) {
     let head = match refs::read_head(&repo.gyt_dir) {
         Ok(h) => h,

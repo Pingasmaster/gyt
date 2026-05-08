@@ -1,5 +1,5 @@
 use crate::errors::Result;
-use crate::net::server::{serve, ServeConfig};
+use crate::net::server::{ServeConfig, serve};
 use std::path::PathBuf;
 
 pub fn parse_args(args: &[String]) -> Result<ServeConfig> {

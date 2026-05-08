@@ -108,7 +108,10 @@ pub fn run(args: &[String]) -> Result<()> {
     for p in &resolved {
         if p.is_dir() {
             fs::remove_dir_all(p)?;
-            eprintln!("removed (dir): {}", fs_path(p.strip_prefix(&cwd).unwrap_or(p)));
+            eprintln!(
+                "removed (dir): {}",
+                fs_path(p.strip_prefix(&cwd).unwrap_or(p))
+            );
         } else {
             fs::remove_file(p)?;
             eprintln!("removed: {}", fs_path(p.strip_prefix(&cwd).unwrap_or(p)));
@@ -160,8 +163,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let mut commits: HashMap<ObjectId, Commit> = HashMap::new();
     let mut queue: Vec<ObjectId> = Vec::new();
-    let mut visited: std::collections::HashSet<ObjectId> =
-        std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
 
     for (_, head) in &head_refs {
         if is_null(head) {
@@ -277,7 +279,9 @@ fn rewrite_tree_entries(
         })
         .map(|mut e| {
             if e.mode == MODE_DIR {
-                e.hash = rewrite_tree_entries(repo_path, &e.hash, targets, cwd, seen).ok().unwrap_or(e.hash);
+                e.hash = rewrite_tree_entries(repo_path, &e.hash, targets, cwd, seen)
+                    .ok()
+                    .unwrap_or(e.hash);
             }
             e
         })

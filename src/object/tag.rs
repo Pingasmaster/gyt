@@ -68,6 +68,7 @@ pub fn write(repo: &Path, t: &Tag) -> Result<ObjectId> {
     store::write_bytes(repo, ObjectKind::Tag, &encode(t))
 }
 
+#[allow(dead_code)]
 pub fn read(repo: &Path, id: &ObjectId) -> Result<Tag> {
     let obj = store::read(repo, id)?;
     if obj.kind != ObjectKind::Tag {

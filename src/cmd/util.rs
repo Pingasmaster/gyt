@@ -171,17 +171,20 @@ pub mod test_helpers {
     static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn lock() -> MutexGuard<'static, ()> {
-        GLOBAL_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn tmp_dir(prefix: &str) -> PathBuf {
+        #[allow(clippy::items_after_statements)]
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         // Add a random component to dedupe within the same nanosecond.
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}"));
         std::fs::create_dir_all(&p).unwrap();

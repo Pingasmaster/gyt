@@ -1,8 +1,8 @@
 use crate::cmd::util::resolve_rev;
 use crate::errors::{GytError, Result};
-use crate::index::IndexEntry;
 use crate::hash::ObjectId;
 use crate::index::Index;
+use crate::index::IndexEntry;
 use crate::object::{ObjectKind, blob, commit as commit_obj, store, tree};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
@@ -40,7 +40,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             }
             _ => {
                 return Err(GytError::InvalidArgument(format!(
-                    "rebase: unknown flag {}", args[i]
+                    "rebase: unknown flag {}",
+                    args[i]
                 )));
             }
         }
@@ -87,7 +88,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             return Ok(());
         }
         return Err(GytError::Unsupported(
-            "rebase: current branch is not an ancestor of upstream (no three-way rebase in v1)".into(),
+            "rebase: current branch is not an ancestor of upstream (no three-way rebase in v1)"
+                .into(),
         ));
     }
     // Unborn HEAD: just point at target
@@ -98,7 +100,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     // Also update working tree to match target
     let target_commit = commit_obj::read(&repo.gyt_dir, &target_id)?;
     let files = flatten_tree(&repo.gyt_dir, &target_commit.tree)?;
-    
+
     // Update index
     let mut idx = Index::new();
     for (p, e) in &files {
@@ -136,12 +138,16 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn is_ancestor(gyt_dir: &std::path::Path, ancestor: &ObjectId, descendant: &ObjectId) -> Result<bool> {
+fn is_ancestor(
+    gyt_dir: &std::path::Path,
+    ancestor: &ObjectId,
+    descendant: &ObjectId,
+) -> Result<bool> {
     use std::collections::HashSet;
-    
+
     let mut seen = HashSet::new();
     let mut stack = vec![*descendant];
-    
+
     while let Some(id) = stack.pop() {
         if id == *ancestor {
             return Ok(true);
@@ -157,7 +163,7 @@ fn is_ancestor(gyt_dir: &std::path::Path, ancestor: &ObjectId, descendant: &Obje
             }
         }
     }
-    
+
     Ok(false)
 }
 
@@ -167,7 +173,10 @@ struct FlatEntry {
     hash: ObjectId,
 }
 
-fn flatten_tree(gyt_dir: &std::path::Path, tree_id: &ObjectId) -> Result<std::collections::BTreeMap<String, FlatEntry>> {
+fn flatten_tree(
+    gyt_dir: &std::path::Path,
+    tree_id: &ObjectId,
+) -> Result<std::collections::BTreeMap<String, FlatEntry>> {
     let mut out = std::collections::BTreeMap::new();
     walk_tree(gyt_dir, tree_id, "", &mut out)?;
     Ok(out)
@@ -191,7 +200,13 @@ fn walk_tree(
         if e.mode == tree::MODE_DIR {
             walk_tree(gyt_dir, &e.hash, &path, out)?;
         } else {
-            out.insert(path, FlatEntry { mode: e.mode, hash: e.hash });
+            out.insert(
+                path,
+                FlatEntry {
+                    mode: e.mode,
+                    hash: e.hash,
+                },
+            );
         }
     }
     Ok(())
@@ -220,28 +235,28 @@ mod tests {
         let r = TestRepo::new("gyt-rebase-ff");
         let mut repo = r.open();
         let main_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        
+
         // Create a branch from main
         refs::write_ref(&repo.gyt_dir, "refs/heads/feature", &main_id).unwrap();
-        
+
         // Advance main with a new commit
         let (main_id_v2, _) = r.commit_next(&[("hello.txt", b"v2\n", false)]);
-        
+
         // Reopen to see the new state and switch HEAD to feature
         repo = Repo::open(&r.root).unwrap();
-        
+
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-        
+
         // Switch HEAD to feature branch
         refs::write_head(&repo.gyt_dir, &Head::Symbolic("refs/heads/feature".into())).unwrap();
-        
+
         // Now rebase feature onto main
         let result = run_in(&repo, &["--ff-only".into(), "main".into()]);
         std::env::set_current_dir(&prev).unwrap();
-        
+
         result.unwrap();
-        
+
         // Verify feature now points to main's commit
         let feature_id = refs::read_ref(&repo.gyt_dir, "refs/heads/feature").unwrap();
         assert_eq!(feature_id, main_id_v2);

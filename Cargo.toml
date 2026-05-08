@@ -15,7 +15,7 @@ blake3 = "=1.8.5"
 rustls = { version = "=0.23.40", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 rustls-pki-types = "=1.14.1"
 webpki-roots = "=1.0.7"
-lzma-rust2 = { version = "=0.16.2", optional = true, default-features = false, features = ["std", "xz"] }
+lzma-rust2 = { version = "=0.16.2", optional = true, default-features = false, features = ["std", "xz", "encoder"] }
 include_dir = "=0.7.4"
 
 [profile.release]

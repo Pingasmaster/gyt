@@ -18,7 +18,7 @@ pub enum ObjectKind {
 }
 
 impl ObjectKind {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Blob => "blob",
             Self::Tree => "tree",
@@ -40,12 +40,14 @@ impl ObjectKind {
 
 #[derive(Debug, Clone)]
 pub struct Object {
+    #[allow(dead_code)]
     pub id: ObjectId,
     pub kind: ObjectKind,
     pub payload: Vec<u8>,
 }
 
 impl Object {
+    #[allow(dead_code)]
     pub fn new(kind: ObjectKind, payload: Vec<u8>) -> Self {
         let raw = store::build_raw(kind, &payload);
         let id = crate::hash::hash_bytes(&raw);

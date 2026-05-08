@@ -223,7 +223,9 @@ fn do_list_at(cwd: &Path) -> Result<()> {
             let wt_dir = wts_dir.join(&name);
             // Resolve the worktree's actual workdir from <wt_dir>/gytdir, which
             // contains the path to <abs_path>/.gyt FILE.
-            let Ok(gytdir_marker) = std::fs::read_to_string(wt_dir.join("gytdir")) else { continue };
+            let Ok(gytdir_marker) = std::fs::read_to_string(wt_dir.join("gytdir")) else {
+                continue;
+            };
             let marker_path = PathBuf::from(gytdir_marker.trim());
             let aux_workdir = match marker_path.parent() {
                 Some(p) => p.to_path_buf(),
@@ -316,7 +318,9 @@ fn resolve_worktree(main_gyt: &Path, target: &str) -> Result<(PathBuf, PathBuf)>
             continue;
         }
         let wt_dir = entry.path();
-        let Ok(aux) = read_aux_workdir(&wt_dir) else { continue };
+        let Ok(aux) = read_aux_workdir(&wt_dir) else {
+            continue;
+        };
         // Collapsed to single `if` requires unstable `let_chains` (&& pattern).
         #[allow(clippy::collapsible_if)]
         if let Some(cabs) = &candidate_abs {
@@ -343,8 +347,12 @@ fn read_aux_workdir(wt_dir: &Path) -> Result<PathBuf> {
 
 fn worktree_is_dirty(main_gyt: &Path, wt_dir: &Path, aux_workdir: &Path) -> Result<bool> {
     let head = refs::read_head(wt_dir)?;
-    let Ok(head_commit) = refs::resolve(main_gyt, &head) else { return Ok(false) };
-    let Some(head_commit) = head_commit else { return Ok(false) };
+    let Ok(head_commit) = refs::resolve(main_gyt, &head) else {
+        return Ok(false);
+    };
+    let Some(head_commit) = head_commit else {
+        return Ok(false);
+    };
     let head_obj = commit_obj::read(main_gyt, &head_commit)?;
     let tree_files = flatten_tree(main_gyt, &head_obj.tree, Path::new(""))?;
 

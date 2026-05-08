@@ -336,7 +336,7 @@ mod tests {
         // Verify HEAD is symbolic to main
         match refs::read_head(&repo.gyt_dir).unwrap() {
             Head::Symbolic(s) => assert_eq!(s, "refs/heads/main"),
-            other => panic!("unexpected HEAD: {other:?}"),
+            other @ Head::Detached(_) => panic!("unexpected HEAD: {other:?}"),
         }
         // Verify workdir materialized
         let on_disk = std::fs::read(repo.workdir.join("hello.txt")).unwrap();

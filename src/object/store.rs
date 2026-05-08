@@ -58,6 +58,7 @@ pub fn write_bytes(repo: &Path, kind: ObjectKind, payload: &[u8]) -> Result<Obje
     Ok(id)
 }
 
+#[allow(dead_code)]
 pub fn write(repo: &Path, obj: &Object) -> Result<ObjectId> {
     let id = write_bytes(repo, obj.kind, &obj.payload)?;
     debug_assert_eq!(id, obj.id);

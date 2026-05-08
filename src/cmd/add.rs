@@ -279,7 +279,7 @@ fn prompt_ignored(path: &str, workdir: &Path) -> Option<IgnoredDecision> {
 /// Write the embedded default .gytignore template to the workdir root.
 fn write_default_gytignore(workdir: &Path) -> Result<()> {
     use crate::fs_util;
-    use include_dir::{include_dir, Dir};
+    use include_dir::{Dir, include_dir};
 
     static DEFAULT_GYTIGNORE_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/cmd");
 

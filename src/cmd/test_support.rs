@@ -167,14 +167,15 @@ pub struct TmpDir(PathBuf);
 
 impl TmpDir {
     pub fn new(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         // Add a per-call counter so prefix collisions across tests are avoided.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}"));
         std::fs::create_dir_all(&p).unwrap();
