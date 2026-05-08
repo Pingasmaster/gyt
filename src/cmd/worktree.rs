@@ -12,7 +12,9 @@ use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
 use crate::index::{Index, IndexEntry};
 use crate::object::commit as commit_obj;
-use crate::object::tree::{self, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, TreeEntry};
+use crate::object::tree::{self, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
+#[cfg(test)]
+use crate::object::tree::TreeEntry;
 use crate::refs::{self, Head};
 use crate::repo::{GYT_DIR, Repo};
 use std::path::{Path, PathBuf};
@@ -321,12 +323,9 @@ fn resolve_worktree(main_gyt: &Path, target: &str) -> Result<(PathBuf, PathBuf)>
         let Ok(aux) = read_aux_workdir(&wt_dir) else {
             continue;
         };
-        // Collapsed to single `if` requires unstable `let_chains` (&& pattern).
-        #[allow(clippy::collapsible_if)]
-        if let Some(cabs) = &candidate_abs {
-            if aux == *cabs {
-                return Ok((wt_dir, aux));
-            }
+        // Collapsed via stable let-chains (edition 2024).
+        if let Some(cabs) = &candidate_abs && aux == *cabs {
+            return Ok((wt_dir, aux));
         }
         if aux.file_name().map(|s| s.to_string_lossy().into_owned()) == Some(target.to_string()) {
             return Ok((wt_dir, aux));
@@ -453,12 +452,9 @@ fn short_hex(id: &ObjectId) -> String {
 
 fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
     // Accept: full hex, or branch/tag name (refs/heads/<x>, refs/tags/<x>).
-    // Collapsed `if` requires unstable `let_chains` (&& pattern).
-    #[allow(clippy::collapsible_if)]
-    if rev.len() == crate::hash::HEX_LEN {
-        if let Ok(id) = ObjectId::from_hex(rev) {
-            return Ok(id);
-        }
+    // Collapsed via stable let-chains (edition 2024).
+    if rev.len() == crate::hash::HEX_LEN && let Ok(id) = ObjectId::from_hex(rev) {
+        return Ok(id);
     }
     if let Ok(id) = refs::read_ref(&repo.gyt_dir, &format!("refs/heads/{rev}")) {
         return Ok(id);
@@ -588,16 +584,7 @@ fn build_index_from_tree(gyt_dir: &Path, tree_id: &ObjectId, workdir: &Path) -> 
     Ok(idx)
 }
 
-// Suppress unused warnings for tree-entry-builder helpers (TreeEntry is used
-// transitively elsewhere in this module).
-#[allow(dead_code)]
-fn _dummy_tree_entry() -> TreeEntry {
-    TreeEntry {
-        mode: MODE_FILE,
-        name: Vec::new(),
-        hash: ObjectId([0u8; 32]),
-    }
-}
+
 
 // -----------------------------------------------------------------------------
 // tests

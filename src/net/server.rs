@@ -757,15 +757,12 @@ fn search(state: &ServerState, params: &[(String, String)]) -> (u16, String, Vec
     }
 }
 
-#[allow(clippy::manual_let_else)]
 fn search_commits(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, String) {
-    let head = match refs::read_head(&repo.gyt_dir) {
-        Ok(h) => h,
-        Err(_) => return json_response(r#"{"kind":"commits","items":[]}"#),
+    let Ok(head) = refs::read_head(&repo.gyt_dir) else {
+        return json_response(r#"{"kind":"commits","items":[]}"#);
     };
-    let start = match refs::resolve(&repo.gyt_dir, &head) {
-        Ok(Some(id)) => id,
-        _ => return json_response(r#"{"kind":"commits","items":[]}"#),
+    let Ok(Some(start)) = refs::resolve(&repo.gyt_dir, &head) else {
+        return json_response(r#"{"kind":"commits","items":[]}"#);
     };
 
     let mut results = Vec::new();
@@ -795,24 +792,19 @@ fn search_commits(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8
     json_response(&body)
 }
 
-#[allow(clippy::manual_let_else)]
 fn search_code(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, String) {
-    let head = match refs::read_head(&repo.gyt_dir) {
-        Ok(h) => h,
-        Err(_) => return json_response(r#"{"kind":"code","items":[]}"#),
+    let Ok(head) = refs::read_head(&repo.gyt_dir) else {
+        return json_response(r#"{"kind":"code","items":[]}"#);
     };
-    let _start = match refs::resolve(&repo.gyt_dir, &head) {
-        Ok(Some(id)) => id,
-        _ => return json_response(r#"{"kind":"code","items":[]}"#),
+    let Ok(Some(_)) = refs::resolve(&repo.gyt_dir, &head) else {
+        return json_response(r#"{"kind":"code","items":[]}"#);
     };
-    let tree_id = match util::resolve_tree(repo, "HEAD") {
-        Ok(id) => id,
-        Err(_) => return json_response(r#"{"kind":"code","items":[]}"#),
+    let Ok(tree_id) = util::resolve_tree(repo, "HEAD") else {
+        return json_response(r#"{"kind":"code","items":[]}"#);
     };
 
-    let files = match util::flatten_tree(repo, &tree_id) {
-        Ok(f) => f,
-        Err(_) => return json_response(r#"{"kind":"code","items":[]}"#),
+    let Ok(files) = util::flatten_tree(repo, &tree_id) else {
+        return json_response(r#"{"kind":"code","items":[]}"#);
     };
 
     let query_lower = query.to_ascii_lowercase();

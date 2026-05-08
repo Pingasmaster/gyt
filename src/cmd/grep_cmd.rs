@@ -3,8 +3,6 @@ use crate::hash::ObjectId;
 use crate::object::{blob, tree};
 use crate::repo::Repo;
 
-// Scaffolding for `gyt grep` - fields and methods are used in commit phase.
-#[allow(dead_code)]
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;

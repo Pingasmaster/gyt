@@ -212,8 +212,6 @@ fn walk_tree(
     Ok(())
 }
 
-// Scaffolding: helper used during commit phase when rebase is connected.
-#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
