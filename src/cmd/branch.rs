@@ -1,7 +1,10 @@
 use crate::errors::{GytError, Result};
+use crate::hash::ObjectId;
+use crate::object::{ObjectKind, commit as commit_obj, store};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
 use crate::term;
+use std::collections::HashSet;
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -21,7 +24,15 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                     "branch -d <name>: expected one branch name".into(),
                 ));
             }
-            delete(repo, &args[1])
+            delete(repo, &args[1], false)
+        }
+        "-D" | "--force" => {
+            if args.len() != 2 {
+                return Err(GytError::InvalidArgument(
+                    "branch -D <name>: expected one branch name".into(),
+                ));
+            }
+            delete(repo, &args[1], true)
         }
         "-m" | "--rename" => {
             if args.len() != 3 {
@@ -114,7 +125,7 @@ fn create(repo: &Repo, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete(repo: &Repo, name: &str) -> Result<()> {
+fn delete(repo: &Repo, name: &str, force: bool) -> Result<()> {
     validate_branch_name(name)?;
     if let Some(cur) = current_branch(&repo.gyt_dir)?
         && cur == name
@@ -122,6 +133,21 @@ fn delete(repo: &Repo, name: &str) -> Result<()> {
         return Err(GytError::Refs(format!(
             "cannot delete the current branch: {name}"
         )));
+    }
+    if !force {
+        // Check merge safety: refuse to delete if the branch is not fully merged
+        // into HEAD or another ref.
+        let ref_name = format!("refs/heads/{name}");
+        let branch_id = refs::read_ref(&repo.gyt_dir, &ref_name)?;
+        let head = refs::read_head(&repo.gyt_dir)?;
+        if let Some(head_id) = refs::resolve(&repo.gyt_dir, &head)?
+            && !is_ancestor(&repo.gyt_dir, &branch_id, &head_id)?
+        {
+            return Err(GytError::Refs(format!(
+                "branch {name} is not fully merged; refusing to delete \
+                 (use -D to force-delete)"
+            )));
+        }
     }
     let ref_name = format!("refs/heads/{name}");
     refs::delete_ref(&repo.gyt_dir, &ref_name)
@@ -147,6 +173,31 @@ fn rename(repo: &Repo, old: &str, new: &str) -> Result<()> {
         refs::write_head(&repo.gyt_dir, &Head::Symbolic(new_ref))?;
     }
     Ok(())
+}
+
+/// Walk the full parent DAG from `descendant` backwards, checking whether
+/// `ancestor` is reachable.  Returns `true` if they are the same commit.
+fn is_ancestor(gyt_dir: &Path, ancestor: &ObjectId, descendant: &ObjectId) -> Result<bool> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![*descendant];
+
+    while let Some(id) = stack.pop() {
+        if id == *ancestor {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        let obj = store::read(gyt_dir, &id)?;
+        if obj.kind == ObjectKind::Commit {
+            let commit = commit_obj::read(gyt_dir, &id)?;
+            for parent in &commit.parents {
+                stack.push(*parent);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -182,6 +233,41 @@ mod tests {
 
         // cannot delete current branch
         assert!(run_in(&repo, &["-d".into(), "main".into()]).is_err());
+    }
+
+    #[test]
+    fn branch_delete_rejects_unmerged() {
+        let r = TestRepo::new("gyt-branch-unmerged");
+        let repo = r.open();
+
+        // Create a branch from main
+        run_in(&repo, &["unmerged".into()]).unwrap();
+
+        // Switch to the new branch and advance it with a new commit
+        refs::write_head(
+            &repo.gyt_dir,
+            &Head::Symbolic("refs/heads/unmerged".into()),
+        )
+        .unwrap();
+        r.commit_next(&[("new.txt", b"content\n", false)]);
+
+        // Switch back to main
+        refs::write_head(&repo.gyt_dir, &Head::Symbolic("refs/heads/main".into())).unwrap();
+        let repo = Repo::open(&r.root).unwrap();
+
+        // Deleting unmerged branch with -d should be rejected
+        let err = run_in(&repo, &["-d".into(), "unmerged".into()]);
+        assert!(err.is_err(), "expected error deleting unmerged branch");
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("not fully merged"),
+            "error should mention merge safety"
+        );
+
+        // Force delete with -D should work
+        run_in(&repo, &["-D".into(), "unmerged".into()]).unwrap();
+        assert!(refs::read_ref(&repo.gyt_dir, "refs/heads/unmerged").is_err());
     }
 
     #[test]

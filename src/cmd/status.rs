@@ -11,12 +11,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
-    if let Some(a) = args.first() {
+    let mut short = false;
+    for a in args {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("gyt status\n\nShow staged, modified, and untracked changes.");
+                println!("gyt status [--short|--porcelain]\n\nShow staged, modified, and untracked changes.");
                 return Ok(());
             }
+            "--short" | "--porcelain" => short = true,
             other => {
                 return Err(GytError::InvalidArgument(format!(
                     "status: unexpected argument {other}"
@@ -58,6 +60,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut staged: Vec<(PathBuf, &'static str)> = Vec::new();
     let mut modified: Vec<PathBuf> = Vec::new();
     let mut untracked: Vec<PathBuf> = Vec::new();
+    let mut staged_set: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut modified_set: BTreeSet<PathBuf> = BTreeSet::new();
 
     let mut seen_in_workdir: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -87,9 +91,11 @@ pub fn run(args: &[String]) -> Result<()> {
                         "modified"
                     };
                     staged.push((ent.path.clone(), label));
+                    staged_set.insert(ent.path.clone());
                 }
                 if wd_vs_idx {
                     modified.push(ent.path.clone());
+                    modified_set.insert(ent.path.clone());
                 }
             }
         }
@@ -110,17 +116,26 @@ pub fn run(args: &[String]) -> Result<()> {
         let in_index = index_map.contains_key(&p);
         let in_head = head_map.contains_key(&p);
         if in_index && in_head {
-            modified.push(p);
+            modified.push(p.clone());
+            modified_set.insert(p);
         } else if !in_index && in_head {
-            staged.push((p, "deleted"));
+            staged.push((p.clone(), "deleted"));
+            staged_set.insert(p);
         } else if in_index && !in_head {
             staged.push((p.clone(), "new file"));
-            modified.push(p);
+            staged_set.insert(p.clone());
+            modified.push(p.clone());
+            modified_set.insert(p);
         }
+
     }
 
-    let use_color = term::use_color();
-    print_status(&staged, &modified, &untracked, use_color);
+    if short {
+        print_short_status(&staged_set, &modified_set, &untracked);
+    } else {
+        let use_color = term::use_color();
+        print_status(&staged, &modified, &untracked, use_color);
+    }
     Ok(())
 }
 
@@ -176,6 +191,43 @@ fn print_status(
         println!();
     }
     if staged.is_empty() && modified.is_empty() && untracked.is_empty() {
+        println!("clean");
+    }
+}
+
+fn print_short_status(
+    staged: &BTreeSet<PathBuf>,
+    modified: &BTreeSet<PathBuf>,
+    untracked: &[PathBuf],
+) {
+    let mut all: BTreeSet<PathBuf> = BTreeSet::new();
+    for k in staged {
+        all.insert(k.clone());
+    }
+    for k in modified {
+        all.insert(k.clone());
+    }
+    for p in untracked {
+        all.insert(p.clone());
+    }
+
+    // Use a stable sorted iteration for reproducible output.
+    let sorted: Vec<&PathBuf> = all.iter().collect();
+    // sorted is already in BTree order (alphabetical)
+
+    let seen_untracked: BTreeSet<&PathBuf> = untracked.iter().collect();
+
+    for p in &sorted {
+        let x = if staged.contains(*p) { 'M' } else { ' ' };
+        let y = if modified.contains(*p) { 'M' } else { ' ' };
+        let line = format!("{x}{y} {}", forward_slash(p));
+        if seen_untracked.contains(p) {
+            println!("?? {}", forward_slash(p));
+        } else {
+            println!("{line}");
+        }
+    }
+    if sorted.is_empty() {
         println!("clean");
     }
 }

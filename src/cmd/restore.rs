@@ -13,28 +13,109 @@ pub fn run(args: &[String]) -> Result<()> {
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(GytError::InvalidArgument(
-            "restore: at least one path required (or '.')".into(),
+            "usage: gyt restore [--staged] [--worktree] <path>...".into(),
         ));
     }
-    let idx = Index::read(&repo.index_path())?;
+    let mut staged = false;
+    let mut worktree = false;
+    let mut path_args: Vec<String> = Vec::new();
 
-    let targets: Vec<PathBuf> = if args.len() == 1 && args[0] == "." {
-        idx.entries.iter().map(|e| e.path.clone()).collect()
-    } else {
-        args.iter().map(PathBuf::from).collect()
-    };
-
-    for path in &targets {
-        match idx.find(path) {
-            Some(entry) => restore_one(repo, entry)?,
-            None => {
-                eprintln!(
-                    "gyt restore: {}: not in the index, skipping",
-                    path.display()
-                );
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--staged" => {
+                staged = true;
+                i += 1;
+            }
+            "--worktree" | "--w" => {
+                worktree = true;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!("gyt restore [--staged] [--worktree] <path>...");
+                println!("  --staged    restore from HEAD to the index (unstages)");
+                println!("  --worktree  restore from the index to the working tree (default)");
+                println!("  If neither --staged nor --worktree is given, --worktree is implied.");
+                println!("  If both are given, both operations are performed.");
+                return Ok(());
+            }
+            other => {
+                path_args.push(other.to_string());
+                i += 1;
             }
         }
     }
+
+    // Default to --worktree if neither is given.
+    if !staged && !worktree {
+        worktree = true;
+    }
+
+    if path_args.is_empty() {
+        return Err(GytError::InvalidArgument(
+            "restore: at least one path required (or '.')".into(),
+        ));
+    }
+
+    let mut idx = Index::read(&repo.index_path())?;
+
+    let targets: Vec<PathBuf> = if path_args.len() == 1 && path_args[0] == "." {
+        // When doing staged restore, "." means all tracked entries from HEAD.
+        idx.entries.iter().map(|e| e.path.clone()).collect()
+    } else {
+        path_args.iter().map(PathBuf::from).collect()
+    };
+
+    for path in &targets {
+        if staged {
+            // Restore from HEAD to index (unstage).
+            let head = crate::refs::read_head(&repo.gyt_dir)?;
+            let head_id = crate::refs::resolve(&repo.gyt_dir, &head)?;
+            match head_id {
+                Some(id) => {
+                    let c = crate::object::commit::read(&repo.gyt_dir, &id)?;
+                    let flat = crate::cmd::util::flatten_tree(repo, &c.tree)?;
+                    match flat.get(path) {
+                        Some((mode, hash)) => {
+                            idx.insert(IndexEntry {
+                                ctime_secs: 0,
+                                mtime_secs: 0,
+                                size: 0,
+                                mode: *mode,
+                                hash: *hash,
+                                path: path.clone(),
+                            });
+                        }
+                        None => {
+                            // Path not in HEAD: remove from index entirely.
+                            idx.remove(path);
+                        }
+                    }
+                }
+                None => {
+                    // No HEAD commit — path not in HEAD, remove from index.
+                    idx.remove(path);
+                }
+            }
+        }
+
+        if worktree {
+            match idx.find(path) {
+                Some(entry) => restore_one(repo, entry)?,
+                None => {
+                    eprintln!(
+                        "gyt restore: {}: not in the index, skipping",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if staged {
+        idx.write(&repo.index_path())?;
+    }
+
     Ok(())
 }
 
@@ -85,6 +166,8 @@ fn restore_one(repo: &Repo, entry: &IndexEntry) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cmd::test_support::TestRepo;
+    use crate::index::Index;
+    use crate::refs;
 
     #[test]
     fn restore_recreates_from_index() {
@@ -115,5 +198,88 @@ mod tests {
         let repo = r.open();
         // No error, just a warning.
         run_in(&repo, &["nope.txt".into()]).unwrap();
+    }
+
+    #[test]
+    fn restore_staged_unstages_file() {
+        let r = TestRepo::new("gyt-restore-staged");
+        let repo = r.open();
+        // Modify the index entry for hello.txt (staging a change).
+        let mut idx = Index::read(&repo.index_path()).unwrap();
+        let orig_entry = idx.find(&PathBuf::from("hello.txt")).unwrap().clone();
+        let orig_mode = orig_entry.mode;
+        let orig_hash = orig_entry.hash;
+        // Change the hash to something else (simulating a staged change).
+        idx.insert(IndexEntry {
+            mode: orig_entry.mode,
+            hash: crate::hash::hash_bytes(b"modified blob"),
+            path: orig_entry.path.clone(),
+            ..orig_entry
+        });
+        idx.write(&repo.index_path()).unwrap();
+
+        // Now restore --staged should put the HEAD version back.
+        run_in(&repo, &["--staged".into(), "hello.txt".into()]).unwrap();
+        let idx2 = Index::read(&repo.index_path()).unwrap();
+        let entry2 = idx2.find(&PathBuf::from("hello.txt")).unwrap();
+        assert_eq!(entry2.hash, orig_hash, "hash should be restored from HEAD");
+        assert_eq!(entry2.mode, orig_mode, "mode should be restored from HEAD");
+    }
+
+    #[test]
+    fn restore_staged_with_path_not_in_head_removes_from_index() {
+        let r = TestRepo::new("gyt-restore-staged-rm");
+        let repo = r.open();
+        // Add a new file to the index that doesn't exist in HEAD.
+        let mut idx = Index::read(&repo.index_path()).unwrap();
+        idx.insert(IndexEntry {
+            ctime_secs: 0,
+            mtime_secs: 0,
+            size: 0,
+            mode: crate::object::tree::MODE_FILE,
+            hash: crate::hash::hash_bytes(b"new"),
+            path: PathBuf::from("newfile.txt"),
+        });
+        idx.write(&repo.index_path()).unwrap();
+
+        // Restore --staged should remove it from the index.
+        run_in(&repo, &["--staged".into(), "newfile.txt".into()]).unwrap();
+        let idx2 = Index::read(&repo.index_path()).unwrap();
+        assert!(idx2.find(&PathBuf::from("newfile.txt")).is_none());
+    }
+
+    #[test]
+    fn restore_staged_and_worktree_both() {
+        let r = TestRepo::new("gyt-restore-both");
+        let repo = r.open();
+        let p = repo.workdir.join("hello.txt");
+        // Change worktree.
+        std::fs::write(&p, b"worktree change\n").unwrap();
+        // Change index.
+        let mut idx = Index::read(&repo.index_path()).unwrap();
+        let orig_entry = idx.find(&PathBuf::from("hello.txt")).unwrap().clone();
+        idx.insert(IndexEntry {
+            hash: crate::hash::hash_bytes(b"index change"),
+            path: orig_entry.path.clone(),
+            ..orig_entry
+        });
+        idx.write(&repo.index_path()).unwrap();
+
+        // Restore --staged --worktree should restore both.
+        run_in(
+            &repo,
+            &["--staged".into(), "--worktree".into(), "hello.txt".into()],
+        )
+        .unwrap();
+        let idx2 = Index::read(&repo.index_path()).unwrap();
+        let entry2 = idx2.find(&PathBuf::from("hello.txt")).unwrap();
+        let head = refs::read_head(&repo.gyt_dir).unwrap();
+        let head_id = refs::resolve(&repo.gyt_dir, &head).unwrap().unwrap();
+        let c = crate::object::commit::read(&repo.gyt_dir, &head_id).unwrap();
+        let flat = crate::cmd::util::flatten_tree(&repo, &c.tree).unwrap();
+        let (orig_mode, orig_hash) = flat[&PathBuf::from("hello.txt")];
+        assert_eq!(entry2.hash, orig_hash);
+        assert_eq!(entry2.mode, orig_mode);
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello\n");
     }
 }

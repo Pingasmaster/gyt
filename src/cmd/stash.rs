@@ -47,9 +47,10 @@ pub fn run(args: &[String]) -> Result<()> {
         "push" => cmd_push(rest),
         "list" => cmd_list(rest),
         "pop" => cmd_pop(rest),
+        "apply" => cmd_apply(rest),
         "drop" => cmd_drop(rest),
         other => Err(GytError::InvalidArgument(format!(
-            "stash: unknown subcommand {other:?} (expected push|list|pop|drop)"
+            "stash: unknown subcommand {other:?} (expected push|list|pop|apply|drop)"
         ))),
     }
 }
@@ -264,6 +265,61 @@ fn do_pop(repo: &Repo, args: &[String]) -> Result<()> {
     drop_top(repo, &stash_commit)?;
 
     println!("Dropped stash@{{0}} ({top_id})");
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// apply
+// -----------------------------------------------------------------------------
+
+fn cmd_apply(args: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repo::open(&cwd)?;
+    do_apply(&repo, args)
+}
+
+fn do_apply(repo: &Repo, args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        return Err(GytError::InvalidArgument(
+            "stash apply: takes no arguments (only stash@{0} is supported)".into(),
+        ));
+    }
+    let top_id = refs::read_ref(&repo.gyt_dir, STASH_REF)
+        .map_err(|_| GytError::Repo("no stash entries to apply".into()))?;
+
+    let stash_commit = commit_obj::read(&repo.gyt_dir, &top_id)?;
+    if stash_commit.parents.len() < 2 {
+        return Err(GytError::Repo(
+            "stash: malformed entry (missing index-commit parent)".into(),
+        ));
+    }
+
+    // Conflict check: refuse if any tracked-or-untracked workdir file would
+    // be overwritten with different content.
+    let workdir_tree_id = stash_commit.tree;
+    let target_files = flatten_tree(&repo.gyt_dir, &workdir_tree_id, Path::new(""))?;
+    let conflicts = detect_conflicts(repo, &target_files)?;
+    if !conflicts.is_empty() {
+        let mut msg = String::from("stash apply: workdir has conflicting changes:\n");
+        for p in &conflicts {
+            msg.push_str("  ");
+            msg.push_str(&p.to_string_lossy());
+            msg.push('\n');
+        }
+        return Err(GytError::Repo(msg));
+    }
+
+    // Materialize workdir from workdir_tree.
+    materialize_tree(repo, &workdir_tree_id)?;
+
+    // Reset index to the index-commit's tree.
+    let index_commit_id = stash_commit.parents[1];
+    let index_commit = commit_obj::read(&repo.gyt_dir, &index_commit_id)?;
+    let index = build_index_from_tree(repo, &index_commit.tree)?;
+    index.write(&repo.index_path())?;
+
+    // NOTE: intentionally do NOT drop the stash entry — apply leaves it intact.
+    println!("Applied stash@{{0}} ({top_id})");
     Ok(())
 }
 

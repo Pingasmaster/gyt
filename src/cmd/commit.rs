@@ -12,6 +12,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut ai_assists: Vec<String> = Vec::new();
     let mut co_authors: Vec<String> = Vec::new();
     let mut reviewers: Vec<String> = Vec::new();
+    let mut amend = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -19,7 +20,7 @@ pub fn run(args: &[String]) -> Result<()> {
         match a.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt commit -m <msg> [--ai <id>]... [--co-author <Name <email>>]... [--reviewer <Name <email>>]..."
+                    "gyt commit -m <msg> [--amend] [--ai <id>]... [--co-author <Name <email>>]... [--reviewer <Name <email>>]..."
                 );
                 return Ok(());
             }
@@ -30,6 +31,9 @@ pub fn run(args: &[String]) -> Result<()> {
                     .ok_or_else(|| GytError::InvalidArgument("commit: -m requires a value".into()))?
                     .clone();
                 message = Some(v);
+            }
+            "--amend" => {
+                amend = true;
             }
             "--ai" => {
                 i += 1;
@@ -70,9 +74,6 @@ pub fn run(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let message =
-        message.ok_or_else(|| GytError::InvalidArgument("commit: -m <msg> is required".into()))?;
-
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     let cfg = Config::load(&repo)?;
@@ -89,7 +90,20 @@ pub fn run(args: &[String]) -> Result<()> {
     // Resolve HEAD.
     let head = refs::read_head(&repo.gyt_dir)?;
     let parent = refs::resolve(&repo.gyt_dir, &head)?;
-    let parents = parent.into_iter().collect::<Vec<_>>();
+
+    let (parents, commit_message) = if amend {
+        let prev_id = parent.ok_or_else(|| {
+            GytError::Repo("cannot amend: HEAD has no commit yet".into())
+        })?;
+        let prev = commit::read(&repo.gyt_dir, &prev_id)?;
+        let msg = message.unwrap_or(prev.message);
+        (prev.parents, msg)
+    } else {
+        let msg = message.ok_or_else(|| {
+            GytError::InvalidArgument("commit: -m <msg> is required".into())
+        })?;
+        (parent.into_iter().collect::<Vec<_>>(), msg)
+    };
 
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,7 +121,7 @@ pub fn run(args: &[String]) -> Result<()> {
         committer: stamped,
         ai_assists,
         reviewers,
-        message,
+        message: commit_message,
     };
 
     let id = commit::write(&repo.gyt_dir, &c)?;
@@ -214,6 +228,77 @@ mod tests {
         let c = commit::read(&repo.gyt_dir, &id).unwrap();
         assert_eq!(c.ai_assists, vec!["claude-opus-4-7".to_string()]);
         assert_eq!(c.reviewers, vec!["Carol <c@x>".to_string()]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_amend_without_message_reuses_previous() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-amend-msg");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        fs::write(dir.join("a.txt"), b"a\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        run(&["-m".to_string(), "first commit".to_string()]).unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let id1 = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        let c1 = commit::read(&repo.gyt_dir, &id1).unwrap();
+        assert_eq!(c1.message, "first commit");
+        assert!(c1.parents.is_empty());
+        // Amend without -m: reuses previous message.
+        fs::write(dir.join("a.txt"), b"b\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        run(&["--amend".to_string()]).unwrap();
+        let id2 = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        assert_ne!(id1, id2, "amend should produce a new commit id");
+        let c2 = commit::read(&repo.gyt_dir, &id2).unwrap();
+        assert_eq!(c2.message, "first commit", "should reuse previous message");
+        assert!(c2.parents.is_empty(), "root commit parents should stay empty");
+        // Tree should reflect the new index content.
+        assert_ne!(c2.tree, c1.tree, "tree should reflect new index");
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_amend_with_new_message() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-amend-newmsg");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        fs::write(dir.join("a.txt"), b"a\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        run(&["-m".to_string(), "old msg".to_string()]).unwrap();
+        // Amend with new -m.
+        fs::write(dir.join("b.txt"), b"b\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        run(&["--amend".to_string(), "-m".to_string(), "new msg".to_string()]).unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        let c = commit::read(&repo.gyt_dir, &id).unwrap();
+        assert_eq!(c.message, "new msg");
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_amend_on_unborn_head_errors() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-amend-unborn");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        fs::write(dir.join("a.txt"), b"a\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        // No initial commit yet - amend should fail.
+        let r = run(&["--amend".to_string()]);
+        assert!(r.is_err(), "amend should fail on unborn HEAD");
+        std::env::set_current_dir(&prev).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

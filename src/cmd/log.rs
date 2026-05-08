@@ -7,14 +7,16 @@ use std::collections::HashSet;
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut full = false;
+    let mut oneline = false;
     let mut rev: Option<String> = None;
     for a in args {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("gyt log [<rev>] [--full]");
+                println!("gyt log [<rev>] [--full] [--oneline]");
                 return Ok(());
             }
             "--full" => full = true,
+            "--oneline" => oneline = true,
             other if other.starts_with("--") => {
                 return Err(GytError::InvalidArgument(format!(
                     "log: unknown flag {other}"
@@ -46,14 +48,19 @@ pub fn run(args: &[String]) -> Result<()> {
         let hex = id.to_hex();
         let short = &hex[..8];
         let first = c.message.lines().next().unwrap_or("");
-        let author_name = primary_author_name(c.primary_author());
-        let line = format!(
-            "{}  {}     {}",
-            term::paint_when(use_color, term::YELLOW, short),
-            first,
-            term::paint_when(use_color, term::CYAN, &author_name)
-        );
-        println!("{line}");
+
+        if oneline {
+            println!("{short} {first}");
+        } else {
+            let author_name = primary_author_name(c.primary_author());
+            let line = format!(
+                "{}  {}     {}",
+                term::paint_when(use_color, term::YELLOW, short),
+                first,
+                term::paint_when(use_color, term::CYAN, &author_name)
+            );
+            println!("{line}");
+        }
 
         if full {
             for p in &c.parents {

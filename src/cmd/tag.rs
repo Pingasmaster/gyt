@@ -17,6 +17,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return list(repo);
     }
+    // Early-return for --list / -l.
+    if args.iter().any(|a| a == "--list" || a == "-l") {
+        return list(repo);
+    }
     // Parse flags.
     let mut annotated = false;
     let mut delete = false;

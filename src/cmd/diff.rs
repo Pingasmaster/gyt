@@ -12,14 +12,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    let mut cached = false;
     let mut revs: Vec<String> = Vec::new();
     for a in args {
         match a.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt diff [<rev>] [<rev>]\n\nWith 0 revs: workdir vs index.\nWith 1 rev: index vs that tree.\nWith 2 revs: rev1 tree vs rev2 tree."
+                    "gyt diff [<rev>] [<rev>] [--cached]\n\n\
+With 0 revs: workdir vs index.\n\
+With 1 rev: index vs that tree.\n\
+With 2 revs: rev1 tree vs rev2 tree.\n\
+With --cached: HEAD tree vs index (staged changes)."
                 );
                 return Ok(());
+            }
+            "--cached" | "--staged" => {
+                cached = true;
             }
             other if other.starts_with("--") => {
                 return Err(GytError::InvalidArgument(format!(
@@ -38,6 +46,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     let use_color = term::use_color();
+
+    if cached {
+        return diff_index_vs_head(&repo, use_color);
+    }
 
     match revs.len() {
         0 => diff_workdir_vs_index(&repo, use_color),
@@ -114,6 +126,32 @@ fn diff_tree_vs_tree(repo: &Repo, a: &str, b: &str, use_color: bool) -> Result<(
     print_pair_diff(repo, &am, &bm, use_color)
 }
 
+fn diff_index_vs_head(repo: &Repo, use_color: bool) -> Result<()> {
+    let head_tree_id = match util::resolve_tree(repo, "HEAD") {
+        Ok(id) => id,
+        Err(e) => {
+            // No commits yet — index vs empty tree
+            if let GytError::Refs(_) = &e {
+                let index = Index::read(&repo.index_path())?;
+                let empty: BTreeMap<PathBuf, (u32, ObjectId)> = BTreeMap::new();
+                let mut idx_map: BTreeMap<PathBuf, (u32, ObjectId)> = BTreeMap::new();
+                for e in &index.entries {
+                    idx_map.insert(e.path.clone(), (e.mode, e.hash));
+                }
+                return print_pair_diff(repo, &empty, &idx_map, use_color);
+            }
+            return Err(e);
+        }
+    };
+    let head_tree_map = util::flatten_tree(repo, &head_tree_id)?;
+    let index = Index::read(&repo.index_path())?;
+    let mut idx_map: BTreeMap<PathBuf, (u32, ObjectId)> = BTreeMap::new();
+    for e in &index.entries {
+        idx_map.insert(e.path.clone(), (e.mode, e.hash));
+    }
+    print_pair_diff(repo, &head_tree_map, &idx_map, use_color)
+}
+
 fn print_pair_diff(
     repo: &Repo,
     a: &BTreeMap<PathBuf, (u32, ObjectId)>,
@@ -188,6 +226,90 @@ mod tests {
         // modify workdir
         fs::write(dir.join("a.txt"), b"AA\n").unwrap();
         let r = run(&[]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_cached_shows_staged_changes() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-cached");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("a.txt"), b"original\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // Stage and commit initial file
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        let _commit_hash = crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+
+        // Modify and stage a change
+        fs::write(dir.join("a.txt"), b"modified\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+
+        // Run diff --cached — should show the staged change vs HEAD
+        let r = run(&["--cached".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_cached_empty_repo_shows_all_as_added() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-cached-empty");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("new.txt"), b"hello\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // Stage a file but no commit yet
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+
+        // diff --cached with no HEAD should show all index entries as new
+        let r = run(&["--cached".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_staged_alias_works() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-staged");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("b.txt"), b"data\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        let _commit_hash =
+            crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+
+        fs::write(dir.join("b.txt"), b"changed\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+
+        // --staged alias should behave exactly like --cached
+        let r = run(&["--staged".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
         fs::remove_dir_all(&dir).unwrap();
