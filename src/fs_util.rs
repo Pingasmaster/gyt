@@ -160,26 +160,19 @@ fn read_lock_marker(path: &Path) -> Option<(Option<u32>, std::time::SystemTime)>
     Some((pid, mtime))
 }
 
-/// True if the given pid is alive on this host (kill(0) semantics on
-/// Unix). On non-Unix we conservatively report "alive" so we never
-/// reclaim a lock we can't verify.
+/// True if the given pid is alive on this host. We can't shell out to
+/// libc::kill(pid, 0) (no libc policy), so we use `/proc/<pid>` —
+/// available on Linux and on macOS with `/proc` mounted. When `/proc`
+/// itself isn't present we conservatively report "alive" so we never
+/// reclaim a lock we can't verify; when `/proc` is present and a
+/// specific pid's entry is missing, the process is dead.
 fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // `/proc/<pid>` exists for live processes on Linux/macOS-with-/proc.
-        // For broader coverage we'd use libc::kill(pid, 0), but we have a
-        // policy of no libc — so use the /proc check and fall through.
-        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-            return true;
-        }
-        // Without /proc we can't tell; err on the side of caution.
-        true
+    if !std::path::Path::new("/proc").is_dir() {
+        // We can't introspect — assume alive so stale reclamation never
+        // accidentally deletes a real holder's lock on this platform.
+        return true;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 impl Drop for FileLock {

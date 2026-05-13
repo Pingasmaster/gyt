@@ -498,3 +498,73 @@ fn binary_server_rejects_non_ff_push() {
 
     t.stop_server();
 }
+
+/// Push to a bare repo, then clone from it. Bare repos are the
+/// recommended layout for `gyt serve`-hosted projects; this test
+/// guards against regressions in `init --bare`, `Repo::open`'s bare
+/// detection, and `wire_repo_dir`'s bare lookup.
+#[test]
+fn binary_push_and_clone_bare_server_repo() {
+    let mut t = GytTest::new();
+    let port = t.start_server();
+
+    // Source repo with one commit.
+    let src = t.init_repo("baresrc", &[("hello.txt", "hi from src\n")]);
+
+    // Make the server side a *bare* repo (no working tree).
+    let server_repo = t.server_repos().join("bare.gyt");
+    let bare_init = Command::new(&t.bin)
+        .args(["init", "--bare"])
+        .arg(&server_repo)
+        .output()
+        .expect("init --bare");
+    assert!(
+        bare_init.status.success(),
+        "init --bare failed: {}",
+        String::from_utf8_lossy(&bare_init.stderr)
+    );
+    assert!(server_repo.join("bare").is_file(), "missing bare marker");
+    assert!(server_repo.join("HEAD").is_file(), "missing HEAD");
+    assert!(!server_repo.join(".gyt").exists(), "bare repo should not have a .gyt subdir");
+
+    // Push into it.
+    let url = format!("http://127.0.0.1:{port}/bare.gyt/");
+    t.add_remote(&src, &url);
+    // `add_remote` also calls create_dir_all on the server-side path —
+    // for a bare repo it created a `.gyt` subdir we don't want. Remove
+    // it so the server's `wire_repo_dir` resolves to the bare layout.
+    let stray = server_repo.join(".gyt");
+    if stray.is_dir() {
+        std::fs::remove_dir_all(&stray).unwrap();
+    }
+    t.run_in(&src, &["push", "--insecure", "origin"]);
+
+    // Verify server stored objects + ref directly at the repo root.
+    assert!(server_repo.join("refs/heads/main").is_file());
+
+    // Clone from the bare server.
+    let clone_dir = t.worktree("bareclone");
+    std::fs::create_dir_all(&clone_dir).unwrap();
+    t.run_in(&clone_dir, &["clone", "--insecure", &url, "."]);
+    let hello = std::fs::read_to_string(clone_dir.join("hello.txt"))
+        .expect("clone should have materialized hello.txt");
+    assert_eq!(hello, "hi from src\n");
+
+    // Working-tree commands inside the bare server repo must refuse.
+    let add_in_bare = Command::new(&t.bin)
+        .args(["add", "."])
+        .current_dir(&server_repo)
+        .output()
+        .expect("add in bare");
+    assert!(
+        !add_in_bare.status.success(),
+        "add inside bare repo should be refused"
+    );
+    let stderr = String::from_utf8_lossy(&add_in_bare.stderr);
+    assert!(
+        stderr.contains("bare repository"),
+        "expected 'bare repository' in stderr, got: {stderr}"
+    );
+
+    t.stop_server();
+}

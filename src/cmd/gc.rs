@@ -12,26 +12,115 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
-    for a in args {
-        if a == "-h" || a == "--help" {
-            println!("gyt gc");
-            return Ok(());
+    let mut expire_days: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "gyt gc [--expire-reflog <days>]\n\n\
+                     Prune unreachable loose objects from .gyt/objects.\n\n\
+                     Reachability roots include every ref (heads, tags, remotes,\n\
+                     stash), the detached HEAD if any, any in-progress merge /\n\
+                     rebase / cherry-pick state, AND every reflog entry. This\n\
+                     means commits referenced *only* by the reflog (e.g.\n\
+                     commit-amend orphans) are never pruned — which keeps\n\
+                     `gyt reflog` usable but means the reflog must be expired\n\
+                     before reclaiming their disk.\n\n\
+                     --expire-reflog <days>   First drop reflog entries older\n\
+                                              than <days> days, then run gc.\n\
+                                              Use 0 to wipe the whole reflog."
+                );
+                return Ok(());
+            }
+            "--expire-reflog" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--expire-reflog needs a value".into())
+                })?;
+                expire_days = Some(v.parse().map_err(|_| {
+                    GytError::InvalidArgument(format!("--expire-reflog: not a number: {v}"))
+                })?);
+            }
+            other if other.starts_with('-') => {
+                return Err(GytError::InvalidArgument(format!(
+                    "gc: unknown flag {other}"
+                )));
+            }
+            other => {
+                return Err(GytError::InvalidArgument(format!(
+                    "gc: unexpected argument {other}"
+                )));
+            }
         }
-        if a.starts_with('-') {
-            return Err(GytError::InvalidArgument(format!("gc: unknown flag {a}")));
-        }
+        i += 1;
     }
 
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
 
+    let expired = if let Some(days) = expire_days {
+        expire_reflog(&repo.gyt_dir, days)
+    } else {
+        0
+    };
     let count = gc(&repo.gyt_dir);
+    if expired > 0 {
+        println!("gc: expired {expired} reflog entries");
+    }
     if count > 0 {
         println!("gc: pruned {count} unreachable objects");
     } else {
         println!("gc: no unreachable objects found");
     }
     Ok(())
+}
+
+/// Drop every reflog entry whose timestamp is older than `days` days.
+/// `days == 0` truncates every reflog. Returns the number of entries
+/// removed (across all refs). Best-effort: per-ref I/O errors are skipped.
+fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
+    let Ok(all) = crate::reflog::list_all(gyt_dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0i64, |d| d.as_secs() as i64);
+    let cutoff = now.saturating_sub(days as i64 * 86_400);
+    let mut removed = 0usize;
+    for (refname, entries) in all {
+        let keep: Vec<_> = entries.iter().filter(|e| e.timestamp >= cutoff).collect();
+        let dropped = entries.len() - keep.len();
+        if dropped == 0 {
+            continue;
+        }
+        // Re-serialize the kept entries. Format must match `reflog::record`.
+        let mut body = String::new();
+        for e in &keep {
+            use std::fmt::Write as _;
+            let old_hex = match e.old {
+                Some(o) => o.to_hex(),
+                None => "0".repeat(64),
+            };
+            let _ = writeln!(
+                body,
+                "{old_hex}\t{}\t{}\t{}\t{}\t{}",
+                e.new.to_hex(),
+                e.who,
+                e.timestamp,
+                e.tz_offset,
+                e.message
+            );
+        }
+        let path = gyt_dir.join("logs").join(&refname);
+        if body.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = crate::fs_util::atomic_write(&path, body.as_bytes());
+        }
+        removed += dropped;
+    }
+    removed
 }
 
 /// Run garbage collection: returns the number of objects pruned.
