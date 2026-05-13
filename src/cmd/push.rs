@@ -37,15 +37,23 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut remote: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut force = false;
+    let mut force_with_lease = false;
     let mut insecure = false;
     let mut push_all = false;
     for a in args {
         match a.as_str() {
             "--force" | "-f" => force = true,
+            "--force-with-lease" => force_with_lease = true,
             "--insecure" => insecure = true,
             "--all" => push_all = true,
             "-h" | "--help" => {
-                println!("gyt push [<remote>] [<branch>] [--force] [--insecure] [--all]");
+                println!(
+                    "gyt push [<remote>] [<branch>] [--force | --force-with-lease] [--insecure] [--all]\n\n\
+                     --force             rewrite the remote ref regardless of current state\n\
+                     --force-with-lease  rewrite only if the remote ref still matches our cached\n\
+                                         refs/remotes/<remote>/<branch> — refuses if it has moved\n\
+                                         since the last fetch (catches over-write of someone else's work)"
+                );
                 return Ok(());
             }
             other if other.starts_with('-') => {
@@ -65,6 +73,11 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+    if force && force_with_lease {
+        return Err(GytError::InvalidArgument(
+            "push: --force and --force-with-lease are mutually exclusive".into(),
+        ));
     }
     let remote = remote.unwrap_or_else(|| "origin".to_string());
     let cfg = Config::load(repo)?;
@@ -131,8 +144,19 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             }
         }
 
+        // For --force-with-lease, the `old` value sent to the server is
+        // the *local cached* remote-tracking ref (refs/remotes/<remote>/<branch>),
+        // not whatever the server claims right now. If the server's ref has
+        // moved beyond what we last fetched, its `cur != old` check fires
+        // and the push is refused — exactly the safety we want.
+        let lease_old = if force_with_lease {
+            let tracking = format!("refs/remotes/{remote}/{branch_name}");
+            refs::read_ref(&repo.gyt_dir, &tracking).ok()
+        } else {
+            remote_tip
+        };
         updates.push(RefUpdate {
-            old: remote_tip,
+            old: lease_old,
             new: local_tip,
             name: local_ref,
         });
@@ -154,14 +178,24 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let body = encode_ref_updates(&updates);
     let suffix = if force {
         "refs/update?force=1"
+    } else if force_with_lease {
+        "refs/update?force-with-lease=1"
     } else {
         "refs/update"
     };
     let resp = client.post(suffix, &body, &[])?;
     if resp.status == 409 {
-        return Err(GytError::Net(format!(
-            "push: server rejected update (non-fast-forward); run `gyt pull {remote}` first or pass --force"
-        )));
+        let msg = if force_with_lease {
+            format!(
+                "push: server rejected update (lease check failed — remote has moved since your last fetch).\n  \
+                 Run `gyt fetch {remote}` to see the new tip, then decide whether to integrate or override."
+            )
+        } else {
+            format!(
+                "push: server rejected update (non-fast-forward); run `gyt pull {remote}` first or pass --force"
+            )
+        };
+        return Err(GytError::Net(msg));
     }
     if resp.status != 200 {
         return Err(GytError::Net(format!(

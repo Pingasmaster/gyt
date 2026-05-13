@@ -6,10 +6,17 @@ use crate::repo::Repo;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+// Reason: these are four independent CLI flags (oneline, graph, all,
+// show_signature). Bundling them into an enum would force users to
+// remember mutually-exclusive combinations, which is contrary to how the
+// flags behave (any subset is legal). The struct shape mirrors the CLI
+// surface and is the clearest representation.
+#[allow(clippy::struct_excessive_bools)]
 struct Options {
     oneline: bool,
     graph: bool,
     all: bool,
+    show_signature: bool,
     author: Option<String>,
     grep: Option<String>,
     since: Option<i64>,
@@ -24,6 +31,7 @@ impl Options {
             oneline: false,
             graph: false,
             all: false,
+            show_signature: false,
             author: None,
             grep: None,
             since: None,
@@ -70,6 +78,7 @@ pub fn run(args: &[String]) -> Result<()> {
             "--oneline" => opts.oneline = true,
             "--graph" => opts.graph = true,
             "--all" => opts.all = true,
+            "--show-signature" => opts.show_signature = true,
             "--author" => {
                 i += 1;
                 opts.author = Some(
@@ -134,9 +143,15 @@ struct Node {
     id: ObjectId,
     parents: Vec<ObjectId>,
     timestamp: i64,
+    tz_offset: String,
     author: String,
     message: String,
     tree: ObjectId,
+    /// Raw `Commit` re-fetched on demand for signature verification.
+    /// Filled lazily by the render path when `--show-signature` is set;
+    /// avoids paying the BLAKE3 + ed25519 cost during the topo walk for
+    /// the common case where signatures aren't being displayed.
+    signature_b64: Option<String>,
 }
 
 fn format_log(repo: &Repo, opts: &Options) -> Result<String> {
@@ -258,7 +273,7 @@ fn walk(gyt_dir: &std::path::Path, roots: &[ObjectId]) -> Result<HashMap<ObjectI
             continue;
         }
         let c = commit::read(gyt_dir, &id)?;
-        let ts = parse_timestamp(&c.committer).unwrap_or(0);
+        let (ts, tz) = parse_timestamp_tz(&c.committer);
         let author = c.authors.first().cloned().unwrap_or_default();
         for p in &c.parents {
             stack.push(*p);
@@ -268,8 +283,10 @@ fn walk(gyt_dir: &std::path::Path, roots: &[ObjectId]) -> Result<HashMap<ObjectI
             Node {
                 id,
                 parents: c.parents.clone(),
-                timestamp: ts,
+                timestamp: ts.unwrap_or(0),
+                tz_offset: tz,
                 author,
+                signature_b64: c.signature.clone(),
                 message: c.message,
                 tree: c.tree,
             },
@@ -325,7 +342,7 @@ fn topo_order(nodes: &HashMap<ObjectId, Node>) -> Vec<ObjectId> {
 fn render_plain(nodes: &[&Node], opts: &Options, out: &mut String) {
     let limit = opts.max_count.unwrap_or(usize::MAX);
     for n in nodes.iter().take(limit) {
-        write_commit(out, n, opts.oneline, "");
+        write_commit(out, n, opts, "");
     }
 }
 
@@ -379,7 +396,7 @@ fn render_graph(nodes: &[&Node], opts: &Options, out: &mut String) {
             }
         }
         let _ = write!(out, "{row} ");
-        write_commit_oneline_after_marker(out, n, opts.oneline);
+        write_commit_oneline_after_marker(out, n, opts);
 
         // Replace this column with the first parent (or empty if none).
         // Append any extra parents as new columns. After this, optionally
@@ -432,17 +449,24 @@ fn compact_lanes(lanes: &[Option<ObjectId>]) -> Vec<Option<ObjectId>> {
     out
 }
 
-fn write_commit_oneline_after_marker(out: &mut String, n: &Node, oneline: bool) {
+fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
     let first_line = n.message.lines().next().unwrap_or("");
-    if oneline {
-        let _ = writeln!(out, "{short} {first_line}");
+    if opts.oneline {
+        if opts.show_signature {
+            let _ = writeln!(out, "{short} [{}] {first_line}", short_sig_status(n));
+        } else {
+            let _ = writeln!(out, "{short} {first_line}");
+        }
     } else {
         let _ = writeln!(out, "commit {hex}");
         let _ = writeln!(out, "Author: {}", primary_author_name(&n.author));
         if n.timestamp > 0 {
-            let _ = writeln!(out, "Date:   {}", n.timestamp);
+            let _ = writeln!(out, "Date:   {}", format_iso8601(n.timestamp, &n.tz_offset));
+        }
+        if opts.show_signature {
+            let _ = writeln!(out, "Signature: {}", verbose_sig_status(n));
         }
         out.push('\n');
         for line in n.message.lines() {
@@ -452,17 +476,32 @@ fn write_commit_oneline_after_marker(out: &mut String, n: &Node, oneline: bool) 
     }
 }
 
-fn write_commit(out: &mut String, n: &Node, oneline: bool, prefix: &str) {
+fn write_commit(out: &mut String, n: &Node, opts: &Options, prefix: &str) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
     let first_line = n.message.lines().next().unwrap_or("");
-    if oneline {
-        let _ = writeln!(out, "{prefix}{short} {first_line}");
+    if opts.oneline {
+        if opts.show_signature {
+            let _ = writeln!(
+                out,
+                "{prefix}{short} [{}] {first_line}",
+                short_sig_status(n)
+            );
+        } else {
+            let _ = writeln!(out, "{prefix}{short} {first_line}");
+        }
     } else {
         let _ = writeln!(out, "{prefix}commit {hex}");
         let _ = writeln!(out, "{prefix}Author: {}", primary_author_name(&n.author));
         if n.timestamp > 0 {
-            let _ = writeln!(out, "{prefix}Date:   {}", n.timestamp);
+            let _ = writeln!(
+                out,
+                "{prefix}Date:   {}",
+                format_iso8601(n.timestamp, &n.tz_offset)
+            );
+        }
+        if opts.show_signature {
+            let _ = writeln!(out, "{prefix}Signature: {}", verbose_sig_status(n));
         }
         out.push('\n');
         for line in n.message.lines() {
@@ -470,6 +509,87 @@ fn write_commit(out: &mut String, n: &Node, oneline: bool, prefix: &str) {
         }
         out.push('\n');
     }
+}
+
+fn short_sig_status(n: &Node) -> &'static str {
+    match verify_node(n) {
+        SigStatus::Unsigned => "U",
+        SigStatus::Good => "G",
+        SigStatus::Bad => "B",
+    }
+}
+
+fn verbose_sig_status(n: &Node) -> &'static str {
+    match verify_node(n) {
+        SigStatus::Unsigned => "unsigned",
+        SigStatus::Good => "good ed25519 signature",
+        SigStatus::Bad => "BAD signature",
+    }
+}
+
+enum SigStatus {
+    Unsigned,
+    Good,
+    Bad,
+}
+
+fn verify_node(n: &Node) -> SigStatus {
+    let Some(b64) = &n.signature_b64 else {
+        return SigStatus::Unsigned;
+    };
+    // Re-read the commit so we have the canonical payload bytes — we
+    // already buffered `tree`, `parents`, etc. on Node, but not the raw
+    // committer/author strings in the on-disk canonical form. The cost is
+    // one extra object read per signed commit shown.
+    // (Skipped if no signature.)
+    // Implementation note: gyt verify uses `commit_payload_without_sig`
+    // which reconstructs canonical bytes from a Commit struct, so we
+    // need to reconstruct a Commit. Easier: re-read from disk.
+    // We deliberately don't keep this on Node by default because most log
+    // invocations don't need signatures and this would slow down the
+    // common case.
+    // Pass-through to the same path `gyt show --show-signature` uses.
+    // Errors are treated as Bad so the user sees something visibly wrong.
+    let dummy = crate::object::commit::Commit {
+        tree: n.tree,
+        parents: n.parents.clone(),
+        authors: vec![n.author.clone()],
+        // Best-effort fields — only the ones from the canonical payload
+        // matter. The signing payload built by `commit_payload_without_sig`
+        // walks all author lines, the committer line, ai/reviewer lines
+        // and the message; without re-reading we can't reproduce them
+        // exactly. So in the common, signed case we DO re-read the
+        // commit object from disk to get the canonical struct.
+        committer: String::new(),
+        ai_assists: vec![],
+        reviewers: vec![],
+        signature: None,
+        message: n.message.clone(),
+    };
+    // Re-read from disk to get the exact canonical encoding for verify.
+    let _ = dummy; // Placeholder so the closure compiles when called from log.rs.
+    // We need access to a repo path here. The function is called from
+    // render which already opened the repo; rather than threading it
+    // through, just compute by re-reading the object via store::read.
+    // The Node's `id` lets us look it up.
+    let bytes = match find_repo_root_via_cwd().and_then(|gyt| {
+        crate::object::commit::read(&gyt, &n.id).ok().map(|c| (gyt, c))
+    }) {
+        Some((_gyt, c)) => crate::cmd::signing::commit_payload_without_sig(&c),
+        None => return SigStatus::Bad,
+    };
+    match crate::cmd::signing::verify_signature(&bytes, b64, None) {
+        Ok(true) => SigStatus::Good,
+        _ => SigStatus::Bad,
+    }
+}
+
+/// Locate the active `.gyt` directory by walking up from the cwd. Falls
+/// back to None if not inside a repo (which shouldn't happen during `log`,
+/// but we don't want to panic from a status-rendering helper).
+fn find_repo_root_via_cwd() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    crate::repo::Repo::open(&cwd).ok().map(|r| r.gyt_dir)
 }
 
 fn all_ref_tips(gyt_dir: &std::path::Path) -> Result<Vec<ObjectId>> {
@@ -494,13 +614,73 @@ fn all_ref_tips(gyt_dir: &std::path::Path) -> Result<Vec<ObjectId>> {
     Ok(ids)
 }
 
-fn parse_timestamp(s: &str) -> Option<i64> {
+/// Parse "<name> <email> <unix-secs> <tz-offset>" → (timestamp, tz_offset).
+/// Returns "+0000" as the default TZ if missing or malformed.
+fn parse_timestamp_tz(s: &str) -> (Option<i64>, String) {
     let parts: Vec<&str> = s.rsplitn(3, ' ').collect();
-    if parts.len() >= 2 {
-        parts.get(1)?.parse().ok()
-    } else {
-        None
+    let tz = parts.first().map_or_else(|| "+0000".to_string(), |s| (*s).to_string());
+    let ts = parts.get(1).and_then(|t| t.parse::<i64>().ok());
+    (ts, tz)
+}
+
+/// Render a unix timestamp + "+HHMM" tz offset as a human ISO-8601 string,
+/// e.g. `2026-05-13 14:30:00 +0000`. Uses the proleptic Gregorian calendar
+/// via Howard Hinnant's `civil_from_days` algorithm — pure arithmetic, no
+/// external date library, valid for all `i64` second counts that fit in a
+/// reasonable era window (effectively all of human history).
+fn format_iso8601(unix_secs: i64, tz_offset: &str) -> String {
+    // Apply the tz offset to display local time then re-tag the printed
+    // offset. Format of tz_offset: "+HHMM" or "-HHMM".
+    let (sign, off_h, off_m) = parse_tz(tz_offset);
+    let shifted = unix_secs + i64::from(sign) * (i64::from(off_h) * 3600 + i64::from(off_m) * 60);
+    let day = shifted.div_euclid(86_400);
+    let sec_of_day = shifted.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(day);
+    let h = sec_of_day / 3600;
+    let mi = (sec_of_day % 3600) / 60;
+    let s = sec_of_day % 60;
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} {tz_offset}")
+}
+
+fn parse_tz(tz: &str) -> (i32, u32, u32) {
+    // Accept "+HHMM" / "-HHMM"; default to UTC on parse failure.
+    let bytes = tz.as_bytes();
+    if bytes.len() != 5 {
+        return (1, 0, 0);
     }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return (1, 0, 0),
+    };
+    let h: u32 = std::str::from_utf8(&bytes[1..3])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let m: u32 = std::str::from_utf8(&bytes[3..5])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (sign, h, m)
+}
+
+/// Howard Hinnant's `civil_from_days`: convert a count of days since the
+/// Unix epoch (1970-01-01) to (year, month, day) in the proleptic
+/// Gregorian calendar. See
+/// <https://howardhinnant.github.io/date_algorithms.html>.
+#[allow(clippy::cast_possible_wrap)] // Reason: era arithmetic stays within i64 even at the extremes; widening to i128 would only hide that.
+const fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // 0..146_096
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 0..399
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // 0..365
+    let mp = (5 * doy + 2) / 153; // 0..11
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // 1..31
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // 1..12
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn primary_author_name(a: &str) -> String {

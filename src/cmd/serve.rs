@@ -9,6 +9,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut auth_token: Option<String> = None;
+    let mut signers_file: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -23,6 +24,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 println!("  --cert <file>         TLS certificate PEM file");
                 println!("  --key <file>          TLS private key PEM file");
                 println!("  --auth-token <token>  Bearer token required on all requests");
+                println!("  --signers <file>      Trusted allowed_signers file (overrides per-repo)");
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     repos_root,
@@ -30,6 +32,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     tls_cert,
                     tls_key,
                     auth_token,
+                    signers_file,
                 });
             }
             "--listen" => {
@@ -77,6 +80,15 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 auth_token = Some(s);
             }
+            "--signers" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--signers requires a file path".into(),
+                    )
+                })?;
+                signers_file = Some(PathBuf::from(s));
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -100,6 +112,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         tls_cert,
         tls_key,
         auth_token,
+        signers_file,
     })
 }
 

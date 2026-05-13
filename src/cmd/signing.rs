@@ -46,8 +46,11 @@ pub fn resolve_pub_path(config: Option<&str>) -> PathBuf {
     }
 }
 
-/// Load the signing key from a path.
+/// Load the signing key from a path. Refuses to load on Unix if the file
+/// mode is wider than `0o600` — a world- or group-readable private key is
+/// a strong sign of a setup mistake we don't want to paper over.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    enforce_private_mode(path)?;
     let bytes = std::fs::read(path)
         .map_err(|e| GytError::Ci(format!("reading signing key {}: {e}", path.display())))?;
     if bytes.len() != 32 {
@@ -60,6 +63,27 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
         .try_into()
         .map_err(|_| GytError::Ci("signing key: expected 32 bytes".into()))?;
     Ok(SigningKey::from_bytes(&arr))
+}
+
+/// Refuse to load a private-key file whose mode allows group or world
+/// access. No-op on non-Unix platforms.
+fn enforce_private_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(path)
+            .map_err(|e| GytError::Ci(format!("stat {}: {e}", path.display())))?;
+        let mode = md.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(GytError::Ci(format!(
+                "private key {} has insecure mode {mode:o} — refusing to load; run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Load the public key from a path or hex string.
@@ -164,7 +188,9 @@ pub fn verify_signature(
 }
 
 /// Generate a new ed25519 keypair. Saves to the given paths (or defaults).
-/// Returns the public key bytes.
+/// The private-key file is created with mode `0600` on Unix — never world-
+/// or group-readable, even momentarily during write. Returns the public
+/// key bytes.
 pub fn generate_keys(priv_path: &Path, pub_path: &Path) -> Result<Vec<u8>> {
     let mut csprng = rand::rngs::OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
@@ -181,11 +207,49 @@ pub fn generate_keys(priv_path: &Path, pub_path: &Path) -> Result<Vec<u8>> {
         }
     }
 
-    std::fs::write(priv_path, signing_key.to_bytes()).map_err(GytError::Io)?;
+    write_private_file(priv_path, &signing_key.to_bytes())?;
     let pub_bytes = verifying_key.to_bytes();
     std::fs::write(pub_path, pub_bytes).map_err(GytError::Io)?;
 
     Ok(pub_bytes.to_vec())
+}
+
+/// Atomically create a private file with mode 0600 on Unix. Opens with
+/// `create_new` (O_EXCL) to refuse to overwrite an existing key by accident.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    // Refuse to overwrite an existing key — operators should explicitly
+    // remove the previous one.
+    if path.exists() {
+        return Err(GytError::Ci(format!(
+            "{} already exists; refuse to overwrite a private key",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(GytError::Io)?;
+        f.write_all(bytes).map_err(GytError::Io)?;
+        f.sync_all().map_err(GytError::Io)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(GytError::Io)?;
+        f.write_all(bytes).map_err(GytError::Io)?;
+        f.sync_all().map_err(GytError::Io)?;
+        Ok(())
+    }
 }
 
 // ── Minimal base64 (no external dep needed) ───────────────────
@@ -215,21 +279,41 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+/// Strict base64 decoder. Rejects:
+///   - non-base64 characters (returns None)
+///   - padding `=` anywhere except the last 1 or 2 positions of a multiple-of-4 input
+///   - inputs whose length is not a multiple of 4 after trimming whitespace
+///   - trailing non-zero bits in the final padded sextet (would silently truncate)
+///
+/// Exposed so other modules (notably `net::refs_policy`) reuse a single,
+/// audited decoder.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let input = input.trim();
-    let mut out = Vec::new();
-    let mut buf = 0u32;
-    let mut bits = 0;
-    for ch in input.chars() {
-        if ch == '=' {
-            break;
-        }
-        let val = match ch {
-            'A'..='Z' => u32::from(ch as u8 - b'A'),
-            'a'..='z' => u32::from(ch as u8 - b'a' + 26),
-            '0'..='9' => u32::from(ch as u8 - b'0' + 52),
-            '+' => 62,
-            '/' => 63,
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    // Count trailing '=' (0, 1, or 2 allowed).
+    let mut pad = 0usize;
+    while pad < 2 && bytes.len() > pad && bytes[bytes.len() - 1 - pad] == b'=' {
+        pad += 1;
+    }
+    // No '=' allowed earlier in the string.
+    let body_end = bytes.len() - pad;
+    if bytes[..body_end].contains(&b'=') {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in &bytes[..body_end] {
+        let val: u32 = match b {
+            b'A'..=b'Z' => u32::from(b - b'A'),
+            b'a'..=b'z' => u32::from(b - b'a' + 26),
+            b'0'..=b'9' => u32::from(b - b'0' + 52),
+            b'+' => 62,
+            b'/' => 63,
             _ => return None,
         };
         buf = (buf << 6) | val;
@@ -237,8 +321,13 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
         if bits >= 8 {
             bits -= 8;
             out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
+            buf &= (1u32 << bits).wrapping_sub(1);
         }
+    }
+    // Any leftover bits in `buf` must be zero (otherwise the input encodes
+    // bits we'd be silently discarding — classic malleability vector).
+    if buf != 0 {
+        return None;
     }
     Some(out)
 }

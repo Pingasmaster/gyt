@@ -15,6 +15,13 @@ pub const FLAG_XZ: u8 = 0x01;
 // Threshold below which we use a higher preset (more compression).
 pub const SIZE_XZ_HIGH: usize = 10 * 1024 * 1024;
 
+/// Hard cap on the decompressed size of a single xz stream. Anything larger
+/// is treated as a decompression-bomb attempt and aborted before the
+/// allocator commits the memory. The server's body cap is 256 MiB, so a
+/// 1 GiB ceiling here still rejects obvious bombs while leaving headroom
+/// for legitimate large packfiles.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub fn encode(payload: &[u8]) -> Vec<u8> {
     let body = xz_encode_raw(payload).expect("xz encoding failed");
     let mut out = Vec::with_capacity(5 + body.len());
@@ -47,9 +54,19 @@ pub fn xz_encode_raw(payload: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn xz_decode_raw(body: &[u8]) -> Result<Vec<u8>> {
-    let mut r = XzReader::new(body, false);
-    let mut out = Vec::with_capacity(body.len() * 2);
-    r.read_to_end(&mut out)?;
+    let r = XzReader::new(body, false);
+    let mut bounded = r.take(MAX_DECOMPRESSED_BYTES + 1);
+    // Pre-allocate up to 2× input but cap at 1 MiB — defending against an
+    // attacker sending a tiny stream that decompresses huge by giving
+    // ourselves a small starting buffer that grows as actual data arrives.
+    let initial = (body.len().saturating_mul(2)).min(1024 * 1024);
+    let mut out = Vec::with_capacity(initial);
+    bounded.read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(GytError::Object(format!(
+            "xz: decompressed output exceeds {MAX_DECOMPRESSED_BYTES} bytes (decompression bomb?)"
+        )));
+    }
     Ok(out)
 }
 

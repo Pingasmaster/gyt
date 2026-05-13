@@ -20,9 +20,12 @@ fn key_path() -> PathBuf {
 }
 
 /// Load the CI encryption key, generating a new one if it doesn't exist.
+/// On Unix the file is created with mode `0600`; the loader refuses to read
+/// a key whose mode allows group or world access.
 pub fn ensure_key() -> Result<[u8; 32]> {
     let path = key_path();
     if path.exists() {
+        enforce_private_mode(&path)?;
         let raw =
             std::fs::read(&path).map_err(|e| GytError::Ci(format!("reading CI key: {e}")))?;
         if raw.len() != 32 {
@@ -38,10 +41,62 @@ pub fn ensure_key() -> Result<[u8; 32]> {
         }
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
-        std::fs::write(&path, key)
-            .map_err(|e| GytError::Ci(format!("writing CI key: {e}")))?;
+        write_private_file(&path, &key)?;
         println!("Generated CI encryption key at {}", path.display());
         Ok(key)
+    }
+}
+
+/// Refuse to read a key whose file mode allows group or world access.
+fn enforce_private_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(path)
+            .map_err(|e| GytError::Ci(format!("stat {}: {e}", path.display())))?;
+        let mode = md.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(GytError::Ci(format!(
+                "CI key {} has insecure mode {mode:o} — run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// Create the key file with O_EXCL + mode 0600 on Unix.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| GytError::Ci(format!("opening CI key for write: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| GytError::Ci(format!("writing CI key: {e}")))?;
+        f.sync_all()
+            .map_err(|e| GytError::Ci(format!("fsync CI key: {e}")))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| GytError::Ci(format!("opening CI key for write: {e}")))?;
+        f.write_all(bytes)
+            .map_err(|e| GytError::Ci(format!("writing CI key: {e}")))?;
+        f.sync_all()
+            .map_err(|e| GytError::Ci(format!("fsync CI key: {e}")))?;
+        Ok(())
     }
 }
 

@@ -41,6 +41,11 @@ pub struct ServeConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auth_token: Option<String>,
+    /// Path to an allowed_signers file used by *every* repo this server
+    /// hosts. Takes precedence over a per-repo `<gyt>/allowed_signers` so
+    /// a pusher with write access to a repo can't bootstrap trust by
+    /// editing their own key into the list.
+    pub signers_file: Option<PathBuf>,
 }
 
 struct Request {
@@ -74,6 +79,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         repos_root: config.repos_root.clone(),
         webroot: config.webroot.clone(),
         auth_token: config.auth_token.clone(),
+        signers_file: config.signers_file.clone(),
         shutdown: Mutex::new(false),
     });
     let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
@@ -115,6 +121,7 @@ struct ServerState {
     repos_root: PathBuf,
     webroot: PathBuf,
     auth_token: Option<String>,
+    signers_file: Option<PathBuf>,
     shutdown: Mutex<bool>,
 }
 
@@ -202,10 +209,29 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
 
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
+    let actor = actor_for(&req);
 
-    let (status, reason, body, ctype) = dispatch(&route, &params, query, &req.body, state);
+    let (status, reason, body, ctype) =
+        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
     write_response(&mut writer, status, &reason, &ctype, &body)
+}
+
+/// Derive an audit-log actor identifier for the request. We fingerprint
+/// the presented bearer token so two different tokens look distinct in
+/// the log without ever writing the token itself. Anonymous (no token)
+/// requests get "anon".
+fn actor_for(req: &Request) -> Option<String> {
+    let header = req.auth_header.as_deref()?;
+    let token = header.strip_prefix("Bearer ")?;
+    let h = blake3::hash(token.as_bytes());
+    let bytes = h.as_bytes();
+    let mut hex = String::with_capacity(16);
+    for &b in &bytes[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Some(format!("token:{hex}"))
 }
 
 /// Handle a TLS-wrapped connection.
@@ -255,19 +281,26 @@ fn handle_tls_conn(
 
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
+    let actor = actor_for(&req);
 
-    let (status, reason, body, ctype) = dispatch(&route, &params, query, &req.body, state);
+    let (status, reason, body, ctype) =
+        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
     write_response(&mut stream, status, &reason, &ctype, &body)
 }
 
 /// Check the request's Authorization header against the expected bearer token.
+///
+/// The comparison runs in time linear in `max(len(presented), len(expected))`
+/// — explicitly *not* a short-circuit `==` — so a timing oracle cannot leak
+/// the token byte-by-byte. We compare lengths into the same accumulator so
+/// even a wrong-length input still costs the full XOR pass.
 fn check_auth(req: &Request, expected_token: &str) -> bool {
     match &req.auth_header {
         Some(val) => {
             // Expect "Bearer <token>"
             if let Some(token) = val.strip_prefix("Bearer ") {
-                token == expected_token
+                constant_time_eq(token.as_bytes(), expected_token.as_bytes())
             } else {
                 false
             }
@@ -276,19 +309,34 @@ fn check_auth(req: &Request, expected_token: &str) -> bool {
     }
 }
 
+/// Constant-time byte-slice equality. Returns false if lengths differ, but
+/// still walks both buffers up to `max(a.len(), b.len())` so the time taken
+/// does not branch on the position of the first mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().max(b.len());
+    let mut acc: u8 = u8::from(a.len() != b.len());
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 fn dispatch(
     route: &router::RouteMatch,
     params: &[(String, String)],
     raw_query: Option<&str>,
     body: &[u8],
     state: &ServerState,
+    actor: Option<&str>,
 ) -> (u16, String, Vec<u8>, String) {
     match route.handler {
         // Wire protocol handlers use route.params (repo from URL path), not query params
         Handler::InfoRefs => wire_info_refs(state, &route.params),
         Handler::ObjectsWant => wire_objects_want(state, &route.params, body),
         Handler::ObjectsHave => wire_objects_have(state, &route.params, body),
-        Handler::RefsUpdate => wire_refs_update(state, &route.params, raw_query, body),
+        Handler::RefsUpdate => wire_refs_update(state, &route.params, raw_query, body, actor),
         // REST API handlers use query params
         Handler::RepoList => repo_list(state, params),
         Handler::RepoInfo => repo_info(state, params),
@@ -1074,14 +1122,22 @@ fn guess_content_type(path: &str) -> String {
 // ═══════════════════════════════════════════════════════════════════
 
 /// Extract a repo path from wire protocol params: repos_root / {repo_name}
+/// Resolve the URL `:repo` path component to the *gyt directory* (the dir
+/// holding `HEAD`, `objects/`, etc.). Accepts both non-bare repos
+/// (`<repos_root>/<repo>/.gyt`) and bare repos (`<repos_root>/<repo>`
+/// where the gyt layout lives directly inside `<repo>`).
 fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std::path::PathBuf> {
     let repo = router::get_param(params, "repo")?;
     let p = state.repos_root.join(repo);
+    // Non-bare: `<p>/.gyt/HEAD` exists.
     if p.join(".gyt").is_dir() {
-        Some(p)
-    } else {
-        None
+        return Some(p.join(".gyt"));
     }
+    // Bare: `<p>/HEAD` exists directly.
+    if p.join("HEAD").is_file() {
+        return Some(p);
+    }
+    None
 }
 
 /// GET /{repo}/info/refs - list all refs as tab-separated text
@@ -1090,7 +1146,7 @@ fn wire_info_refs(
     params: &[(String, String)],
 ) -> (u16, String, Vec<u8>, String) {
     let dir = match wire_repo_dir(state, params) {
-        Some(d) => d.join(".gyt"),
+        Some(d) => d,
         None => {
             return (
                 404,
@@ -1122,7 +1178,7 @@ fn wire_objects_want(
     body: &[u8],
 ) -> (u16, String, Vec<u8>, String) {
     let gyt_dir = match wire_repo_dir(state, params) {
-        Some(d) => d.join(".gyt"),
+        Some(d) => d,
         None => {
             return (
                 404,
@@ -1167,7 +1223,7 @@ fn wire_objects_have(
     body: &[u8],
 ) -> (u16, String, Vec<u8>, String) {
     let gyt_dir = match wire_repo_dir(state, params) {
-        Some(d) => d.join(".gyt"),
+        Some(d) => d,
         None => {
             return (
                 404,
@@ -1221,9 +1277,10 @@ fn wire_refs_update(
     params: &[(String, String)],
     raw_query: Option<&str>,
     body: &[u8],
+    actor: Option<&str>,
 ) -> (u16, String, Vec<u8>, String) {
     let gyt_dir = match wire_repo_dir(state, params) {
-        Some(d) => d.join(".gyt"),
+        Some(d) => d,
         None => {
             return (
                 404,
@@ -1247,9 +1304,40 @@ fn wire_refs_update(
 
     let force = raw_query
         .is_some_and(|q| q.split('&').any(|p| p == "force=1"));
+    let force_with_lease = raw_query
+        .is_some_and(|q| q.split('&').any(|p| p == "force-with-lease=1"));
 
-    let (sign_required, allowed) = refs_policy::server_policy(&gyt_dir);
-    let eval = refs_policy::evaluate(&gyt_dir, &updates, force, sign_required, &allowed);
+    // Per-repo lock: hold for the entire evaluate+write sequence to
+    // prevent two concurrent pushes from both passing the FF check (which
+    // reads the on-disk ref) and then both writing — silently losing one
+    // pusher's history. The lock is a cross-process file lock so concurrent
+    // CLI commits inside the repo also serialize.
+    let lock_path = gyt_dir.join("refs.lock");
+    let _lock = match crate::fs_util::FileLock::acquire(
+        &lock_path,
+        std::time::Duration::from_secs(10),
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                503,
+                "Service Unavailable".into(),
+                format!("could not acquire refs lock: {e}\n").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
+
+    let (sign_required, allowed) =
+        refs_policy::server_policy_with_override(&gyt_dir, state.signers_file.as_deref());
+    let mode = if force {
+        refs_policy::Mode::Force
+    } else if force_with_lease {
+        refs_policy::Mode::ForceWithLease
+    } else {
+        refs_policy::Mode::FastForward
+    };
+    let eval = refs_policy::evaluate_with_mode(&gyt_dir, &updates, mode, sign_required, &allowed);
     if !eval.is_clean() {
         let mut msg = String::new();
         for (refname, err) in &eval.blocked {
@@ -1268,13 +1356,13 @@ fn wire_refs_update(
         match std::fs::write(&ref_path, format!("{}\n", update.new).as_bytes()) {
             Ok(()) => {
                 n_updated += 1;
-                refs_policy::append_audit(&gyt_dir, update, None);
+                refs_policy::append_audit(&gyt_dir, update, actor);
                 crate::reflog::record(
                     &gyt_dir,
                     &update.name,
                     update.old.as_ref(),
                     &update.new,
-                    "remote",
+                    actor.unwrap_or("anon"),
                     "wire: refs/update",
                 );
             }
@@ -1347,6 +1435,7 @@ mod tests {
             repos_root: repos_root.to_path_buf(),
             webroot: webroot.to_path_buf(),
             auth_token: None,
+            signers_file: None,
             shutdown: Mutex::new(false),
         })
     }

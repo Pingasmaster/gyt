@@ -36,6 +36,13 @@ pub fn run(args: &[String]) -> Result<()> {
     let walk = workdir::walk(&workdir_path, &ignore)?;
     let index = Index::read(&repo.index_path())?;
 
+    // Branch label + ahead/behind vs remote-tracking ref. Printed before
+    // the per-file status block so the user sees their branch state at
+    // the top, the way they expect from years of `git status`.
+    if !short {
+        print_branch_status(&repo);
+    }
+
     // Build HEAD path -> hash map.
     let head_map: BTreeMap<PathBuf, (u32, ObjectId)> = match refs::read_head(&repo.gyt_dir) {
         Ok(head) => match refs::resolve(&repo.gyt_dir, &head)? {
@@ -215,6 +222,98 @@ fn detect_renames(
         out.push((path, label));
     }
     *staged = out;
+}
+
+/// Print "On branch X" and an ahead/behind summary vs the first remote
+/// that has a tracking ref for X. Quietly skips both lines if there's no
+/// HEAD branch or no matching remote-tracking ref — we never invent
+/// information.
+fn print_branch_status(repo: &Repo) {
+    let Ok(head) = refs::read_head(&repo.gyt_dir) else {
+        return;
+    };
+    let branch_name = match &head {
+        refs::Head::Symbolic(name) => name.strip_prefix("refs/heads/").map(str::to_string),
+        refs::Head::Detached(_) => None,
+    };
+    let Some(branch) = branch_name else {
+        // Detached HEAD: just print where we are.
+        if let Ok(refs::Head::Detached(id)) = refs::read_head(&repo.gyt_dir) {
+            let hex = id.to_hex();
+            println!("HEAD detached at {}", &hex[..hex.len().min(8)]);
+            println!();
+        }
+        return;
+    };
+    println!("On branch {branch}");
+
+    // Walk every refs/remotes/<remote>/<branch> looking for a match.
+    let head_id = refs::resolve(&repo.gyt_dir, &head).ok().flatten();
+    let remotes_root = repo.gyt_dir.join("refs/remotes");
+    if !remotes_root.is_dir() {
+        println!();
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&remotes_root) else {
+        println!();
+        return;
+    };
+    for entry in entries.flatten() {
+        let remote = entry.file_name().to_string_lossy().into_owned();
+        let candidate = format!("refs/remotes/{remote}/{branch}");
+        let Ok(remote_id) = refs::read_ref(&repo.gyt_dir, &candidate) else {
+            continue;
+        };
+        let Some(local_id) = head_id else {
+            println!();
+            return;
+        };
+        let (ahead, behind) = ahead_behind(repo, &local_id, &remote_id);
+        match (ahead, behind) {
+            (0, 0) => println!("Your branch is up to date with '{remote}/{branch}'."),
+            (a, 0) => println!("Your branch is ahead of '{remote}/{branch}' by {a} commit(s)."),
+            (0, b) => println!(
+                "Your branch is behind '{remote}/{branch}' by {b} commit(s); fast-forward possible."
+            ),
+            (a, b) => println!(
+                "Your branch and '{remote}/{branch}' have diverged ({a} local, {b} remote)."
+            ),
+        }
+        println!();
+        return;
+    }
+    println!();
+}
+
+/// Count commits reachable from `local` but not `remote` (ahead), and
+/// reachable from `remote` but not `local` (behind). Uses set-difference
+/// over the parent DAG; for normal-sized histories this is fast enough.
+fn ahead_behind(repo: &Repo, local: &crate::hash::ObjectId, remote: &crate::hash::ObjectId) -> (usize, usize) {
+    if local == remote {
+        return (0, 0);
+    }
+    let local_set = reachable(repo, local);
+    let remote_set = reachable(repo, remote);
+    let ahead = local_set.iter().filter(|c| !remote_set.contains(c)).count();
+    let behind = remote_set.iter().filter(|c| !local_set.contains(c)).count();
+    (ahead, behind)
+}
+
+fn reachable(repo: &Repo, tip: &crate::hash::ObjectId) -> std::collections::HashSet<crate::hash::ObjectId> {
+    use std::collections::HashSet;
+    let mut out: HashSet<crate::hash::ObjectId> = HashSet::new();
+    let mut stack = vec![*tip];
+    while let Some(id) = stack.pop() {
+        if !out.insert(id) {
+            continue;
+        }
+        if let Ok(c) = crate::object::commit::read(&repo.gyt_dir, &id) {
+            for p in c.parents {
+                stack.push(p);
+            }
+        }
+    }
+    out
 }
 
 fn forward_slash(p: &Path) -> String {

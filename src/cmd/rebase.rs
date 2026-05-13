@@ -35,18 +35,23 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut ff_only = false;
     let mut upstream: Option<String> = None;
     let mut abort = false;
+    let mut cont = false;
 
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt rebase [--ff-only] [--abort] <upstream>\n\n\
-                     Replay commits from merge-base..HEAD on top of <upstream>."
+                    "gyt rebase [--ff-only] [--abort] [--continue] <upstream>\n\n\
+                     Replay commits from merge-base..HEAD on top of <upstream>.\n\n\
+                     --continue   resume a paused rebase: replays REBASE_TODO after the\n\
+                                  user has resolved conflicts and staged the result.\n\
+                     --abort      discard a paused rebase, restoring HEAD."
                 );
                 return Ok(());
             }
             "--ff-only" => ff_only = true,
             "--abort" => abort = true,
+            "--continue" => cont = true,
             other if !other.starts_with('-') => {
                 if upstream.is_some() {
                     return Err(GytError::InvalidArgument(
@@ -65,6 +70,9 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     if abort {
         return run_abort(repo);
+    }
+    if cont {
+        return run_continue(repo);
     }
 
     let upstream_rev = upstream
@@ -263,6 +271,221 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     );
     println!("Rebased {} commits onto {}", commits.len(), short(&target_id));
     Ok(())
+}
+
+/// Resume a paused rebase. Reads `.gyt/REBASE_HEAD` (the original HEAD
+/// before the rebase started), `.gyt/REBASE_ONTO` (the target the user is
+/// rebasing onto), and `.gyt/REBASE_TODO` (the still-to-replay commit
+/// ids, one per line). Treats the current index as the conflict resolution
+/// for the *first* todo: commits it as the next replayed commit, then
+/// replays the rest using the same three-way engine.
+fn run_continue(repo: &Repo) -> Result<()> {
+    let onto_path = repo.gyt_dir.join("REBASE_ONTO");
+    let head_path = repo.gyt_dir.join("REBASE_HEAD");
+    let todo_path = repo.gyt_dir.join("REBASE_TODO");
+    if !todo_path.exists() {
+        return Err(GytError::Repo("no rebase in progress".into()));
+    }
+    let prev_hex = std::fs::read_to_string(&head_path)?;
+    let prev_head = ObjectId::from_hex(prev_hex.trim())?;
+    let onto_hex = std::fs::read_to_string(&onto_path)?;
+    let onto = ObjectId::from_hex(onto_hex.trim())?;
+    let todo_text = std::fs::read_to_string(&todo_path)?;
+    let todo_ids: Vec<ObjectId> = todo_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| ObjectId::from_hex(l.trim()))
+        .collect::<std::result::Result<_, _>>()?;
+    if todo_ids.is_empty() {
+        // Nothing to do — just clean up state.
+        let _ = std::fs::remove_file(&head_path);
+        let _ = std::fs::remove_file(&onto_path);
+        let _ = std::fs::remove_file(&todo_path);
+        return Err(GytError::Repo("rebase --continue: TODO is empty".into()));
+    }
+
+    let head = refs::read_head(&repo.gyt_dir)?;
+    let head_ref = match &head {
+        Head::Symbolic(name) => name.clone(),
+        Head::Detached(_) => {
+            return Err(GytError::Refs(
+                "rebase --continue: detached HEAD".into(),
+            ));
+        }
+    };
+
+    // The current ref's commit is the parent of the first-todo replay.
+    let mut cursor = refs::read_ref(&repo.gyt_dir, &head_ref).map_err(|_| {
+        GytError::Repo(format!("rebase --continue: cannot read {head_ref}"))
+    })?;
+
+    // 1. Commit the user's conflict resolution as the next replayed commit.
+    let first_pc = commit_obj::read(&repo.gyt_dir, &todo_ids[0])?;
+    let resolved_tree = build_tree_from_index(repo)?;
+    let identity = identity_for(repo);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let stamped = format!("{identity} {secs} +0000");
+    let new_commit = commit_obj::Commit {
+        tree: resolved_tree,
+        parents: vec![cursor],
+        authors: vec![stamped.clone()],
+        committer: stamped,
+        ai_assists: first_pc.ai_assists.clone(),
+        reviewers: first_pc.reviewers.clone(),
+        signature: None,
+        message: first_pc.message.clone(),
+    };
+    cursor = commit_obj::write(&repo.gyt_dir, &new_commit)?;
+
+    // 2. Replay the remaining todos with the three-way engine.
+    let remaining = &todo_ids[1..];
+    for (idx, c) in remaining.iter().enumerate() {
+        match replay_one(repo, &cursor, c)? {
+            ReplayOutcome::Clean(new_id) => cursor = new_id,
+            ReplayOutcome::Conflict => {
+                // Persist state for the next --continue invocation.
+                let still_left: Vec<String> = remaining
+                    .iter()
+                    .skip(idx)
+                    .map(|c| c.to_hex())
+                    .collect();
+                std::fs::write(
+                    repo.gyt_dir.join("REBASE_HEAD"),
+                    format!("{}\n", prev_head.to_hex()),
+                )?;
+                std::fs::write(
+                    repo.gyt_dir.join("REBASE_ONTO"),
+                    format!("{}\n", onto.to_hex()),
+                )?;
+                std::fs::write(
+                    repo.gyt_dir.join("REBASE_TODO"),
+                    still_left.join("\n"),
+                )?;
+                refs::write_ref(&repo.gyt_dir, &head_ref, &cursor)?;
+                return Err(GytError::Repo(format!(
+                    "rebase --continue: conflicts replaying {}. Resolve and re-run.",
+                    short(c)
+                )));
+            }
+        }
+    }
+
+    // Done — advance HEAD, drop state files.
+    refs::write_ref(&repo.gyt_dir, &head_ref, &cursor)?;
+    let msg = format!(
+        "rebase --continue: finished onto {} (was {})",
+        short(&onto),
+        short(&prev_head)
+    );
+    crate::reflog::record(
+        &repo.gyt_dir,
+        &head_ref,
+        Some(&prev_head),
+        &cursor,
+        &identity,
+        &msg,
+    );
+    crate::reflog::record(
+        &repo.gyt_dir,
+        "HEAD",
+        Some(&prev_head),
+        &cursor,
+        &identity,
+        &msg,
+    );
+    let _ = std::fs::remove_file(&head_path);
+    let _ = std::fs::remove_file(&onto_path);
+    let _ = std::fs::remove_file(&todo_path);
+    println!("Rebase complete; HEAD now at {}", short(&cursor));
+    Ok(())
+}
+
+enum ReplayOutcome {
+    Clean(ObjectId),
+    Conflict,
+}
+
+/// Three-way merge picked-commit `c` on top of `cursor` and (on success)
+/// write a new commit, returning its id. On conflict the workdir is left
+/// with marker files and `Conflict` is returned.
+fn replay_one(repo: &Repo, cursor: &ObjectId, c: &ObjectId) -> Result<ReplayOutcome> {
+    let pc = commit_obj::read(&repo.gyt_dir, c)?;
+    let base_tree = match pc.parents.first() {
+        Some(p) => commit_obj::read(&repo.gyt_dir, p)?.tree,
+        None => tree::write(&repo.gyt_dir, &[])?,
+    };
+    let cursor_tree = commit_obj::read(&repo.gyt_dir, cursor)?.tree;
+    let base_files = crate::cmd::util::flatten_tree(repo, &base_tree)?;
+    let ours_files = crate::cmd::util::flatten_tree(repo, &cursor_tree)?;
+    let theirs_files = crate::cmd::util::flatten_tree(repo, &pc.tree)?;
+
+    let mut conflict_blobs: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    let tm = merge3::merge_trees(&base_files, &ours_files, &theirs_files, |path, ours, theirs, base| {
+        let ob = blob::read(&repo.gyt_dir, ours.1).unwrap_or_default();
+        let tb = blob::read(&repo.gyt_dir, theirs.1).unwrap_or_default();
+        let bb = match base {
+            Some((_, h)) => blob::read(&repo.gyt_dir, h).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let merged = merge3::merge_lines(&bb, &ob, &tb);
+        if merged.clean {
+            let bytes = merge3::render_with_markers(&merged, "ours", "theirs");
+            match blob::write(&repo.gyt_dir, &bytes) {
+                Ok(h) => merge3::ContentResult::Resolved(h),
+                Err(_) => merge3::ContentResult::Conflict {
+                    ours_hash: *ours.1,
+                    theirs_hash: *theirs.1,
+                },
+            }
+        } else {
+            let bytes = merge3::render_with_markers(&merged, "HEAD", "picked");
+            conflict_blobs.insert(path.clone(), bytes);
+            merge3::ContentResult::Conflict {
+                ours_hash: *ours.1,
+                theirs_hash: *theirs.1,
+            }
+        }
+    });
+
+    if !tm.conflicts.is_empty() {
+        apply_files_to_workdir(repo, &tm.merged)?;
+        write_index_from_map(repo, &tm.merged)?;
+        for (path, bytes) in &conflict_blobs {
+            let abs = repo.workdir.join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&abs, bytes)?;
+        }
+        return Ok(ReplayOutcome::Conflict);
+    }
+    apply_files_to_workdir(repo, &tm.merged)?;
+    write_index_from_map(repo, &tm.merged)?;
+    let new_tree = write_tree_from_map(repo, &tm.merged)?;
+    let identity = identity_for(repo);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let stamped = format!("{identity} {secs} +0000");
+    let new_commit = commit_obj::Commit {
+        tree: new_tree,
+        parents: vec![*cursor],
+        authors: vec![stamped.clone()],
+        committer: stamped,
+        ai_assists: pc.ai_assists.clone(),
+        reviewers: pc.reviewers.clone(),
+        signature: None,
+        message: pc.message.clone(),
+    };
+    let new_id = commit_obj::write(&repo.gyt_dir, &new_commit)?;
+    Ok(ReplayOutcome::Clean(new_id))
+}
+
+fn build_tree_from_index(repo: &Repo) -> Result<ObjectId> {
+    let idx = crate::index::Index::read(&repo.index_path())?;
+    crate::cmd::util::build_tree_from_index(repo, &idx)
 }
 
 fn run_abort(repo: &Repo) -> Result<()> {

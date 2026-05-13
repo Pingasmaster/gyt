@@ -1,4 +1,5 @@
 pub mod add;
+pub mod blame;
 pub mod branch;
 pub mod cherry_pick;
 pub mod ci;

@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut path: Option<PathBuf> = None;
+    let mut bare = false;
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
             }
+            "--bare" => bare = true,
             other if other.starts_with('-') => {
                 return Err(GytError::InvalidArgument(format!(
                     "init: unknown flag {other}"
@@ -30,11 +32,20 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
     let target = path.unwrap_or_else(|| PathBuf::from("."));
-    init_at(&target)
+    if bare {
+        init_bare_at(&target)
+    } else {
+        init_at(&target)
+    }
 }
 
 fn print_usage() {
-    println!("gyt init [path]\n\nInitialize a new gyt repository.");
+    println!(
+        "gyt init [path] [--bare]\n\n\
+         Initialize a new gyt repository.\n\
+           --bare   Lay out the gyt directory directly in <path> with no\n\
+                    working tree. Use this for repos hosted by `gyt serve`."
+    );
 }
 
 pub fn init_at(target: &Path) -> Result<()> {
@@ -44,18 +55,45 @@ pub fn init_at(target: &Path) -> Result<()> {
     if gyt.exists() {
         return Err(GytError::Repo(format!("{} already exists", gyt.display())));
     }
+    populate_gyt_layout(&gyt)?;
+    println!("initialized empty gyt repository in {}", gyt.display());
+    Ok(())
+}
+
+/// Initialize a *bare* repository: the layout (objects/, refs/, HEAD, …)
+/// goes directly in `target` with no enclosing working tree. Servers use
+/// these so they don't accumulate working-tree files they never read.
+pub fn init_bare_at(target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    let abs = target.canonicalize()?;
+    if abs.join("HEAD").exists() || abs.join("objects").exists() {
+        return Err(GytError::Repo(format!(
+            "{} already looks like a bare repo",
+            abs.display()
+        )));
+    }
+    if abs.join(GYT_DIR).exists() {
+        return Err(GytError::Repo(format!(
+            "{} has a non-bare .gyt directory; refuse to overwrite",
+            abs.display()
+        )));
+    }
+    populate_gyt_layout(&abs)?;
+    // Marker file so tools can tell at a glance.
+    fs::write(abs.join("bare"), b"true\n")?;
+    println!("initialized bare gyt repository in {}", abs.display());
+    Ok(())
+}
+
+fn populate_gyt_layout(gyt: &Path) -> Result<()> {
     fs::create_dir_all(gyt.join("objects"))?;
     fs::create_dir_all(gyt.join("refs/heads"))?;
     fs::create_dir_all(gyt.join("refs/tags"))?;
     fs::create_dir_all(gyt.join("refs/remotes"))?;
     fs::create_dir_all(gyt.join("worktrees"))?;
-
-    refs::write_head(&gyt, &Head::Symbolic("refs/heads/main".to_string()))?;
-
+    refs::write_head(gyt, &Head::Symbolic("refs/heads/main".to_string()))?;
     let idx = Index::new();
     idx.write(&gyt.join("index"))?;
-
-    // Starter config: pick up any env-var identity, otherwise empty file.
     let mut cfg = Config::default();
     if let Ok(v) = std::env::var("GYT_AUTHOR_NAME") {
         cfg.user_name = Some(v);
@@ -63,9 +101,7 @@ pub fn init_at(target: &Path) -> Result<()> {
     if let Ok(v) = std::env::var("GYT_AUTHOR_EMAIL") {
         cfg.user_email = Some(v);
     }
-    cfg.write(&gyt)?;
-
-    println!("initialized empty gyt repository in {}", gyt.display());
+    cfg.write(gyt)?;
     Ok(())
 }
 

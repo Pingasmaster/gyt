@@ -258,12 +258,18 @@ fn three_way_merge(
 
     let has_tree_conflict = !tm.conflicts.is_empty();
     if has_tree_conflict {
-        // Apply the clean parts (merged map) to the workdir + index. For
-        // conflicted entries, write the rendered marker text (when
-        // available) or fall back to "ours". Leave MERGE_HEAD/MERGE_MSG so
-        // a follow-up `commit` records the merge.
+        // Apply the clean parts (merged map) to the workdir + index, then
+        // ensure every tree-level conflict gets a visible artifact in the
+        // workdir so the user can resolve it. Content conflicts already
+        // have marker-rendered bytes stashed in `conflicted_paths`;
+        // modify/delete, add/add and mode collisions need a synthesized
+        // marker file.
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
+
+        let content_set: std::collections::HashSet<&PathBuf> =
+            conflicted_paths.iter().map(|(p, _)| p).collect();
+
         for (path, render) in &conflicted_paths {
             let abs = repo.workdir.join(path);
             if let Some(parent) = abs.parent() {
@@ -273,6 +279,24 @@ fn three_way_merge(
                 ConflictRender::Content(bytes) => std::fs::write(&abs, bytes)?,
             }
         }
+        for c in &tm.conflicts {
+            if content_set.contains(&c.path) {
+                continue;
+            }
+            // Produce a marker file describing the tree-level conflict.
+            // We pick "ours" content as the base, then append a marker
+            // block describing what theirs did. This guarantees the user
+            // sees the conflict even if it's "modify on one side, delete
+            // on the other".
+            let bytes =
+                render_tree_conflict_marker(repo, &c.path, c.kind, c.base, c.ours, c.theirs);
+            let abs = repo.workdir.join(&c.path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&abs, bytes)?;
+        }
+
         std::fs::write(
             repo.gyt_dir.join("MERGE_HEAD"),
             format!("{}\n", theirs.to_hex()).as_bytes(),
@@ -336,6 +360,69 @@ fn three_way_merge(
 enum ConflictRender {
     /// Marker-rendered bytes — write straight into the workdir.
     Content(Vec<u8>),
+}
+
+/// Synthesize a workdir-visible marker file for a tree-level conflict that
+/// the line-merge engine didn't handle (modify/delete, add/add with
+/// different content, mode collision). The output is loosely modeled on
+/// git's conflict-marker convention: a `<<<<<<<` header, the "ours" side,
+/// a `=======` separator, the "theirs" side, a `>>>>>>>` footer. For
+/// missing sides we emit a one-line placeholder so the user can see at a
+/// glance what happened. The file is overwritten with this marker so the
+/// next `gyt commit` will not accidentally commit half-merged content.
+fn render_tree_conflict_marker(
+    repo: &Repo,
+    path: &Path,
+    kind: merge3::ConflictKind,
+    base: Option<(u32, ObjectId)>,
+    ours: Option<(u32, ObjectId)>,
+    theirs: Option<(u32, ObjectId)>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let path_str = path.display().to_string();
+    out.extend_from_slice(b"<<<<<<< CONFLICT (");
+    out.extend_from_slice(
+        match kind {
+            merge3::ConflictKind::AddAdd => "add/add",
+            merge3::ConflictKind::ModifyDelete => "modify/delete",
+            merge3::ConflictKind::Content => "content",
+            merge3::ConflictKind::Mode => "mode",
+        }
+        .as_bytes(),
+    );
+    out.extend_from_slice(b"): ");
+    out.extend_from_slice(path_str.as_bytes());
+    out.push(b'\n');
+
+    out.extend_from_slice(b"<<<<<<< ours\n");
+    match ours {
+        Some((mode, hash)) => append_side(repo, &mut out, mode, &hash),
+        None => out.extend_from_slice(b"(deleted on our side)\n"),
+    }
+    if let Some((mode, hash)) = base {
+        out.extend_from_slice(b"||||||| base\n");
+        out.extend_from_slice(format!("mode={mode:o} {}\n", hash.to_hex()).as_bytes());
+    }
+    out.extend_from_slice(b"=======\n");
+    match theirs {
+        Some((mode, hash)) => append_side(repo, &mut out, mode, &hash),
+        None => out.extend_from_slice(b"(deleted on their side)\n"),
+    }
+    out.extend_from_slice(b">>>>>>> theirs\n");
+    out
+}
+
+fn append_side(repo: &Repo, out: &mut Vec<u8>, mode: u32, hash: &ObjectId) {
+    if let Ok(bytes) = blob::read(&repo.gyt_dir, hash) {
+        // If the blob has no trailing newline, add one so the next marker
+        // is on its own line.
+        out.extend_from_slice(&bytes);
+        if !bytes.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    } else {
+        out.extend_from_slice(format!("mode={mode:o} {} (blob unreadable)\n", hash.to_hex()).as_bytes());
+    }
 }
 
 fn short(id: &ObjectId) -> String {

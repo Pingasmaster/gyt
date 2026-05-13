@@ -115,10 +115,13 @@ pass
 
 # ── 12. reset --hard works (was rejected pre-1.0; now restores workdir) ─
 echo "[12] reset --hard restores workdir"
-# a.txt at HEAD was committed as "MOD" in step 6; scribble on it then
-# reset --hard HEAD — the file should be restored to the committed value.
+# reset --hard refuses to silently discard uncommitted changes; --force
+# overrides. a.txt at HEAD was committed as "MOD" in step 6; scribble on
+# it, run reset --hard --force HEAD, and the file should be restored.
 echo "scratch-line" >> a.txt
-"$BIN" reset --hard HEAD >/dev/null 2>&1 || fail "reset --hard should succeed"
+# Without --force, reset --hard must refuse (safety check).
+"$BIN" reset --hard HEAD 2>/dev/null && fail "reset --hard should refuse dirty workdir"
+"$BIN" reset --hard --force HEAD >/dev/null 2>&1 || fail "reset --hard --force should succeed"
 restored_a=$(cat a.txt)
 [ "$restored_a" = "MOD" ] || fail "reset --hard did not restore a.txt (got '$restored_a')"
 pass

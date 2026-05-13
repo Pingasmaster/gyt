@@ -18,12 +18,21 @@ pub fn run(args: &[String]) -> Result<()> {
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut remote: Option<String> = None;
+    let mut refspec: Option<String> = None;
     let mut insecure = false;
+    let mut prune = false;
     for a in args {
         match a.as_str() {
             "--insecure" => insecure = true,
+            "--prune" | "-p" => prune = true,
             "-h" | "--help" => {
-                println!("gyt fetch [<remote>] [--insecure]");
+                println!(
+                    "gyt fetch [<remote>] [<ref>] [--insecure] [--prune|-p]\n\n\
+                     Fetch objects and refs from the named remote (default origin).\n\
+                     With <ref>, only refs whose short name matches are fetched\n\
+                     (e.g. `gyt fetch origin main`). --prune deletes any local\n\
+                     refs/remotes/<remote>/* that the server no longer advertises."
+                );
                 return Ok(());
             }
             other if other.starts_with('-') => {
@@ -32,30 +41,55 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 )));
             }
             other => {
-                if remote.is_some() {
+                if remote.is_none() {
+                    remote = Some(other.to_string());
+                } else if refspec.is_none() {
+                    refspec = Some(other.to_string());
+                } else {
                     return Err(GytError::InvalidArgument(
-                        "fetch: at most one remote argument".into(),
+                        "fetch: at most two positional arguments (<remote> [<ref>])".into(),
                     ));
                 }
-                remote = Some(other.to_string());
             }
         }
     }
     let remote = remote.unwrap_or_else(|| "origin".to_string());
-    let summary = fetch(repo, &remote, insecure)?;
-    println!(
-        "{} new objects from {}; updated {} refs.",
-        summary.new_objects, remote, summary.updated_refs
-    );
+    let summary = fetch_with_refspec(repo, &remote, refspec.as_deref(), insecure, prune)?;
+    if summary.pruned_refs > 0 {
+        println!(
+            "{} new objects from {}; updated {} refs; pruned {} stale.",
+            summary.new_objects, remote, summary.updated_refs, summary.pruned_refs
+        );
+    } else {
+        println!(
+            "{} new objects from {}; updated {} refs.",
+            summary.new_objects, remote, summary.updated_refs
+        );
+    }
     Ok(())
 }
 
 pub struct FetchSummary {
     pub new_objects: usize,
     pub updated_refs: usize,
+    pub pruned_refs: usize,
 }
 
-pub fn fetch(repo: &Repo, remote: &str, insecure: bool) -> Result<FetchSummary> {
+pub fn fetch(repo: &Repo, remote: &str, insecure: bool, prune: bool) -> Result<FetchSummary> {
+    fetch_with_refspec(repo, remote, None, insecure, prune)
+}
+
+/// Like `fetch`, but if `refspec` is `Some(name)` only refs whose
+/// short name (under `refs/heads/` or `refs/tags/`) equals that name are
+/// fetched and mirrored to `refs/remotes/<remote>/...`. Useful for CI
+/// fetching just a single branch without downloading every tag.
+pub fn fetch_with_refspec(
+    repo: &Repo,
+    remote: &str,
+    refspec: Option<&str>,
+    insecure: bool,
+    prune: bool,
+) -> Result<FetchSummary> {
     let cfg = Config::load(repo)?;
     let url = cfg
         .remotes
@@ -63,11 +97,32 @@ pub fn fetch(repo: &Repo, remote: &str, insecure: bool) -> Result<FetchSummary> 
         .ok_or_else(|| GytError::InvalidArgument(format!("fetch: unknown remote {remote:?}")))?
         .clone();
     let client = open_client(&url, insecure)?;
-    let server_refs = fetch_info_refs(&client)?;
+    let server_refs_all = fetch_info_refs(&client)?;
+    let server_refs: Vec<_> = match refspec {
+        Some(name) => server_refs_all
+            .into_iter()
+            .filter(|r| {
+                r.name
+                    .strip_prefix("refs/heads/")
+                    .or_else(|| r.name.strip_prefix("refs/tags/"))
+                    == Some(name)
+            })
+            .collect(),
+        None => server_refs_all,
+    };
+    if let Some(name) = refspec
+        && server_refs.is_empty()
+    {
+        return Err(GytError::Repo(format!(
+            "fetch: refspec {name:?} did not match any ref on {remote}"
+        )));
+    }
     let n_objects = walk_and_fetch(&client, repo, &server_refs, true)?;
 
     // Update refs/remotes/<remote>/<name> for heads and tags.
     let mut updated = 0usize;
+    let mut advertised_local: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for r in &server_refs {
         let mapped = if let Some(rest) = r.name.strip_prefix("refs/heads/") {
             Some(format!("refs/remotes/{remote}/{rest}"))
@@ -83,11 +138,29 @@ pub fn fetch(repo: &Repo, remote: &str, insecure: bool) -> Result<FetchSummary> 
                 refs::write_ref(&repo.gyt_dir, &local, &r.id)?;
                 updated += 1;
             }
+            advertised_local.insert(local);
         }
     }
+
+    let mut pruned = 0usize;
+    if prune {
+        // Delete refs/remotes/<remote>/* that the server no longer
+        // advertises. Operates on the namespace we exclusively manage.
+        let prefix = format!("refs/remotes/{remote}");
+        if let Ok(local_refs) = refs::list_refs(&repo.gyt_dir, &prefix) {
+            for (name, _) in local_refs {
+                if !advertised_local.contains(&name) {
+                    refs::delete_ref(&repo.gyt_dir, &name)?;
+                    pruned += 1;
+                }
+            }
+        }
+    }
+
     Ok(FetchSummary {
         new_objects: n_objects,
         updated_refs: updated,
+        pruned_refs: pruned,
     })
 }
 
@@ -194,7 +267,7 @@ mod tests {
         }
 
         // Fetch.
-        let summary = fetch(&repo, "origin", true).unwrap();
+        let summary = fetch(&repo, "origin", true, false).unwrap();
         assert!(summary.new_objects >= 3, "got {}", summary.new_objects);
         assert!(summary.updated_refs >= 1, "got {}", summary.updated_refs);
 

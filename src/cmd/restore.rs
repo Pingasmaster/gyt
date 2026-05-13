@@ -13,11 +13,12 @@ pub fn run(args: &[String]) -> Result<()> {
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(GytError::InvalidArgument(
-            "usage: gyt restore [--staged] [--worktree] <path>...".into(),
+            "usage: gyt restore [--staged] [--worktree] [--source=<rev>] <path>...".into(),
         ));
     }
     let mut staged = false;
     let mut worktree = false;
+    let mut source: Option<String> = None;
     let mut path_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -31,13 +32,29 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 worktree = true;
                 i += 1;
             }
+            "--source" | "-s" => {
+                i += 1;
+                source = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            GytError::InvalidArgument("--source requires a revision".into())
+                        })?
+                        .clone(),
+                );
+                i += 1;
+            }
             "--help" | "-h" => {
-                println!("gyt restore [--staged] [--worktree] <path>...");
-                println!("  --staged    restore from HEAD to the index (unstages)");
-                println!("  --worktree  restore from the index to the working tree (default)");
+                println!("gyt restore [--staged] [--worktree] [--source=<rev>] <path>...");
+                println!("  --staged       restore from --source (or HEAD) to the index (unstages)");
+                println!("  --worktree     restore from --source (or the index) to the working tree (default)");
+                println!("  --source <rev> pull blobs from <rev>'s tree instead of HEAD/index");
                 println!("  If neither --staged nor --worktree is given, --worktree is implied.");
                 println!("  If both are given, both operations are performed.");
                 return Ok(());
+            }
+            arg if arg.starts_with("--source=") => {
+                source = Some(arg.trim_start_matches("--source=").to_string());
+                i += 1;
             }
             other => {
                 path_args.push(other.to_string());
@@ -59,54 +76,105 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     let mut idx = Index::read(&repo.index_path())?;
 
+    // If --source <rev> is given, resolve its tree once and use it as the
+    // authoritative source for both --staged and --worktree restores.
+    // Otherwise we fall back to HEAD (for --staged) and the index (for
+    // --worktree), matching git's defaults.
+    let source_tree: Option<std::collections::BTreeMap<PathBuf, (u32, crate::hash::ObjectId)>> =
+        if let Some(rev) = &source {
+            let id = crate::cmd::util::resolve_rev(repo, rev)?;
+            let obj = crate::object::store::read(&repo.gyt_dir, &id)?;
+            // Accept either a commit or a raw tree object id.
+            let tree_id = match obj.kind {
+                crate::object::ObjectKind::Commit => {
+                    crate::object::commit::decode(&obj.payload)?.tree
+                }
+                crate::object::ObjectKind::Tree => id,
+                other => {
+                    return Err(GytError::InvalidArgument(format!(
+                        "restore --source: {rev} is a {} (need commit or tree)",
+                        other.as_str()
+                    )));
+                }
+            };
+            Some(crate::cmd::util::flatten_tree(repo, &tree_id)?)
+        } else {
+            None
+        };
+
     let targets: Vec<PathBuf> = if path_args.len() == 1 && path_args[0] == "." {
-        // When doing staged restore, "." means all tracked entries from HEAD.
-        idx.entries.iter().map(|e| e.path.clone()).collect()
+        // "." means all tracked entries: from the source if given, otherwise
+        // from the index.
+        if let Some(flat) = &source_tree {
+            flat.keys().cloned().collect()
+        } else {
+            idx.entries.iter().map(|e| e.path.clone()).collect()
+        }
     } else {
         path_args.iter().map(PathBuf::from).collect()
     };
 
     for path in &targets {
         if staged {
-            // Restore from HEAD to index (unstage).
-            let head = crate::refs::read_head(&repo.gyt_dir)?;
-            let head_id = crate::refs::resolve(&repo.gyt_dir, &head)?;
-            match head_id {
-                Some(id) => {
+            let source_entry = if let Some(flat) = &source_tree {
+                flat.get(path).copied()
+            } else {
+                // Default: HEAD's tree.
+                let head = crate::refs::read_head(&repo.gyt_dir)?;
+                let head_id = crate::refs::resolve(&repo.gyt_dir, &head)?;
+                if let Some(id) = head_id {
                     let c = crate::object::commit::read(&repo.gyt_dir, &id)?;
                     let flat = crate::cmd::util::flatten_tree(repo, &c.tree)?;
-                    match flat.get(path) {
-                        Some((mode, hash)) => {
-                            idx.insert(IndexEntry {
-                                ctime_secs: 0,
-                                mtime_secs: 0,
-                                size: 0,
-                                mode: *mode,
-                                hash: *hash,
-                                path: path.clone(),
-                            });
-                        }
-                        None => {
-                            // Path not in HEAD: remove from index entirely.
-                            idx.remove(path);
-                        }
-                    }
+                    flat.get(path).copied()
+                } else {
+                    None
+                }
+            };
+            match source_entry {
+                Some((mode, hash)) => {
+                    idx.insert(IndexEntry {
+                        ctime_secs: 0,
+                        mtime_secs: 0,
+                        size: 0,
+                        mode,
+                        hash,
+                        path: path.clone(),
+                    });
                 }
                 None => {
-                    // No HEAD commit — path not in HEAD, remove from index.
                     idx.remove(path);
                 }
             }
         }
 
         if worktree {
-            match idx.find(path) {
-                Some(entry) => restore_one(repo, entry)?,
-                None => {
+            if let Some(flat) = &source_tree {
+                // Pull directly from the source tree, bypassing the index.
+                let Some((mode, hash)) = flat.get(path).copied() else {
                     eprintln!(
-                        "gyt restore: {}: not in the index, skipping",
+                        "gyt restore: {}: not in source tree, skipping",
                         path.display()
                     );
+                    continue;
+                };
+                let synth = IndexEntry {
+                    ctime_secs: 0,
+                    mtime_secs: 0,
+                    size: 0,
+                    mode,
+                    hash,
+                    path: path.clone(),
+                };
+                restore_one(repo, &synth)?;
+            } else {
+                match idx.find(path) {
+                    Some(entry) => restore_one(repo, entry)?,
+                    None => {
+                        eprintln!(
+                            "gyt restore: {}: not in the index, skipping",
+                            path.display()
+                        );
+                    }
                 }
             }
         }

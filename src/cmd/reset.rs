@@ -21,11 +21,13 @@ pub fn run(args: &[String]) -> Result<()> {
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut mode = Mode::Mixed;
     let mut rev: Option<String> = None;
+    let mut force = false;
     for a in args {
         match a.as_str() {
             "--soft" => mode = Mode::Soft,
             "--mixed" => mode = Mode::Mixed,
             "--hard" => mode = Mode::Hard,
+            "--force" | "-f" => force = true,
             other if !other.starts_with('-') => {
                 if rev.is_some() {
                     return Err(GytError::InvalidArgument(
@@ -60,6 +62,32 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             "reset: <rev> {rev} is not a commit (got {})",
             obj.kind.as_str()
         )));
+    }
+
+    // Dirty-workdir guard for `--hard`. Without this, scribbles on tracked
+    // files are silently lost — the classic git footgun. List paths that
+    // differ between workdir and HEAD's index and refuse if any are dirty
+    // unless the user passes `--force`.
+    if mode == Mode::Hard && !force {
+        let dirty = workdir_dirty_paths(repo)?;
+        if !dirty.is_empty() {
+            let preview = dirty
+                .iter()
+                .take(10)
+                .map(|p| format!("  {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let more = if dirty.len() > 10 {
+                format!("\n  ... and {} more", dirty.len() - 10)
+            } else {
+                String::new()
+            };
+            return Err(GytError::Repo(format!(
+                "reset --hard: workdir has uncommitted changes; refusing to discard.\n\
+                 Run `gyt stash push` first, or pass --force to override.\n\
+                 Dirty paths:\n{preview}{more}"
+            )));
+        }
     }
 
     let prev = refs::read_ref(&repo.gyt_dir, &head_ref).ok();
@@ -116,6 +144,53 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
     // Soft: only ref updated above, index and workdir unchanged
     Ok(())
+}
+
+/// List tracked paths whose workdir content differs from the index. Empty
+/// vec means the workdir is clean. Untracked files are intentionally NOT
+/// included — reset --hard never touches them.
+fn workdir_dirty_paths(repo: &Repo) -> Result<Vec<std::path::PathBuf>> {
+    let idx = Index::read(&repo.index_path())?;
+    let mut dirty = Vec::new();
+    for e in &idx.entries {
+        let abs = repo.workdir.join(&e.path);
+        let md = match std::fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            Err(_) => {
+                // File missing from workdir: that's dirty too (deletion).
+                dirty.push(e.path.clone());
+                continue;
+            }
+        };
+        if md.file_type().is_symlink() {
+            // For symlinks, the stored "blob" is the link target path. Hash
+            // the same way `object::store::write_bytes(_, Blob, target)`
+            // would have computed the ObjectId.
+            let Ok(target) = std::fs::read_link(&abs) else {
+                dirty.push(e.path.clone());
+                continue;
+            };
+            let bytes = target.to_string_lossy().into_owned().into_bytes();
+            let raw = crate::object::store::build_raw(
+                crate::object::ObjectKind::Blob,
+                &bytes,
+            );
+            let hash = crate::hash::hash_bytes(&raw);
+            if hash != e.hash {
+                dirty.push(e.path.clone());
+            }
+            continue;
+        }
+        let Ok(actual) = crate::workdir::hash_blob(&abs) else {
+            dirty.push(e.path.clone());
+            continue;
+        };
+        if actual != e.hash {
+            dirty.push(e.path.clone());
+        }
+    }
+    dirty.sort();
+    Ok(dirty)
 }
 
 #[cfg(test)]

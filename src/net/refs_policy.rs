@@ -152,39 +152,7 @@ pub fn load_allowed_signers(gyt_dir: &Path) -> Result<Vec<VerifyingKey>> {
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| GytError::Repo(format!("read allowed_signers: {e}")))?;
-    let mut out = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let hex_part = line.split_whitespace().next().unwrap_or("");
-        if hex_part.len() != 64 {
-            return Err(GytError::Parse(format!(
-                "allowed_signers line {}: expected 64 hex chars, got {}",
-                i + 1,
-                hex_part.len()
-            )));
-        }
-        let mut bytes = [0u8; 32];
-        for (j, b) in bytes.iter_mut().enumerate() {
-            let hi = (hex_part.as_bytes()[j * 2] as char)
-                .to_digit(16)
-                .ok_or_else(|| {
-                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
-                })?;
-            let lo = (hex_part.as_bytes()[j * 2 + 1] as char)
-                .to_digit(16)
-                .ok_or_else(|| {
-                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
-                })?;
-            *b = ((hi << 4) | lo) as u8;
-        }
-        let vk = VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| GytError::Parse(format!("allowed_signers line {}: {e}", i + 1)))?;
-        out.push(vk);
-    }
-    Ok(out)
+    parse_allowed_signers(&text)
 }
 
 /// Verify a single commit object: it must have a signature line, the
@@ -198,11 +166,11 @@ fn verify_commit_signed(
     let Some(b64) = &c.signature else {
         return Err(PolicyError::UnsignedCommit { commit: *id });
     };
-    // Decode the base64 signature using the same logic the verify command uses.
-    // We re-encode the payload without the signature line to obtain the bytes
-    // that were signed.
+    // Decode the base64 signature using the same strict decoder as
+    // `gyt verify`. We re-encode the payload without the signature line to
+    // obtain the bytes that were signed.
     let payload = signing::commit_payload_without_sig(&c);
-    let sig_bytes = match decode_b64(b64) {
+    let sig_bytes = match signing::base64_decode(b64) {
         Some(b) if b.len() == 64 => b,
         _ => return Err(PolicyError::BadSignature { commit: *id }),
     };
@@ -218,34 +186,6 @@ fn verify_commit_signed(
     Err(PolicyError::SignerNotAllowed { commit: *id })
 }
 
-/// Tiny base64 decoder so we don't need to expose the one in `signing`.
-fn decode_b64(input: &str) -> Option<Vec<u8>> {
-    let input = input.trim();
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-    for ch in input.chars() {
-        if ch == '=' {
-            break;
-        }
-        let val: u32 = match ch {
-            'A'..='Z' => u32::from(ch as u8 - b'A'),
-            'a'..='z' => u32::from(ch as u8 - b'a' + 26),
-            '0'..='9' => u32::from(ch as u8 - b'0' + 52),
-            '+' => 62,
-            '/' => 63,
-            _ => return None,
-        };
-        buf = (buf << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
-}
 
 /// Result of evaluating a ref-update batch against server policy.
 pub struct PolicyEvaluation {
@@ -258,8 +198,24 @@ impl PolicyEvaluation {
     }
 }
 
+/// What kind of update authorization the client requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Default: strict fast-forward (`new` must descend from `old` AND the
+    /// on-disk ref must currently match `old`).
+    FastForward,
+    /// Lease semantics: skip the FF descendant check but keep the "current
+    /// ref must equal the client's expected `old`" check. The client passes
+    /// its local cached refs/remotes/... value as `old`; if the remote has
+    /// moved beyond it, the push is rejected.
+    ForceWithLease,
+    /// Unconditional force: bypass both checks. Use sparingly.
+    Force,
+}
+
 /// Check a list of ref updates against the configured server policy.
-/// `force` lets the caller bypass FF checks (sign-check is never bypassed).
+/// Convenience wrapper that converts a bool to a Mode. Existing callers
+/// (tests) keep working.
 pub fn evaluate(
     gyt_dir: &Path,
     updates: &[crate::net::protocol::RefUpdate],
@@ -267,10 +223,26 @@ pub fn evaluate(
     sign_required: bool,
     allowed_signers: &[VerifyingKey],
 ) -> PolicyEvaluation {
+    let mode = if force { Mode::Force } else { Mode::FastForward };
+    evaluate_with_mode(gyt_dir, updates, mode, sign_required, allowed_signers)
+}
+
+/// Like `evaluate`, but lets the caller request `ForceWithLease` (the new
+/// mode that splits the bool into two more useful flavors).
+pub fn evaluate_with_mode(
+    gyt_dir: &Path,
+    updates: &[crate::net::protocol::RefUpdate],
+    mode: Mode,
+    sign_required: bool,
+    allowed_signers: &[VerifyingKey],
+) -> PolicyEvaluation {
     let mut blocked = Vec::new();
 
     for u in updates {
-        // FF check (skipped for branch creation, for force, and for deletes).
+        // Three modes have three different gate combinations. We always
+        // run signature verification at the end if `sign_required`.
+        let force = mode == Mode::Force;
+        let with_lease = mode == Mode::ForceWithLease;
         if !force && let Some(old) = u.old {
             // Resolve the current on-disk value of the ref; if it doesn't
             // exist or doesn't match `old`, the client is racing — return a
@@ -297,17 +269,21 @@ pub fn evaluate(
                 }
                 Some(_) => {}
             }
-            // True FF: new must descend from old.
-            match is_ancestor(gyt_dir, &old, &u.new) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => {
-                    blocked.push((
-                        u.name.clone(),
-                        PolicyError::NotFastForward {
-                            refname: u.name.clone(),
-                        },
-                    ));
-                    continue;
+            // True FF: new must descend from old. ForceWithLease skips
+            // this check (the point of a lease is to allow rewinds /
+            // rewrites as long as nobody else moved the ref first).
+            if !with_lease {
+                match is_ancestor(gyt_dir, &old, &u.new) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        blocked.push((
+                            u.name.clone(),
+                            PolicyError::NotFastForward {
+                                refname: u.name.clone(),
+                            },
+                        ));
+                        continue;
+                    }
                 }
             }
         }
@@ -362,13 +338,75 @@ pub fn read_sign_required(gyt_dir: &Path) -> bool {
 
 /// Wrapper: load both the sign_required flag and allowed signers in one go.
 pub fn server_policy(gyt_dir: &Path) -> (bool, Vec<VerifyingKey>) {
+    server_policy_with_override(gyt_dir, None)
+}
+
+/// Same as `server_policy`, but if `override_signers` points at an
+/// existing file the allowed signers come from there instead of the
+/// per-repo `<gyt>/allowed_signers`. This is the recommended deployment:
+/// keep the trust file *outside* the repo so a pusher with write access
+/// cannot extend trust by editing the file and pushing.
+pub fn server_policy_with_override(
+    gyt_dir: &Path,
+    override_signers: Option<&Path>,
+) -> (bool, Vec<VerifyingKey>) {
     let sign_required = read_sign_required(gyt_dir);
-    let allowed = if sign_required {
-        load_allowed_signers(gyt_dir).unwrap_or_default()
-    } else {
-        Vec::new()
+    if !sign_required {
+        return (false, Vec::new());
+    }
+    let allowed = match override_signers {
+        Some(p) if p.exists() => load_allowed_signers_at(p).unwrap_or_default(),
+        _ => load_allowed_signers(gyt_dir).unwrap_or_default(),
     };
-    (sign_required, allowed)
+    (true, allowed)
+}
+
+/// Load allowed-signer public keys from an arbitrary file path. Used by
+/// the server-wide `--signers <file>` override; same format as the
+/// in-repo file (one hex pubkey per line, `#`-comments allowed).
+fn load_allowed_signers_at(path: &Path) -> Result<Vec<VerifyingKey>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| GytError::Repo(format!("read allowed_signers {}: {e}", path.display())))?;
+    parse_allowed_signers(&text)
+}
+
+fn parse_allowed_signers(text: &str) -> Result<Vec<VerifyingKey>> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let hex_part = line.split_whitespace().next().unwrap_or("");
+        if hex_part.len() != 64 {
+            return Err(GytError::Parse(format!(
+                "allowed_signers line {}: expected 64 hex chars, got {}",
+                i + 1,
+                hex_part.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        for (j, b) in bytes.iter_mut().enumerate() {
+            let hi = (hex_part.as_bytes()[j * 2] as char)
+                .to_digit(16)
+                .ok_or_else(|| {
+                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
+                })?;
+            let lo = (hex_part.as_bytes()[j * 2 + 1] as char)
+                .to_digit(16)
+                .ok_or_else(|| {
+                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
+                })?;
+            *b = ((hi << 4) | lo) as u8;
+        }
+        let vk = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| GytError::Parse(format!("allowed_signers line {}: {e}", i + 1)))?;
+        out.push(vk);
+    }
+    Ok(out)
 }
 
 /// Append an entry to `<gyt>/audit.log` describing a successful ref update.

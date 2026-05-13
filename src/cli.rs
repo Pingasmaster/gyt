@@ -15,6 +15,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
             Ok(())
         }
         "init" => crate::cmd::init::run(rest),
+        "blame" => crate::cmd::blame::run(rest),
         "keygen" => crate::cmd::keygen::run(rest),
         "verify" => crate::cmd::verify::run(rest),
         "add" => crate::cmd::add::run(rest),

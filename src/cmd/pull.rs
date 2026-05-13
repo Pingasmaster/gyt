@@ -44,7 +44,7 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
     let remote = remote.unwrap_or_else(|| "origin".to_string());
 
-    let summary: FetchSummary = fetch::fetch(repo, &remote, insecure)?;
+    let summary: FetchSummary = fetch::fetch(repo, &remote, insecure, false)?;
     println!(
         "fetch: {} new objects, {} refs updated",
         summary.new_objects, summary.updated_refs

@@ -64,12 +64,38 @@ pub fn encode(c: &Commit) -> Vec<u8> {
     s.into_bytes()
 }
 
+/// The header sections of a commit, in their canonical on-disk order.
+/// Decode rejects any out-of-order line so that signatures bind to a
+/// single byte representation.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Section {
+    Tree = 0,
+    Parent = 1,
+    Author = 2,
+    Committer = 3,
+    Ai = 4,
+    Reviewer = 5,
+    Signature = 6,
+}
+
+fn advance_section(cur: &mut Section, next: Section, name: &str) -> Result<()> {
+    if next < *cur {
+        return Err(GytError::Object(format!(
+            "commit: header {name} out of canonical order"
+        )));
+    }
+    *cur = next;
+    Ok(())
+}
+
 pub fn decode(payload: &[u8]) -> Result<Commit> {
     let text =
         std::str::from_utf8(payload).map_err(|_| GytError::Object("commit: non-utf8".into()))?;
     let (header, message) = text
         .split_once("\n\n")
         .ok_or_else(|| GytError::Object("commit: missing blank line before message".into()))?;
+
+    let mut cur_section = Section::Tree;
     let mut tree: Option<ObjectId> = None;
     let mut parents = Vec::new();
     let mut authors = Vec::new();
@@ -79,27 +105,37 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
     let mut signature: Option<String> = None;
     for line in header.lines() {
         if let Some(rest) = line.strip_prefix("tree ") {
+            if tree.is_some() {
+                return Err(GytError::Object("commit: multiple tree lines".into()));
+            }
+            advance_section(&mut cur_section, Section::Tree, "tree")?;
             if rest.len() != HEX_LEN {
                 return Err(GytError::Object("commit: bad tree hash length".into()));
             }
             tree = Some(ObjectId::from_hex(rest)?);
         } else if let Some(rest) = line.strip_prefix("parent ") {
+            advance_section(&mut cur_section, Section::Parent, "parent")?;
             parents.push(ObjectId::from_hex(rest)?);
         } else if let Some(rest) = line.strip_prefix("author ") {
+            advance_section(&mut cur_section, Section::Author, "author")?;
             authors.push(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("committer ") {
             if committer.is_some() {
                 return Err(GytError::Object("commit: multiple committer lines".into()));
             }
+            advance_section(&mut cur_section, Section::Committer, "committer")?;
             committer = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("ai ") {
+            advance_section(&mut cur_section, Section::Ai, "ai")?;
             ai_assists.push(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("reviewer ") {
+            advance_section(&mut cur_section, Section::Reviewer, "reviewer")?;
             reviewers.push(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("signature ") {
             if signature.is_some() {
                 return Err(GytError::Object("commit: multiple signature lines".into()));
             }
+            advance_section(&mut cur_section, Section::Signature, "signature")?;
             signature = Some(rest.to_string());
         } else {
             return Err(GytError::Object(format!("commit: unknown line {line:?}")));
@@ -108,7 +144,7 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
     if authors.is_empty() {
         return Err(GytError::Object("commit: missing author".into()));
     }
-    Ok(Commit {
+    let commit = Commit {
         tree: tree.ok_or_else(|| GytError::Object("commit: missing tree".into()))?,
         parents,
         authors,
@@ -117,7 +153,17 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
         reviewers,
         signature,
         message: message.to_string(),
-    })
+    };
+    // Defense in depth: re-encoding must reproduce the input. This catches
+    // any field-ordering or whitespace anomaly the section walk might miss
+    // and guarantees commit IDs and signatures bind to a unique byte form.
+    let re_encoded = encode(&commit);
+    if re_encoded != payload {
+        return Err(GytError::Object(
+            "commit: non-canonical encoding (re-encode differs from input)".into(),
+        ));
+    }
+    Ok(commit)
 }
 
 pub fn write(repo: &Path, c: &Commit) -> Result<ObjectId> {

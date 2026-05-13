@@ -23,6 +23,12 @@ use crate::repo::Repo;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// How far back in HEAD's first-parent chain we look for an already-applied
+/// equivalent (same tree + same message) before falling through to a fresh
+/// cherry-pick. 64 is plenty for any normal workflow without being so large
+/// that we walk the entire repo on every pick.
+const ANCESTRY_LOOKBACK: usize = 64;
+
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
@@ -83,15 +89,32 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         }
     };
 
-    // Already-applied detection: same tree, same author (cheap heuristic).
+    // Already-applied detection.
+    //
+    // Walk a short ancestry of HEAD (up to ANCESTRY_LOOKBACK commits) and
+    // declare the pick "already applied" if any commit in that window has
+    // the same *tree* AND the same *commit message* as the target. The
+    // tree match alone is too loose (an empty commit after the same
+    // changes would match every commit with the same final tree); the
+    // message anchors the comparison to the specific change.
+    //
+    // NB: the previous heuristic compared `head_commit.authors` to the
+    // target's authors, but cherry-pick *rewrites* authors to the picker's
+    // identity — so that check could never fire and silently allowed
+    // double-picks.
     if let Some(hid) = head_id {
-        let head_commit = commit_obj::read(&repo.gyt_dir, &hid)?;
-        if head_commit.tree == target_commit.tree
-            && head_commit.authors == target_commit.authors
-        {
-            return Err(GytError::Repo(
-                "HEAD is up to date: commit already applied".into(),
-            ));
+        let mut cur = Some(hid);
+        for _ in 0..ANCESTRY_LOOKBACK {
+            let Some(id) = cur else { break };
+            let c = commit_obj::read(&repo.gyt_dir, &id)?;
+            if c.tree == target_commit.tree && c.message == target_commit.message {
+                return Err(GytError::Repo(format!(
+                    "HEAD ancestry already contains an equivalent commit: {} \"{}\"",
+                    &id.to_hex()[..12],
+                    target_commit.message.lines().next().unwrap_or("")
+                )));
+            }
+            cur = c.parents.first().copied();
         }
     }
 

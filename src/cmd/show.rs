@@ -10,12 +10,14 @@ use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut rev: Option<String> = None;
+    let mut show_sig = false;
     for a in args {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("gyt show <rev>");
+                println!("gyt show [--show-signature] <rev>");
                 return Ok(());
             }
+            "--show-signature" => show_sig = true,
             other => {
                 if rev.is_some() {
                     return Err(GytError::InvalidArgument(
@@ -31,10 +33,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     let id = util::resolve_rev(&repo, &rev)?;
-    show(&repo, &id)
+    show(&repo, &id, show_sig)
 }
 
-fn show(repo: &Repo, id: &ObjectId) -> Result<()> {
+fn show(repo: &Repo, id: &ObjectId, show_sig: bool) -> Result<()> {
     let obj = store::read(&repo.gyt_dir, id)?;
     match obj.kind {
         ObjectKind::Blob => {
@@ -72,6 +74,9 @@ fn show(repo: &Repo, id: &ObjectId) -> Result<()> {
             for r in &c.reviewers {
                 println!("reviewer {r}");
             }
+            if show_sig {
+                print_signature_status(&c, use_color);
+            }
             println!();
             print!("{}", c.message);
             if !c.message.ends_with('\n') {
@@ -102,10 +107,37 @@ fn show(repo: &Repo, id: &ObjectId) -> Result<()> {
             }
             println!();
             // Recurse into the target.
-            show(repo, &t.target)?;
+            show(repo, &t.target, show_sig)?;
         }
     }
     Ok(())
+}
+
+/// Verify the commit's signature against the default verifying key and
+/// print a one-line status. Mirrors what `gyt verify` reports, but inline
+/// in `gyt show` / `gyt log --show-signature` so users can audit signing
+/// while browsing history.
+fn print_signature_status(c: &commit::Commit, use_color: bool) {
+    let Some(b64) = &c.signature else {
+        let line = "signature: (unsigned)";
+        println!("{}", term::paint_when(use_color, term::YELLOW, line));
+        return;
+    };
+    let payload = crate::cmd::signing::commit_payload_without_sig(c);
+    match crate::cmd::signing::verify_signature(&payload, b64, None) {
+        Ok(true) => {
+            let line = "signature: good ed25519 signature";
+            println!("{}", term::paint_when(use_color, term::GREEN, line));
+        }
+        Ok(false) => {
+            let line = "signature: BAD ed25519 signature";
+            println!("{}", term::paint_when(use_color, term::RED, line));
+        }
+        Err(e) => {
+            let line = format!("signature: verification error ({e})");
+            println!("{}", term::paint_when(use_color, term::RED, &line));
+        }
+    }
 }
 
 pub fn print_tree_diff(
