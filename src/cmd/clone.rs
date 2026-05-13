@@ -366,7 +366,12 @@ fn walk_one(
             enqueue_for_fetch(repo, &c.tree, wants, downloaded);
 
             let next_d = d.saturating_add(1);
-            let truncated = matches!(max_depth, Some(max) if next_d > max);
+            // `--depth=N` means "fetch N commits per tip path". The tip
+            // is at depth 0, so commits at depths 0..N-1 are fetched
+            // and the depth-(N-1) commit is the boundary (its parents
+            // at depth N are not fetched). The cutoff is therefore
+            // `next_d >= N`, not `next_d > N`.
+            let truncated = matches!(max_depth, Some(max) if next_d >= max);
             if truncated {
                 if !c.parents.is_empty() {
                     shallow_boundary.insert(*id);

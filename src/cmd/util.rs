@@ -11,9 +11,36 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Resolve a textual revision to an ObjectId by trying, in order:
-/// HEAD, branch refs, tag refs, remote refs, then a 64-hex BLAKE3 id.
+/// HEAD, HEAD~N (Nth ancestor along the first-parent chain), branch
+/// refs, tag refs, remote refs, full or abbreviated BLAKE3 hex id.
+/// Abbreviated hex resolves only when it uniquely matches one object
+/// in the local store (loose or packed); ambiguous prefixes error.
 /// Returns an error if not found.
 pub fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
+    // `HEAD~N` — walk N first-parent commits back from HEAD.
+    if let Some(rest) = rev.strip_prefix("HEAD~") {
+        let n: u32 = rest
+            .parse()
+            .map_err(|_| GytError::InvalidArgument(format!("bad HEAD~N: {rev:?}")))?;
+        let head = refs::read_head(&repo.gyt_dir)?;
+        let mut id = refs::resolve(&repo.gyt_dir, &head)?
+            .ok_or_else(|| GytError::Refs("HEAD has no commit yet".into()))?;
+        for _ in 0..n {
+            let obj = store::read(&repo.gyt_dir, &id)?;
+            if obj.kind != ObjectKind::Commit {
+                return Err(GytError::Object(format!(
+                    "HEAD~ walk hit non-commit at {id}"
+                )));
+            }
+            let c = commit::decode(&obj.payload)?;
+            id = c
+                .parents
+                .first()
+                .copied()
+                .ok_or_else(|| GytError::NotFound(format!("{rev}: ran off root")))?;
+        }
+        return Ok(id);
+    }
     if rev == "HEAD" {
         let head = refs::read_head(&repo.gyt_dir)?;
         return refs::resolve(&repo.gyt_dir, &head)?
@@ -33,7 +60,104 @@ pub fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
     if rev.len() == HEX_LEN && rev.chars().all(|c| c.is_ascii_hexdigit()) {
         return ObjectId::from_hex(rev);
     }
+    // Abbreviated hex: at least 4 chars. Require unique match. We scan
+    // both loose objects (objects/<2>/<62>) and pack indexes.
+    if rev.len() >= 4 && rev.len() < HEX_LEN && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        let matches = find_objects_with_prefix(&repo.gyt_dir, rev);
+        return match matches.len() {
+            0 => Err(GytError::NotFound(format!("revision {rev}"))),
+            1 => Ok(matches[0]),
+            _ => Err(GytError::InvalidArgument(format!(
+                "revision {rev} is ambiguous ({} matches)",
+                matches.len()
+            ))),
+        };
+    }
     Err(GytError::NotFound(format!("revision {rev}")))
+}
+
+/// Find all object ids in the store whose hex form starts with `prefix`.
+/// Scans loose `<2>/<62>` shards and the entries in every `.idx`.
+fn find_objects_with_prefix(gyt_dir: &std::path::Path, prefix: &str) -> Vec<ObjectId> {
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut out: Vec<ObjectId> = Vec::new();
+    let objects = gyt_dir.join("objects");
+    if let Ok(top) = std::fs::read_dir(&objects) {
+        for shard in top.flatten() {
+            let p = shard.path();
+            let dir_name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if dir_name.len() != 2 || !dir_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            // Quick reject: if the prefix's first 2 chars don't match this shard,
+            // there's no point opening it.
+            if prefix_lower.len() >= 2 && !dir_name.starts_with(&prefix_lower[..2]) {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&p) {
+                for f in files.flatten() {
+                    let fp = f.path();
+                    let file_name = fp
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if file_name.len() != 62 || !file_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        continue;
+                    }
+                    let hex = format!("{dir_name}{file_name}");
+                    if hex.starts_with(&prefix_lower)
+                        && let Ok(id) = ObjectId::from_hex(&hex)
+                    {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+    }
+    // Pack index scan.
+    let pack_dir = objects.join("pack");
+    if let Ok(it) = std::fs::read_dir(&pack_dir) {
+        for f in it.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("idx") {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&p)
+                && bytes.len() >= 12
+                && &bytes[..4] == b"GYPI"
+            {
+                let count =
+                    u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
+                // Entry layout in pack idx: 32B hash + 8B offset.
+                let entries_start = 12;
+                for i in 0..count {
+                    let off = entries_start + i * 40;
+                    if off + 32 > bytes.len() {
+                        break;
+                    }
+                    let hash_bytes = &bytes[off..off + 32];
+                    let mut hex = String::with_capacity(64);
+                    for b in hash_bytes {
+                        use std::fmt::Write as _;
+                        let _ = write!(hex, "{b:02x}");
+                    }
+                    if hex.starts_with(&prefix_lower)
+                        && let Ok(id) = ObjectId::from_hex(&hex)
+                    {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Resolve a textual revision to a tree id. Accepts commits, trees, and tags

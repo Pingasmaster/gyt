@@ -203,7 +203,15 @@ fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
     let cutoff = now.saturating_sub(days as i64 * 86_400);
     let mut removed = 0usize;
     for (refname, entries) in all {
-        let keep: Vec<_> = entries.iter().filter(|e| e.timestamp >= cutoff).collect();
+        // Special-case days=0: drop every entry unconditionally, so the
+        // documented "use 0 to wipe the whole reflog" behavior isn't
+        // hostage to whether entries happened in the same wall-clock
+        // second as gc itself.
+        let keep: Vec<_> = if days == 0 {
+            Vec::new()
+        } else {
+            entries.iter().filter(|e| e.timestamp >= cutoff).collect()
+        };
         let dropped = entries.len() - keep.len();
         if dropped == 0 {
             continue;
