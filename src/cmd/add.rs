@@ -32,6 +32,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
+    repo.require_worktree()?;
     let workdir = repo.workdir.clone();
     let ignore = IgnoreSet::load_from_root(&workdir)?;
     let mut index = Index::read(&repo.index_path())?;

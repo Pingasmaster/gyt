@@ -46,6 +46,13 @@ pub struct ServeConfig {
     /// a pusher with write access to a repo can't bootstrap trust by
     /// editing their own key into the list.
     pub signers_file: Option<PathBuf>,
+    /// Path to a server-side policy TOML that overrides per-repo
+    /// `[commit].sign_required`. Format mirrors the in-repo config; only
+    /// the `[commit].sign_required` boolean is currently consulted. The
+    /// motivation is the same as `signers_file`: a pusher with write
+    /// access to `.gyt/config.toml` could otherwise flip the flag off
+    /// for their own next push.
+    pub policy_config: Option<PathBuf>,
 }
 
 struct Request {
@@ -56,6 +63,28 @@ struct Request {
 }
 
 pub fn serve(config: &ServeConfig) -> Result<()> {
+    // Fail fast: if the operator passed `--signers <file>` but the file
+    // doesn't exist, the previous behavior was to silently fall back to
+    // the in-repo `.gyt/allowed_signers` — a trust downgrade triggered
+    // by a typo. Refuse to start instead.
+    if let Some(p) = &config.signers_file
+        && !p.exists()
+    {
+        return Err(crate::errors::GytError::InvalidArgument(format!(
+            "--signers {} does not exist; refusing to start (would silently fall back to per-repo trust)",
+            p.display()
+        )));
+    }
+    // Likewise for --policy-config: if specified, it must exist.
+    if let Some(p) = &config.policy_config
+        && !p.exists()
+    {
+        return Err(crate::errors::GytError::InvalidArgument(format!(
+            "--policy-config {} does not exist; refusing to start",
+            p.display()
+        )));
+    }
+
     let listener = TcpListener::bind(&config.listen_addr)?;
     let addr = listener.local_addr()?;
 
@@ -80,6 +109,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         webroot: config.webroot.clone(),
         auth_token: config.auth_token.clone(),
         signers_file: config.signers_file.clone(),
+        policy_config: config.policy_config.clone(),
         shutdown: Mutex::new(false),
     });
     let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
@@ -122,6 +152,7 @@ struct ServerState {
     webroot: PathBuf,
     auth_token: Option<String>,
     signers_file: Option<PathBuf>,
+    policy_config: Option<PathBuf>,
     shutdown: Mutex<bool>,
 }
 
@@ -1257,6 +1288,22 @@ fn wire_objects_have(
             n_skipped += 1;
             continue;
         };
+        // Canonical-encoding check for commits and tags: refuse to accept
+        // objects whose stored bytes don't match `encode(decode(bytes))`.
+        // Without this a malicious pusher can poison the repo with a
+        // non-canonical commit that every future reader fails to decode.
+        if kind == crate::object::ObjectKind::Commit
+            && crate::object::commit::decode(&payload).is_err()
+        {
+            n_skipped += 1;
+            continue;
+        }
+        if kind == crate::object::ObjectKind::Tag
+            && crate::object::tag::decode(&payload).is_err()
+        {
+            n_skipped += 1;
+            continue;
+        }
         match crate::object::store::write_bytes(&gyt_dir, kind, &payload) {
             Ok(_) => n_stored += 1,
             Err(_) => n_skipped += 1,
@@ -1328,8 +1375,11 @@ fn wire_refs_update(
         }
     };
 
-    let (sign_required, allowed) =
-        refs_policy::server_policy_with_override(&gyt_dir, state.signers_file.as_deref());
+    let (sign_required, allowed) = refs_policy::server_policy_with_overrides(
+        &gyt_dir,
+        state.signers_file.as_deref(),
+        state.policy_config.as_deref(),
+    );
     let mode = if force {
         refs_policy::Mode::Force
     } else if force_with_lease {
@@ -1436,6 +1486,7 @@ mod tests {
             webroot: webroot.to_path_buf(),
             auth_token: None,
             signers_file: None,
+            policy_config: None,
             shutdown: Mutex::new(false),
         })
     }

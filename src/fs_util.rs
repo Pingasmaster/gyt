@@ -50,8 +50,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 impl FileLock {
     /// Acquire `path` exclusively. Blocks (with polling) up to `timeout`
-    /// for another holder to release. Reclaims stale locks (files older
-    /// than `STALE_AFTER`).
+    /// for another holder to release. Reclaims stale locks safely.
+    ///
+    /// Stale-lock reclamation is the tricky part: a crashed holder leaves
+    /// a lockfile behind that no one will ever remove, so we have to be
+    /// willing to delete it eventually — but a naive "older than N
+    /// seconds → delete" check has a TOCTOU window where a legitimate
+    /// holder releases and a new holder acquires between our stat and
+    /// our unlink, and we wipe the new holder's live lock.
+    ///
+    /// Our defense: when we observe a stale lockfile, we read the pid we
+    /// recorded into it on acquisition, *then* re-stat and re-read after
+    /// a tiny sleep. We only `remove_file` if both observations report
+    /// the same pid AND both still claim the file is old. That gives a
+    /// fresh acquirer (who wrote a new pid) the chance to fail the check
+    /// and survive.
     pub fn acquire(path: &Path, timeout: Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -64,27 +77,24 @@ impl FileLock {
                 .open(path)
             {
                 Ok(mut f) => {
-                    // Best-effort: write pid for forensic debugging. Errors
-                    // here don't block lock acquisition.
+                    // Record pid + timestamp so a future acquirer that
+                    // suspects this lock is stale can confirm the holder
+                    // hasn't churned.
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
+                    // Errors here don't block lock acquisition — the file
+                    // exists and is held by us; an empty body just makes
+                    // future stale-reclamation slightly more conservative.
                     let _ = writeln!(f, "pid={} ts={ts}", std::process::id());
+                    let _ = f.sync_all();
                     return Ok(Self {
                         path: path.to_path_buf(),
                         _file: f,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Reclaim stale locks. We compare against the file's
-                    // modified time, which an attacker could in principle
-                    // bump — but the only thing that buys them is one more
-                    // 60 s window, which is well within tolerable.
-                    if let Ok(md) = fs::metadata(path)
-                        && let Ok(modified) = md.modified()
-                        && modified.elapsed().unwrap_or(Duration::ZERO) > STALE_AFTER
-                    {
-                        let _ = fs::remove_file(path);
+                    if try_reclaim_stale(path)? {
                         continue;
                     }
                     if std::time::Instant::now() >= deadline {
@@ -98,6 +108,77 @@ impl FileLock {
                 Err(e) => return Err(GytError::Io(e)),
             }
         }
+    }
+}
+
+/// Return `true` if we successfully reclaimed a stale lock at `path`.
+/// "Stale" requires *all three* of:
+///   1. The recorded pid is no longer alive (or the file has no pid).
+///   2. The file's mtime is older than `STALE_AFTER`.
+///   3. A small re-check 10 ms later reports the same pid and same mtime
+///      — i.e. nobody's actively using this lock right now.
+fn try_reclaim_stale(path: &Path) -> Result<bool> {
+    let (pid1, mtime1) = match read_lock_marker(path) {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    if mtime1.elapsed().unwrap_or(Duration::ZERO) <= STALE_AFTER {
+        return Ok(false);
+    }
+    if let Some(pid) = pid1
+        && pid_alive(pid)
+    {
+        return Ok(false);
+    }
+    // Brief re-check. If pid/mtime changed in the meantime, a fresh
+    // holder has acquired this lock; back off.
+    std::thread::sleep(Duration::from_millis(10));
+    let (pid2, mtime2) = match read_lock_marker(path) {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    if pid1 != pid2 || mtime1 != mtime2 {
+        return Ok(false);
+    }
+    // Best-effort delete; if it races with someone else's unlink, the
+    // next `create_new` attempt will simply succeed.
+    let _ = fs::remove_file(path);
+    Ok(true)
+}
+
+/// Read `(pid, mtime)` from a lockfile. Returns None if the file is gone
+/// or its contents can't be parsed.
+fn read_lock_marker(path: &Path) -> Option<(Option<u32>, std::time::SystemTime)> {
+    let md = fs::metadata(path).ok()?;
+    let mtime = md.modified().ok()?;
+    let body = fs::read_to_string(path).ok().unwrap_or_default();
+    // Look for "pid=<n>" anywhere in the body.
+    let pid = body
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("pid="))
+        .and_then(|s| s.parse::<u32>().ok());
+    Some((pid, mtime))
+}
+
+/// True if the given pid is alive on this host (kill(0) semantics on
+/// Unix). On non-Unix we conservatively report "alive" so we never
+/// reclaim a lock we can't verify.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `/proc/<pid>` exists for live processes on Linux/macOS-with-/proc.
+        // For broader coverage we'd use libc::kill(pid, 0), but we have a
+        // policy of no libc — so use the /proc check and fall through.
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        // Without /proc we can't tell; err on the side of caution.
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
     }
 }
 

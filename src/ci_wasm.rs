@@ -115,38 +115,14 @@ pub fn run_ci_wasm(wasm_path: &Path, repo_dir: &Path, output_dir: &Path) -> Resu
         )
         .map_err(|e| GytError::Ci(format!("linker write_file: {e}")))?;
 
-    linker
-        .func_wrap(
-            "gyt_ci",
-            "getenv",
-            |mut caller: Caller<'_, Sandbox>,
-             name_ptr: i32,
-             name_len: i32,
-             out_ptr: i32,
-             out_len: i32|
-             -> i32 {
-                // Read the env var name from WASM memory
-                let Some(name) = read_caller_string(&mut caller, name_ptr, name_len) else {
-                    return -2;
-                };
-                // Look up via std::env::var()
-                let value = match std::env::var(&name) {
-                    Ok(v) => v,
-                    Err(_) => return -1,
-                };
-                // Write value into WASM memory (truncated to out_len)
-                let Some(mem) = get_caller_memory(&mut caller) else {
-                    return -3;
-                };
-                let start = out_ptr.max(0) as usize;
-                let n = value.len().min(out_len.max(0) as usize);
-                if mem.write(&mut caller, start, &value.as_bytes()[..n]).is_err() {
-                    return -3;
-                }
-                0
-            },
-        )
-        .map_err(|e| GytError::Ci(format!("linker getenv: {e}")))?;
+    // NOTE: there is *no* `getenv` host import. The previous version of
+    // this module exposed `getenv(name) -> string` so WASM workflows
+    // could read environment variables — but that breaks the sandbox:
+    // the gyt process runs with decrypted CI secrets in its env, and a
+    // malicious .wasm could exfiltrate them via `gyt_ci.write_file`.
+    // If a workflow needs configuration data, write it to a file under
+    // .gyt-ci/ (visible read-only inside the sandbox) or pass it through
+    // the dedicated `ci env` store as a file the WASM can `read_file`.
 
     let mut store = Store::new(&engine, state);
     let instance = linker

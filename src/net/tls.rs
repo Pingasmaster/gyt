@@ -126,6 +126,12 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
         )));
     }
 
+    // Refuse to load a TLS private key whose mode permits group/world
+    // access. Same policy as ed25519 signing keys: if you put your TLS
+    // private material at 0644 by accident, gyt won't quietly serve it
+    // up to anyone who reads the box. Run `chmod 600` to proceed.
+    enforce_private_mode(key_path)?;
+
     // Load private key
     let keyfile = std::fs::File::open(key_path)
         .map_err(|e| GytError::Net(format!("cannot open key file {}: {e}", key_path.display())))?;
@@ -141,6 +147,27 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
         .map_err(|e| GytError::Net(format!("server config error: {e}")))?;
 
     Ok(Arc::new(config))
+}
+
+/// Refuse to load a private key file whose mode allows group/world
+/// access. No-op on non-Unix platforms.
+fn enforce_private_mode(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(path)
+            .map_err(|e| GytError::Net(format!("stat {}: {e}", path.display())))?;
+        let mode = md.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(GytError::Net(format!(
+                "TLS key {} has insecure mode {mode:o} — refusing to load; run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Accept an incoming TCP stream and perform the TLS server-side handshake.

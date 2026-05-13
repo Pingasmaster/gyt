@@ -69,9 +69,9 @@ fn search_working_tree(repo: &Repo, pattern: &str) -> Result<()> {
         if is_binary(&content) {
             continue;
         }
-        if let Some(line_num) = grep_bytes(&content, pattern.as_bytes()) {
-            let path_str = entry.path.to_string_lossy();
-            println!("{path_str}:{line_num}:{pattern}");
+        let path_str = entry.path.to_string_lossy();
+        for (line_num, line) in grep_lines(&content, pattern) {
+            println!("{path_str}:{line_num}:{line}");
             found = true;
         }
     }
@@ -92,8 +92,8 @@ fn search_tree(repo: &Repo, tree_id: &ObjectId, pattern: &str) -> Result<()> {
         if is_binary(&payload) {
             continue;
         }
-        if let Some(line_num) = grep_bytes(&payload, pattern.as_bytes()) {
-            println!("{path}:{line_num}:{pattern}");
+        for (line_num, line) in grep_lines(&payload, pattern) {
+            println!("{path}:{line_num}:{line}");
             found = true;
         }
     }
@@ -109,17 +109,15 @@ fn is_binary(buf: &[u8]) -> bool {
     buf.contains(&0u8)
 }
 
-fn grep_bytes(content: &[u8], pattern: &[u8]) -> Option<usize> {
-    let text = std::str::from_utf8(content).ok()?;
-    let pattern_str = std::str::from_utf8(pattern).ok()?;
-
-    for (line_num, line) in text.lines().enumerate() {
-        if line.contains(pattern_str) {
-            return Some(line_num + 1);
-        }
-    }
-
-    None
+/// Iterate over `(1-based line number, line text)` pairs in `content` that
+/// contain `pattern`. Both inputs must be valid UTF-8; non-utf8 content
+/// yields an empty iterator (the binary check upstream usually catches it).
+fn grep_lines<'a>(content: &'a [u8], pattern: &'a str) -> impl Iterator<Item = (usize, &'a str)> {
+    let text = std::str::from_utf8(content).unwrap_or("");
+    text.lines()
+        .enumerate()
+        .filter(move |(_, line)| line.contains(pattern))
+        .map(|(i, line)| (i + 1, line))
 }
 
 #[derive(Debug, Clone)]

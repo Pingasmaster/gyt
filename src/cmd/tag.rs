@@ -21,6 +21,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--list" || a == "-l") {
         return list(repo);
     }
+    // From here on we mutate refs: hold the repo lock.
+    let _lock = repo.lock()?;
     // Parse flags.
     let mut annotated = false;
     let mut delete = false;

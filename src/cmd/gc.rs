@@ -84,31 +84,65 @@ fn gc(gyt_dir: &Path) -> usize {
     pruned
 }
 
-/// Walk all refs (heads, tags, remotes) and return the set of reachable object ids.
+/// Walk every "anchor" that proves an object is alive — branch tips,
+/// tag tips, remote-tracking refs, the stash chain, a detached HEAD,
+/// and any in-progress merge/cherry-pick/rebase state — then close
+/// over the parent/tree/blob graph. Anything not in the resulting
+/// set is fair game for pruning.
 fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     let mut reachable: HashSet<ObjectId> = HashSet::new();
 
-    // Collect seeds from all refs
     let mut seeds: Vec<ObjectId> = Vec::new();
 
-    // refs/heads/
-    if let Ok(refs) = refs::list_refs(gyt_dir, "refs/heads") {
-        for (_, id) in refs {
+    // refs/heads/, refs/tags/, refs/remotes/, refs/stash (single ref).
+    for prefix in ["refs/heads", "refs/tags", "refs/remotes"] {
+        if let Ok(rs) = refs::list_refs(gyt_dir, prefix) {
+            for (_, id) in rs {
+                seeds.push(id);
+            }
+        }
+    }
+    if let Ok(id) = refs::read_ref(gyt_dir, "refs/stash") {
+        seeds.push(id);
+    }
+
+    // Detached HEAD: if HEAD points at a commit directly rather than at
+    // a branch ref, that commit is otherwise unanchored.
+    if let Ok(head) = refs::read_head(gyt_dir)
+        && let refs::Head::Detached(id) = head
+    {
+        seeds.push(id);
+    }
+
+    // In-progress operations have their own short-lived "tip refs"
+    // stored as plain hex files at the gyt_dir root. Treat anything
+    // mentioned in them as reachable so an interrupted merge/rebase
+    // can't be GC'd out from under the user.
+    for sticky in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REBASE_ONTO"] {
+        if let Ok(s) = std::fs::read_to_string(gyt_dir.join(sticky))
+            && let Ok(id) = ObjectId::from_hex(s.trim())
+        {
             seeds.push(id);
         }
     }
-
-    // refs/tags/
-    if let Ok(refs) = refs::list_refs(gyt_dir, "refs/tags") {
-        for (_, id) in refs {
-            seeds.push(id);
+    if let Ok(text) = std::fs::read_to_string(gyt_dir.join("REBASE_TODO")) {
+        for line in text.lines() {
+            if let Ok(id) = ObjectId::from_hex(line.trim()) {
+                seeds.push(id);
+            }
         }
     }
 
-    // refs/remotes/
-    if let Ok(refs) = refs::list_refs(gyt_dir, "refs/remotes") {
-        for (_, id) in refs {
-            seeds.push(id);
+    // Reflog entries also reference commits; we treat reflog targets as
+    // reachable so `gyt reflog`/recovery still works after gc.
+    if let Ok(all) = crate::reflog::list_all(gyt_dir) {
+        for (_, entries) in all {
+            for e in entries {
+                if let Some(old) = e.old {
+                    seeds.push(old);
+                }
+                seeds.push(e.new);
+            }
         }
     }
 

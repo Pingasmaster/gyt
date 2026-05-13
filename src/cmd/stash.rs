@@ -65,6 +65,7 @@ fn cmd_push(args: &[String]) -> Result<()> {
 }
 
 fn do_push(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     // Parse `-m <msg>` (only flag we support).
     let mut user_msg: Option<String> = None;
     let mut i = 0;
@@ -223,6 +224,7 @@ fn cmd_pop(args: &[String]) -> Result<()> {
 }
 
 fn do_pop(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     if !args.is_empty() {
         return Err(GytError::InvalidArgument(
             "stash pop: takes no arguments (only stash@{0} is supported)".into(),
@@ -280,6 +282,7 @@ fn cmd_apply(args: &[String]) -> Result<()> {
 }
 
 fn do_apply(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     if !args.is_empty() {
         return Err(GytError::InvalidArgument(
             "stash apply: takes no arguments (only stash@{0} is supported)".into(),
@@ -335,6 +338,7 @@ fn cmd_drop(args: &[String]) -> Result<()> {
 }
 
 fn do_drop(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     let target = args.first().map_or("stash@{0}", String::as_str);
     if target != "stash@{0}" {
         return Err(GytError::Unsupported(format!(

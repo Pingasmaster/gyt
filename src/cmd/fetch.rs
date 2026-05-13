@@ -90,6 +90,7 @@ pub fn fetch_with_refspec(
     insecure: bool,
     prune: bool,
 ) -> Result<FetchSummary> {
+    let _lock = repo.lock()?;
     let cfg = Config::load(repo)?;
     let url = cfg
         .remotes
@@ -145,10 +146,27 @@ pub fn fetch_with_refspec(
     let mut pruned = 0usize;
     if prune {
         // Delete refs/remotes/<remote>/* that the server no longer
-        // advertises. Operates on the namespace we exclusively manage.
+        // advertises. When a refspec is supplied we only prune within
+        // that ref's namespace — otherwise --prune with a single-ref
+        // fetch would happily nuke every *other* remote-tracking ref the
+        // server didn't mention, which is the opposite of what users
+        // want.
         let prefix = format!("refs/remotes/{remote}");
         if let Ok(local_refs) = refs::list_refs(&repo.gyt_dir, &prefix) {
             for (name, _) in local_refs {
+                if let Some(filter) = refspec {
+                    // Map local refs/remotes/<remote>/<rest> back to the
+                    // server-side short ref name; only consider those
+                    // whose short name matches the requested refspec.
+                    let local_prefix = format!("refs/remotes/{remote}/");
+                    let short = name.strip_prefix(&local_prefix).unwrap_or(&name);
+                    // tag refs live under refs/remotes/<remote>/tags/<x>;
+                    // strip that too so the comparison sees the bare name.
+                    let short = short.strip_prefix("tags/").unwrap_or(short);
+                    if short != filter {
+                        continue;
+                    }
+                }
                 if !advertised_local.contains(&name) {
                     refs::delete_ref(&repo.gyt_dir, &name)?;
                     pruned += 1;

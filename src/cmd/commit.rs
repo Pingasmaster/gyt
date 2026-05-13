@@ -84,6 +84,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
+    let _lock = repo.lock()?;
     let cfg = Config::load(&repo)?;
     let identity = cfg.identity()?;
 

@@ -17,6 +17,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return list(repo);
     }
+    // From here every subcommand (-d / -D / -m / create) mutates refs.
+    let _lock = repo.lock()?;
     match args[0].as_str() {
         "-d" | "--delete" => {
             if args.len() != 2 {

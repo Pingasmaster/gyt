@@ -350,7 +350,23 @@ pub fn server_policy_with_override(
     gyt_dir: &Path,
     override_signers: Option<&Path>,
 ) -> (bool, Vec<VerifyingKey>) {
-    let sign_required = read_sign_required(gyt_dir);
+    server_policy_with_overrides(gyt_dir, override_signers, None)
+}
+
+/// Same as `server_policy_with_override`, but also accepts a
+/// `policy_config` path. When given, `[commit].sign_required` from that
+/// file overrides the per-repo value — closing the bootstrap hole where
+/// a pusher with write access to `.gyt/config.toml` could flip the flag
+/// off and skip signature enforcement for their own next push.
+pub fn server_policy_with_overrides(
+    gyt_dir: &Path,
+    override_signers: Option<&Path>,
+    policy_config: Option<&Path>,
+) -> (bool, Vec<VerifyingKey>) {
+    let sign_required = match policy_config {
+        Some(p) if p.exists() => read_sign_required_from(p),
+        _ => read_sign_required(gyt_dir),
+    };
     if !sign_required {
         return (false, Vec::new());
     }
@@ -359,6 +375,15 @@ pub fn server_policy_with_override(
         _ => load_allowed_signers(gyt_dir).unwrap_or_default(),
     };
     (true, allowed)
+}
+
+/// Read `[commit].sign_required` from an arbitrary file path. Same TOML
+/// subset as the per-repo config; missing/unreadable files imply `false`.
+fn read_sign_required_from(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    crate::config::parse(&bytes).is_ok_and(|c| c.sign_required)
 }
 
 /// Load allowed-signer public keys from an arbitrary file path. Used by

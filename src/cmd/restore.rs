@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
+    repo.require_worktree()?;
     run_in(&repo, args)
 }
 

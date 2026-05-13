@@ -160,6 +160,16 @@ pub fn run(args: &[String]) -> Result<()> {
     for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/tags/")? {
         head_refs.push((name, oid));
     }
+    // Also rewrite refs/remotes/* and refs/stash — otherwise destroyed
+    // content stays reachable via remote-tracking refs or stash chains,
+    // which defeats the whole point of this command (purging secrets /
+    // accidentally-committed files from *all* history).
+    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/remotes/")? {
+        head_refs.push((name, oid));
+    }
+    if let Ok(stash_id) = refs::read_ref(&repo.gyt_dir, "refs/stash") {
+        head_refs.push(("refs/stash".to_string(), stash_id));
+    }
 
     let mut commits: HashMap<ObjectId, Commit> = HashMap::new();
     let mut queue: Vec<ObjectId> = Vec::new();

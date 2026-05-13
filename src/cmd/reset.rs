@@ -19,6 +19,7 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     let mut mode = Mode::Mixed;
     let mut rev: Option<String> = None;
     let mut force = false;

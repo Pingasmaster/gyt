@@ -214,6 +214,18 @@ pub fn walk_and_fetch(
             let id = hash::hash_bytes(&raw);
             // Verify the raw header round-trips.
             let (kind, payload) = store::parse_raw(&raw)?;
+            // For commits, require a canonical encoding so a malicious or
+            // buggy server can't poison our store with a non-canonical
+            // commit that later breaks `commit::read` for every future
+            // reader. We trust `commit::decode` to enforce this — if it
+            // rejects, refuse the pack.
+            if kind == ObjectKind::Commit {
+                crate::object::commit::decode(&payload).map_err(|e| {
+                    GytError::Net(format!(
+                        "clone: server returned non-canonical commit {id}: {e}"
+                    ))
+                })?;
+            }
             // Already on disk? skip.
             if !store::exists(&repo.gyt_dir, &id) {
                 let path = store::path_for(&repo.gyt_dir, &id);

@@ -1,6 +1,5 @@
 use crate::errors::{GytError, Result};
 use crate::index::Index;
-use crate::refs::{self, Head};
 use crate::repo::Repo;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,19 +130,13 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         println!("rm {}", forward_slash(p));
     }
 
-    // If index is now empty and we're on an unborn branch, mark HEAD as resolved.
-    if index.entries.is_empty() {
-        let head = refs::read_head(&repo.gyt_dir)?;
-        match head {
-            Head::Symbolic(name) => {
-                // Clear the branch ref if it exists (it was pointing to an unborn commit).
-                if refs::read_ref(&repo.gyt_dir, &name).is_ok() {
-                    refs::delete_ref(&repo.gyt_dir, &name)?;
-                }
-            }
-            Head::Detached(_) => {}
-        }
-    }
+    // NB: a previous version of this code deleted `refs/heads/<current>`
+    // when the index emptied out, on the reasoning that the branch was
+    // "unborn again". That's wrong — there can be committed objects on
+    // the branch already, and silently nuking the ref left users with
+    // a phantom-deleted branch they had to recover via reflog. We now
+    // never touch refs from rm. Use `gyt branch -d <name>` to delete a
+    // branch.
 
     Ok(())
 }

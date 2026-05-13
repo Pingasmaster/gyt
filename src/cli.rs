@@ -61,39 +61,70 @@ fn print_usage() {
 USAGE:
     gyt <command> [args]
 
-COMMANDS:
-    init                 create a new repository
-    keygen               generate ed25519 signing keypair
-    verify [<commit>]    verify a signed commit's signature
-    add <path>...|[-A]   stage files (use -A to also stage removals)
-    status               show working tree status
-    clean [-n]           remove untracked files (dry-run with -n)
-    commit -m <msg> [--allow-empty] [--sign|-S]
-    log [--oneline] [--graph] [--all]
-    show <rev>           show a commit or object
-    diff [<rev>] [--cached|--staged] [--stat]
-    branch [<name>]      list or create branches
-    switch <branch>      switch to a branch
-    restore <path>...    discard unstaged changes
-    reset [--soft|--mixed|--hard] <rev>
-    reflog [<ref>] [--all] [-n N]  show ref-movement history
-    tag <name> [<rev>]   create a tag
-    rm <path>...         remove files
-    grep <pattern>       search content
-    gc                   garbage collect unreachable objects
-    cherry-pick <commit> apply a commit's changes
-    rebase <branch>      fast-forward rebase
-    merge --ff-only <rev>  fast-forward merge
-    pull   [<remote>]    fetch + merge
-    push   [<remote>]    push to remote
-    fetch  [<remote>]    fetch from remote
-    clone  <url> [<dir>] clone a repository
-    remote -v            list remotes
-    config --list|--get <key>
-    stash {{push|pop|list|drop}}
-    worktree {{add|list|remove}}
+REPOSITORY
+    init [<path>] [--bare]       create a new repository
+    clone <url> [<dir>] [--insecure]
+                                 clone a repository
+    config --list | --get <key>
+    config --set <key> <val> [--global]
+    config --unset <key> [--global]
+    remote -v | add <name> <url>
+
+WORKING TREE
+    status [--short|--porcelain] show working tree status (incl. ahead/behind)
+    add <path>... | [-A]         stage files (use -A to also stage removals)
+    rm [-f] <path>...            remove files
+    clean [-n]                   remove untracked files (dry-run with -n)
+    restore [--staged] [--worktree] [--source=<rev>] <path>...
+                                 restore files from HEAD / index / arbitrary rev
+
+HISTORY
+    commit -m <msg> [--amend] [--allow-empty] [--sign|-S]
+                                 create a commit
+    log [--oneline] [--graph] [--all] [--show-signature]
+        [--author PAT] [--grep PAT] [--since TS] [--until TS]
+        [-n N] [-- <path>...]    show commit history
+    show [--show-signature] <rev>
+                                 show a commit / tag / tree / blob
+    diff [<rev>] [<rev>] [--cached|--staged] [--stat]
+    blame [<rev>] [--] <path>    line-by-line authorship
+    reflog [<ref>] [--all] [-n N]
+                                 show ref-movement history
+
+BRANCHES & MERGING
+    branch [<name>] | -d <name> | -D <name> | -m <old> <new>
+    switch [-c] <branch>         switch to a branch
+    reset [--soft|--mixed|--hard [--force]] <rev>
+    merge [<rev>] [--ff-only] [--no-ff] [-m <msg>]
+                                 real three-way merge
+    rebase [--ff-only] [--abort] [--continue] <upstream>
+    cherry-pick <commit>         apply a commit's changes (three-way)
+    tag [<name> [<rev>]] | -a <name> -m <msg> | -d <name> | -l
+    stash {{push [-m <msg>] | pop | apply | list | drop}}
+    worktree {{add [-b <branch>] <path> | list | remove <path>}}
+
+REMOTE
+    fetch [<remote>] [<ref>] [--insecure] [--prune|-p]
+    pull  [<remote>] [--insecure]
+    push  [<remote>] [<branch>] [--force | --force-with-lease] [--insecure] [--all]
+
+SIGNING
+    keygen [--priv <path>] [--pub <path>]
+    verify [--pub <path>] [<commit-id>]
+
+SERVER & CI
     serve [--listen <addr>] [--repos <dir>] [--webroot <dir>]
-    getthefuckoutofmyrepo  clear repo metadata
+          [--cert <f> --key <f>] [--auth-token <t>]
+          [--signers <f>] [--policy-config <f>]
+    ci [--list] [--docker <image>] [--output <dir>]
+    ci secret {{init | set <name> | list | remove <name>}}
+    ci env    {{set <name> <val> | list | remove <name>}}
+
+UTILITIES
+    grep <pattern> [<rev>]
+    gc                           prune unreachable objects (keeps reflogs, stash, …)
+    getthefuckoutofmyrepo <path>...
+                                 permanently rewrite history to purge paths
 ",
         env!("CARGO_PKG_VERSION")
     );

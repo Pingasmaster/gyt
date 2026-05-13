@@ -36,6 +36,7 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     let mut rev: Option<String> = None;
     for arg in args {
         match arg.as_str() {

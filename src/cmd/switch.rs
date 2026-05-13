@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
+    repo.require_worktree()?;
     run_in(&repo, args)
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     let mut create = false;
     let mut name: Option<String> = None;
     let mut i = 0;

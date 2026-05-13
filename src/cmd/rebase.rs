@@ -32,6 +32,7 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+    let _lock = repo.lock()?;
     let mut ff_only = false;
     let mut upstream: Option<String> = None;
     let mut abort = false;
