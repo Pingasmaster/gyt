@@ -67,27 +67,30 @@ pub fn write(repo: &Path, obj: &Object) -> Result<ObjectId> {
 
 pub fn read(repo: &Path, id: &ObjectId) -> Result<Object> {
     let path = path_for(repo, id);
-    if !path.exists() {
-        return Err(GytError::NotFound(format!("object {id}")));
+    if path.exists() {
+        let stored = fs_util::read_all(&path)?;
+        let raw = compress::decode(&stored)?;
+        let observed = hash::hash_bytes(&raw);
+        if observed != *id {
+            return Err(GytError::Object(format!(
+                "object {id} content hash mismatch (got {observed})"
+            )));
+        }
+        let (kind, payload) = parse_raw(&raw)?;
+        return Ok(Object {
+            id: *id,
+            kind,
+            payload,
+        });
     }
-    let stored = fs_util::read_all(&path)?;
-    let raw = compress::decode(&stored)?;
-    let observed = hash::hash_bytes(&raw);
-    if observed != *id {
-        return Err(GytError::Object(format!(
-            "object {id} content hash mismatch (got {observed})"
-        )));
+    if let Some(obj) = crate::object::pack::read_from_packs(repo, id)? {
+        return Ok(obj);
     }
-    let (kind, payload) = parse_raw(&raw)?;
-    Ok(Object {
-        id: *id,
-        kind,
-        payload,
-    })
+    Err(GytError::NotFound(format!("object {id}")))
 }
 
 pub fn exists(repo: &Path, id: &ObjectId) -> bool {
-    path_for(repo, id).exists()
+    path_for(repo, id).exists() || crate::object::pack::id_in_packs(repo, id)
 }
 
 #[cfg(test)]

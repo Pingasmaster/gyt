@@ -5,10 +5,14 @@ use crate::errors::{GytError, Result};
 pub const HASH_LEN: usize = 32;
 pub const HEX_LEN: usize = HASH_LEN * 2;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId(pub [u8; HASH_LEN]);
 
 impl ObjectId {
+    pub const fn as_bytes(&self) -> &[u8; HASH_LEN] {
+        &self.0
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != HASH_LEN {
             return Err(GytError::Parse(format!(

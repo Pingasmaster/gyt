@@ -5,6 +5,7 @@ use crate::hash::ObjectId;
 
 pub mod blob;
 pub mod commit;
+pub mod pack;
 pub mod store;
 pub mod tag;
 pub mod tree;

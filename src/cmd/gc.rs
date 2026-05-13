@@ -17,12 +17,13 @@ pub fn run(args: &[String]) -> Result<()> {
     // by the reflog stay reachable forever and gc reclaims nothing for
     // the common amend/reset/switch case.
     let mut expire_days: Option<u64> = Some(90);
+    let mut pack = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "gyt gc [--expire-reflog <days>] [--keep-reflog]\n\n\
+                    "gyt gc [--expire-reflog <days>] [--keep-reflog] [--pack]\n\n\
                      Prune unreachable loose objects from .gyt/objects.\n\n\
                      Reachability roots include every ref (heads, tags, remotes,\n\
                      stash), the detached HEAD if any, any in-progress merge /\n\
@@ -38,7 +39,14 @@ pub fn run(args: &[String]) -> Result<()> {
                      --keep-reflog            Don't drop any reflog entries\n\
                                               (everything in the reflog stays\n\
                                               reachable; gc only reclaims\n\
-                                              objects unreachable from any ref)."
+                                              objects unreachable from any ref).\n\
+                     --pack                   After pruning, batch the remaining\n\
+                                              loose objects into a single pack\n\
+                                              under .gyt/objects/pack/ and delete\n\
+                                              the original loose files. Reads\n\
+                                              after this still resolve those\n\
+                                              objects (store.rs checks packs\n\
+                                              when no loose file is present)."
                 );
                 return Ok(());
             }
@@ -53,6 +61,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--keep-reflog" => {
                 expire_days = None;
+            }
+            "--pack" => {
+                pack = true;
             }
             other if other.starts_with('-') => {
                 return Err(GytError::InvalidArgument(format!(
@@ -77,6 +88,11 @@ pub fn run(args: &[String]) -> Result<()> {
         0
     };
     let count = gc(&repo.gyt_dir);
+    let packed = if pack {
+        pack_loose_objects(&repo.gyt_dir)?
+    } else {
+        0
+    };
     if expired > 0 {
         println!("gc: expired {expired} reflog entries");
     }
@@ -85,7 +101,87 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         println!("gc: no unreachable objects found");
     }
+    if packed > 0 {
+        println!("gc: packed {packed} loose objects");
+    }
     Ok(())
+}
+
+/// Collect every loose object under `<gyt>/objects/<2>/<62>`, write
+/// them into a single new pack file, then delete the loose files.
+/// Returns the number of objects packed. Errors during deletion are
+/// swallowed (the pack is what readers will look at next; a leftover
+/// loose copy is harmless duplication, not corruption).
+fn pack_loose_objects(gyt_dir: &Path) -> Result<usize> {
+    use crate::object::pack::{PackEntry, write_pack};
+    let objects_dir = gyt_dir.join("objects");
+    let Ok(top) = std::fs::read_dir(&objects_dir) else {
+        return Ok(0);
+    };
+    let mut entries: Vec<PackEntry> = Vec::new();
+    let mut loose_paths: Vec<std::path::PathBuf> = Vec::new();
+    for d in top.flatten() {
+        let dir_path = d.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+        // Skip the pack subdirectory itself.
+        if dir_path.file_name().and_then(|s| s.to_str()) == Some("pack") {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir_path) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let fp = f.path();
+            if !fp.is_file() {
+                continue;
+            }
+            let dir_name = dir_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let file_name = fp
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let hex = format!("{dir_name}{file_name}");
+            if hex.len() != 64 {
+                continue;
+            }
+            let Ok(id) = ObjectId::from_hex(&hex) else {
+                continue;
+            };
+            let Ok(on_disk) = std::fs::read(&fp) else {
+                continue;
+            };
+            // We need the kind for the entry; decode just enough.
+            let raw = match crate::compress::decode(&on_disk) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let Ok((kind, _payload)) = crate::object::store::parse_raw(&raw) else {
+                continue;
+            };
+            entries.push(PackEntry {
+                id,
+                kind,
+                on_disk,
+            });
+            loose_paths.push(fp);
+        }
+    }
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let packed = entries.len();
+    write_pack(gyt_dir, entries)?;
+    // Only after the pack is durably on disk do we delete the loose
+    // copies; if the rename fails, the loose objects stay readable.
+    for p in &loose_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(packed)
 }
 
 /// Drop every reflog entry whose timestamp is older than `days` days.
