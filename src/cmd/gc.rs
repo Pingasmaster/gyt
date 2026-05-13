@@ -81,6 +81,12 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
+    // Hold the repo lock for the entire reflog-expire + reachability +
+    // prune + pack sequence. Without it, a concurrent push that has
+    // written loose objects via `wire_objects_have` but not yet
+    // committed its ref update would have those objects classified
+    // unreachable and reclaimed mid-push.
+    let _lock = repo.lock()?;
 
     let expired = if let Some(days) = expire_days {
         expire_reflog(&repo.gyt_dir, days)
@@ -233,51 +239,59 @@ fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
 
 /// Run garbage collection: returns the number of objects pruned.
 fn gc(gyt_dir: &Path) -> usize {
-    // 1. Compute reachable set from all refs
     let reachable = compute_reachable(gyt_dir);
-
-    // 2. Scan all loose objects
     let objects_dir = gyt_dir.join("objects");
     if !objects_dir.is_dir() {
         return 0;
     }
 
     let mut pruned = 0usize;
-
-    let Ok(entries) = std::fs::read_dir(&objects_dir) else {
+    // Loose objects live at `objects/<2-hex>/<62-hex>` — two-level sharding.
+    // Earlier versions of this loop read only the top-level entries and
+    // checked `is_file`, which silently skipped every loose object (they
+    // are directories at that level) so gc had been a no-op. Walk the
+    // shard directories explicitly. The `pack/` subdirectory and any
+    // future non-shard child are recognised by their non-2-hex name.
+    let Ok(top) = std::fs::read_dir(&objects_dir) else {
         return 0;
     };
-
-    for entry in entries {
-        let Ok(entry) = entry else {
+    for shard in top.flatten() {
+        let shard_path = shard.path();
+        if !shard_path.is_dir() {
+            continue;
+        }
+        let shard_name = match shard_path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if shard_name.len() != 2 || !shard_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&shard_path) else {
             continue;
         };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        // The file name is the hex suffix (everything after the first 2 chars).
-        let dir_name = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let hex = format!("{dir_name}{file_name}");
-        if hex.len() != 64 {
-            continue;
-        }
-        if let Ok(id) = ObjectId::from_hex(&hex)
-            && !reachable.contains(&id)
-        {
-            let _ = std::fs::remove_file(&path);
-            pruned += 1;
+        for f in files.flatten() {
+            let fp = f.path();
+            if !fp.is_file() {
+                continue;
+            }
+            let file_name = match fp.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if file_name.len() != 62 || !file_name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let hex = format!("{shard_name}{file_name}");
+            let Ok(id) = ObjectId::from_hex(&hex) else {
+                continue;
+            };
+            if !reachable.contains(&id) {
+                let _ = std::fs::remove_file(&fp);
+                pruned += 1;
+            }
         }
     }
-
     pruned
 }
 
@@ -288,6 +302,12 @@ fn gc(gyt_dir: &Path) -> usize {
 /// set is fair game for pruning.
 fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     let mut reachable: HashSet<ObjectId> = HashSet::new();
+    // Commits listed in `.gyt/shallow` are the boundary of a shallow
+    // clone — their parents are intentionally absent on disk. We treat
+    // them as walk roots so the BFS doesn't try (and fail) to descend
+    // through their missing parents. The boundary commits themselves
+    // stay reachable through their normal ref ancestry.
+    let shallow = read_shallow(gyt_dir);
 
     let mut seeds: Vec<ObjectId> = Vec::new();
 
@@ -360,8 +380,13 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
             crate::object::ObjectKind::Commit => {
                 if let Ok(c) = commit::decode(&obj.payload) {
                     queue.push_back(c.tree);
-                    for p in &c.parents {
-                        queue.push_back(*p);
+                    // Stop descending past shallow boundary commits.
+                    // Their parents weren't fetched and there's nothing
+                    // to mark reachable on disk.
+                    if !shallow.contains(&id) {
+                        for p in &c.parents {
+                            queue.push_back(*p);
+                        }
                     }
                 }
             }
@@ -381,4 +406,20 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     }
 
     reachable
+}
+
+/// Read `.gyt/shallow` into a set of boundary commit ids. The file is
+/// written by `gyt clone --depth`; if it doesn't exist (a normal full
+/// clone) we return an empty set.
+fn read_shallow(gyt_dir: &Path) -> HashSet<ObjectId> {
+    let Ok(text) = std::fs::read_to_string(gyt_dir.join("shallow")) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for line in text.lines() {
+        if let Ok(id) = ObjectId::from_hex(line.trim()) {
+            out.insert(id);
+        }
+    }
+    out
 }

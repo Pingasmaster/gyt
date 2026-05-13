@@ -441,6 +441,14 @@ const AUDIT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// (active log + 5 rotated). Older rotations are discarded.
 const AUDIT_LOG_KEEP: usize = 5;
 
+/// Single global mutex protecting the rotation sequence. Two threads
+/// crossing the size threshold concurrently must not interleave the
+/// descending-rename loop — that would clobber a generation. Process
+/// granularity is enough because each server process owns its own
+/// `<gyt>/audit.log`; cross-process locking would need a file lock and
+/// we don't run two servers against the same audit log.
+static AUDIT_ROTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Append an entry to `<gyt>/audit.log` describing a successful ref update.
 /// Crash-resistant best-effort: errors are dropped because audit is advisory.
 ///
@@ -477,13 +485,30 @@ pub fn append_audit(
     }
 }
 
-/// If `audit.log` exists and exceeds the size threshold, rotate it.
-/// Best-effort: any rename failure aborts the rotation; the next call
-/// will retry. We never panic and never block.
+/// If `audit.log` exists, is a regular file, and exceeds the size
+/// threshold, rotate it. Best-effort: any rename failure aborts the
+/// rotation; the next call will retry. We never panic and never block
+/// on disk I/O for long.
+///
+/// Concurrency: serialized via `AUDIT_ROTATE_LOCK`. Two threads passing
+/// the threshold simultaneously would otherwise interleave the
+/// descending-rename loop, losing one generation per race.
+///
+/// Symlink safety: `symlink_metadata` does *not* follow symlinks, so a
+/// local attacker who has replaced `audit.log` with a symlink can't
+/// trick the rename into clobbering a file elsewhere — we refuse to
+/// rotate anything that isn't a plain regular file.
 fn rotate_audit_if_needed(gyt_dir: &Path, path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let _guard = AUDIT_ROTATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
+    if !meta.file_type().is_file() {
+        // Symlink, fifo, etc. Refuse to operate.
+        return;
+    }
     if meta.len() < AUDIT_LOG_MAX_BYTES {
         return;
     }

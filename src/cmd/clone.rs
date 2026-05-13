@@ -207,78 +207,100 @@ pub fn walk_and_fetch(
     depth: Option<u32>,
 ) -> Result<usize> {
     let _ = mirror_all_refs;
+
+    // Queue of ids to *walk*. Duplicates are allowed; the per-id depth
+    // bookkeeping below short-circuits redundant walks. We need
+    // duplicates so a commit re-discovered at a smaller depth can have
+    // its parents re-enqueued at the correct lower depth — the previous
+    // implementation locked depth at first discovery, which silently
+    // dropped reachable objects when a shorter path to a deep commit
+    // existed.
     let mut wants: VecDeque<ObjectId> = VecDeque::new();
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    // Depth annotation for ids that *might* be commits (we can't tell
-    // until we decode). Tip refs and tag targets enter at depth 0.
-    // Parents of a commit at depth d enter at depth d+1; if depth+1
-    // exceeds the configured `--depth`, we record the commit in
-    // `shallow_boundary` instead of enqueueing its parents.
+    // Ids whose bytes are on disk. Once true, no further network fetch.
+    let mut downloaded: HashSet<ObjectId> = HashSet::new();
+    // Minimum depth at which we've observed an id. Only meaningful for
+    // commits, but recorded eagerly because we don't know the kind
+    // until we decode.
     let mut commit_depth: HashMap<ObjectId, u32> = HashMap::new();
+    // The depth at which we *walked parents* for a commit. If
+    // `commit_depth[id]` later drops below `walked_at[id]`, the commit
+    // is re-walked so its parents get the smaller depth.
+    let mut walked_at: HashMap<ObjectId, u32> = HashMap::new();
+    // Cached commit payloads keep re-walks free of disk I/O. Trees and
+    // blobs aren't cached because their walk is depth-independent.
+    let mut commit_payloads: HashMap<ObjectId, Vec<u8>> = HashMap::new();
     let mut shallow_boundary: HashSet<ObjectId> = HashSet::new();
-    let mut downloaded = 0usize;
+    let mut new_objects = 0usize;
 
     for r in server_refs {
-        if (r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/"))
-            && enqueue_if_new(repo, &r.id, &mut wants, &mut seen)
-        {
-            commit_depth.insert(r.id, 0);
+        if r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/") {
+            commit_depth.entry(r.id).or_insert(0);
+            if store::exists(&repo.gyt_dir, &r.id) {
+                downloaded.insert(r.id);
+            }
+            wants.push_back(r.id);
         }
     }
 
     while !wants.is_empty() {
-        // Drain the current batch. `std::mem::take` swaps in a fresh empty
-        // `VecDeque` and gives us ownership of the old one — same effect
-        // as `drain(..).collect()` but avoids the `iter_with_drain` lint
-        // (which warns that drain doesn't reduce VecDeque's capacity).
+        // -- Step 1: batch-fetch every want that's not yet on disk.
+        let mut to_fetch: HashSet<ObjectId> = HashSet::new();
+        for id in &wants {
+            if !downloaded.contains(id) {
+                to_fetch.insert(*id);
+            }
+        }
+        if !to_fetch.is_empty() {
+            let fetch_vec: Vec<ObjectId> = to_fetch.into_iter().collect();
+            let body = encode_wants(&fetch_vec);
+            let resp = client.post("objects/want", &body, &[])?;
+            if resp.status != 200 {
+                return Err(GytError::Net(format!(
+                    "POST /objects/want: status {} {}",
+                    resp.status, resp.reason
+                )));
+            }
+            for entry in parse_packfile(&resp.body)? {
+                let raw = compress::decode(&entry.bytes)?;
+                let entry_id = hash::hash_bytes(&raw);
+                let (kind, payload) = store::parse_raw(&raw)?;
+                if kind == ObjectKind::Commit {
+                    crate::object::commit::decode(&payload).map_err(|e| {
+                        GytError::Net(format!(
+                            "clone: server returned non-canonical commit {entry_id}: {e}"
+                        ))
+                    })?;
+                    commit_payloads.insert(entry_id, payload);
+                }
+                if !store::exists(&repo.gyt_dir, &entry_id) {
+                    let path = store::path_for(&repo.gyt_dir, &entry_id);
+                    fs_util::atomic_write(&path, &entry.bytes)?;
+                    new_objects += 1;
+                }
+                downloaded.insert(entry_id);
+            }
+        }
+
+        // -- Step 2: walk the batch. New parents/trees enqueued here
+        //    accumulate in `wants` for the next iteration.
         let batch: Vec<ObjectId> = std::mem::take(&mut wants).into_iter().collect();
-        if batch.is_empty() {
-            break;
-        }
-        let body = encode_wants(&batch);
-        let resp = client.post("objects/want", &body, &[])?;
-        if resp.status != 200 {
-            return Err(GytError::Net(format!(
-                "POST /objects/want: status {} {}",
-                resp.status, resp.reason
-            )));
-        }
-        let entries = parse_packfile(&resp.body)?;
-        // For each received object, verify and store; then enqueue its references.
-        for entry in entries {
-            let raw = compress::decode(&entry.bytes)?;
-            let id = hash::hash_bytes(&raw);
-            // Verify the raw header round-trips.
-            let (kind, payload) = store::parse_raw(&raw)?;
-            // For commits, require a canonical encoding so a malicious or
-            // buggy server can't poison our store with a non-canonical
-            // commit that later breaks `commit::read` for every future
-            // reader. We trust `commit::decode` to enforce this — if it
-            // rejects, refuse the pack.
-            if kind == ObjectKind::Commit {
-                crate::object::commit::decode(&payload).map_err(|e| {
-                    GytError::Net(format!(
-                        "clone: server returned non-canonical commit {id}: {e}"
-                    ))
-                })?;
+        for id in batch {
+            if !downloaded.contains(&id) {
+                // Server didn't ship it. We don't have its kind so we
+                // can't walk; skip and trust the caller to notice the
+                // ref it cares about doesn't resolve.
+                continue;
             }
-            // Already on disk? skip.
-            if !store::exists(&repo.gyt_dir, &id) {
-                let path = store::path_for(&repo.gyt_dir, &id);
-                fs_util::atomic_write(&path, &entry.bytes)?;
-                downloaded += 1;
-            }
-            // Enqueue references.
-            enqueue_refs(
+            walk_one(
                 repo,
-                kind,
-                &payload,
                 &id,
-                &mut wants,
-                &mut seen,
-                &mut commit_depth,
-                &mut shallow_boundary,
                 depth,
+                &mut wants,
+                &mut downloaded,
+                &mut commit_depth,
+                &mut walked_at,
+                &commit_payloads,
+                &mut shallow_boundary,
             )?;
         }
     }
@@ -287,7 +309,101 @@ pub fn walk_and_fetch(
         write_shallow(repo, &shallow_boundary)?;
     }
 
-    Ok(downloaded)
+    Ok(new_objects)
+}
+
+#[allow(clippy::too_many_arguments)] // Reason: the shallow walker threads a handful of parallel maps; bundling into a struct would just rename them.
+fn walk_one(
+    repo: &Repo,
+    id: &ObjectId,
+    max_depth: Option<u32>,
+    wants: &mut VecDeque<ObjectId>,
+    downloaded: &mut HashSet<ObjectId>,
+    commit_depth: &mut HashMap<ObjectId, u32>,
+    walked_at: &mut HashMap<ObjectId, u32>,
+    commit_payloads: &HashMap<ObjectId, Vec<u8>>,
+    shallow_boundary: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    // Resolve kind+payload. Commits live in the payload cache so
+    // re-walks avoid hitting disk; everything else reads back through
+    // the object store.
+    let (kind, payload): (ObjectKind, Vec<u8>) = if let Some(p) = commit_payloads.get(id) {
+        (ObjectKind::Commit, p.clone())
+    } else {
+        let obj = store::read(&repo.gyt_dir, id)?;
+        (obj.kind, obj.payload)
+    };
+    match kind {
+        ObjectKind::Blob => {}
+        ObjectKind::Tree => {
+            for e in tree::decode(&payload)? {
+                enqueue_for_fetch(repo, &e.hash, wants, downloaded);
+            }
+        }
+        ObjectKind::Tag => {
+            let t = tag::decode(&payload)?;
+            // A tag target restarts at depth 0 (treat as a fresh tip).
+            let need = match commit_depth.get(&t.target) {
+                None => true,
+                Some(d) => *d > 0,
+            };
+            if need {
+                commit_depth.insert(t.target, 0);
+                enqueue_for_fetch(repo, &t.target, wants, downloaded);
+            }
+        }
+        ObjectKind::Commit => {
+            let d = commit_depth.get(id).copied().unwrap_or(0);
+            // Already walked this commit at depth <= d? Skip.
+            if let Some(prev) = walked_at.get(id).copied()
+                && prev <= d
+            {
+                return Ok(());
+            }
+            walked_at.insert(*id, d);
+
+            let c = crate::object::commit::decode(&payload)?;
+            enqueue_for_fetch(repo, &c.tree, wants, downloaded);
+
+            let next_d = d.saturating_add(1);
+            let truncated = matches!(max_depth, Some(max) if next_d > max);
+            if truncated {
+                if !c.parents.is_empty() {
+                    shallow_boundary.insert(*id);
+                }
+            } else {
+                // A shorter path to this commit means it is no longer
+                // a real boundary — clear it if previously recorded.
+                shallow_boundary.remove(id);
+                for p in c.parents {
+                    let should_update = match commit_depth.get(&p) {
+                        None => true,
+                        Some(old) => next_d < *old,
+                    };
+                    if should_update {
+                        commit_depth.insert(p, next_d);
+                        enqueue_for_fetch(repo, &p, wants, downloaded);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Push `id` onto the walk queue, marking it as already-downloaded
+/// if it's present in the local store (so the next network batch
+/// skips it).
+fn enqueue_for_fetch(
+    repo: &Repo,
+    id: &ObjectId,
+    wants: &mut VecDeque<ObjectId>,
+    downloaded: &mut HashSet<ObjectId>,
+) {
+    if !downloaded.contains(id) && store::exists(&repo.gyt_dir, id) {
+        downloaded.insert(*id);
+    }
+    wants.push_back(*id);
 }
 
 /// Persist `.gyt/shallow`: one boundary commit hex per line. The presence
@@ -303,77 +419,6 @@ fn write_shallow(repo: &Repo, boundary: &HashSet<ObjectId>) -> Result<()> {
         body.push('\n');
     }
     fs_util::atomic_write(&repo.gyt_dir.join("shallow"), body.as_bytes())?;
-    Ok(())
-}
-
-/// Mark `id` as needing-fetch (or already known). Returns true iff this
-/// was the first time we saw the id — callers use the return to gate
-/// recording a per-id depth annotation.
-fn enqueue_if_new(
-    repo: &Repo,
-    id: &ObjectId,
-    wants: &mut VecDeque<ObjectId>,
-    seen: &mut HashSet<ObjectId>,
-) -> bool {
-    if seen.insert(*id) {
-        if !store::exists(&repo.gyt_dir, id) {
-            wants.push_back(*id);
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // Reason: shallow walk threads multiple parallel maps; bundling them into a struct would just rename the noise.
-fn enqueue_refs(
-    repo: &Repo,
-    kind: ObjectKind,
-    payload: &[u8],
-    self_id: &ObjectId,
-    wants: &mut VecDeque<ObjectId>,
-    seen: &mut HashSet<ObjectId>,
-    commit_depth: &mut HashMap<ObjectId, u32>,
-    shallow_boundary: &mut HashSet<ObjectId>,
-    max_depth: Option<u32>,
-) -> Result<()> {
-    match kind {
-        ObjectKind::Blob => {}
-        ObjectKind::Commit => {
-            let c = crate::object::commit::decode(payload)?;
-            // Tree contents are always fetched in full within the commits
-            // we *do* download — shallow truncates history, not breadth.
-            enqueue_if_new(repo, &c.tree, wants, seen);
-            let d = commit_depth.get(self_id).copied().unwrap_or(0);
-            let next = d.saturating_add(1);
-            let truncated = matches!(max_depth, Some(max) if next > max);
-            if truncated {
-                if !c.parents.is_empty() {
-                    shallow_boundary.insert(*self_id);
-                }
-            } else {
-                for p in &c.parents {
-                    if enqueue_if_new(repo, p, wants, seen) {
-                        commit_depth.insert(*p, next);
-                    }
-                }
-            }
-        }
-        ObjectKind::Tree => {
-            let entries = tree::decode(payload)?;
-            for e in entries {
-                enqueue_if_new(repo, &e.hash, wants, seen);
-            }
-        }
-        ObjectKind::Tag => {
-            let t = tag::decode(payload)?;
-            // A tag's target may itself be a commit; treat it as a fresh
-            // tip so its depth restarts at 0 within the shallow walk.
-            if enqueue_if_new(repo, &t.target, wants, seen) {
-                commit_depth.insert(t.target, 0);
-            }
-        }
-    }
     Ok(())
 }
 

@@ -311,6 +311,14 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     for _ in 0..MAX_REQUESTS_PER_CONN {
+        // Respect graceful shutdown: a keep-alive worker waiting for
+        // the next request must drop out promptly when serve() flips
+        // the shutdown flag. Without this check a single client could
+        // hold a worker for the whole MAX_REQUESTS_PER_CONN × timeout
+        // window after the operator asked us to exit.
+        if *state.shutdown.lock().unwrap() {
+            break;
+        }
         if !serve_one(&mut reader, &mut writer, state)? {
             break;
         }
@@ -384,6 +392,9 @@ fn handle_tls_conn(
 ) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream);
     for _ in 0..MAX_REQUESTS_PER_CONN {
+        if *state.shutdown.lock().unwrap() {
+            break;
+        }
         if !serve_one_tls(&mut reader, state)? {
             break;
         }
@@ -634,7 +645,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         .ok_or_else(|| std::io::Error::other("bad request line"))?
         .to_string();
 
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
     let mut auth_header: Option<String> = None;
     let mut client_wants_close = false;
     for line in lines {
@@ -647,7 +658,26 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         let k_trim = k.trim();
         let v_trim = v.trim();
         if k_trim.eq_ignore_ascii_case("content-length") {
-            content_length = v_trim.parse().unwrap_or(0);
+            // Reject malformed lengths instead of silently falling
+            // back to 0 — on a keep-alive connection a "0-length"
+            // request with a body fed in afterwards would let the
+            // body bytes be parsed as the *next* request, the
+            // classic CL-smuggling pattern. A duplicate header is
+            // also a smuggling signal per RFC 7230 §3.3.2.
+            if content_length.is_some() {
+                return Err(std::io::Error::other("duplicate Content-Length header"));
+            }
+            let parsed: usize = v_trim
+                .parse()
+                .map_err(|_| std::io::Error::other(format!("bad Content-Length: {v_trim:?}")))?;
+            content_length = Some(parsed);
+        } else if k_trim.eq_ignore_ascii_case("transfer-encoding") {
+            // We don't implement chunked request decoding. Refuse so a
+            // client can't smuggle bytes past the body cap by sending
+            // them as a chunked stream we'd otherwise leave unread.
+            return Err(std::io::Error::other(
+                "Transfer-Encoding header not supported by server",
+            ));
         } else if k_trim.eq_ignore_ascii_case("authorization") {
             auth_header = Some(v_trim.to_string());
         } else if k_trim.eq_ignore_ascii_case("connection")
@@ -658,6 +688,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
             client_wants_close = true;
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return Err(std::io::Error::other(format!(
             "request body too large: {content_length} bytes (max {MAX_BODY_BYTES})"
@@ -1358,6 +1389,14 @@ fn guess_content_type(path: &str) -> String {
 /// where the gyt layout lives directly inside `<repo>`).
 fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std::path::PathBuf> {
     let repo = router::get_param(params, "repo")?;
+    // Hard-reject anything that could escape repos_root or alias to a
+    // different on-disk location: `..`, embedded path separators, NUL,
+    // names starting with `.` (would hide), or empty names. PathBuf::join
+    // does not canonicalize; without this check, `/../neighbour/info/refs`
+    // would resolve to a sibling repo the operator never published.
+    if !is_safe_repo_segment(repo) {
+        return None;
+    }
     let p = state.repos_root.join(repo);
     // Non-bare: `<p>/.gyt/HEAD` exists.
     if p.join(".gyt").is_dir() {
@@ -1368,6 +1407,26 @@ fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std
         return Some(p);
     }
     None
+}
+
+/// True iff `s` is safe to join under `repos_root` as a single segment.
+/// The wire URL `/{repo}/...` uses one path component, so the repo name
+/// must NOT contain anything that would either escape (`..`, `/`, `\`)
+/// or alias to a hidden / special name. We also bound the length to
+/// keep paths reasonable. This is the only checkpoint between an
+/// attacker-controlled URL and `Path::join`.
+fn is_safe_repo_segment(s: &str) -> bool {
+    if s.is_empty() || s.len() > 255 {
+        return false;
+    }
+    if s == "." || s == ".." {
+        return false;
+    }
+    if s.starts_with('.') {
+        return false;
+    }
+    !s.bytes()
+        .any(|b| b == b'/' || b == b'\\' || b == 0 || b == b':')
 }
 
 /// GET /{repo}/info/refs - list all refs as tab-separated text

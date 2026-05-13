@@ -45,7 +45,18 @@ pub fn decode(stored: &[u8]) -> Result<Vec<u8>> {
 
 pub fn xz_encode_raw(payload: &[u8]) -> Result<Vec<u8>> {
     let level: u32 = if payload.len() < SIZE_XZ_HIGH { 9 } else { 6 };
-    let opts = XzOptions::with_preset(level);
+    let mut opts = XzOptions::with_preset(level);
+    // Apply the "extreme"-equivalent tuning that xz-utils's `-9e` flag
+    // gives: push the match-finder's `nice_len` to its max (273) and
+    // raise `depth_limit` to 1000. Cost is encoder CPU time; ratio
+    // improves a few percent on the kind of compressible payloads
+    // gyt deals with (commits, trees, text blobs). For preset >= 4
+    // (Normal mode, BT4 match-finder) this is meaningful; for the
+    // fast presets we leave the defaults alone.
+    if level >= 4 {
+        opts.lzma_options.nice_len = 273;
+        opts.lzma_options.depth_limit = 1000;
+    }
     let body = Vec::with_capacity(payload.len() / 2 + 64);
     let mut w = XzWriter::new(body, opts).map_err(|e| GytError::Object(format!("xz init: {e}")))?;
     w.write_all(payload)?;

@@ -166,41 +166,55 @@ impl HttpClient {
         let target = self.build_target(path_suffix);
         let request_bytes = self.build_request(method, &target, body, extra_headers);
 
-        // Try cached connection. If write/parse fails on a recycled
-        // socket, that's usually the server having closed it during the
-        // idle window — silently reopen and retry once. Failures on a
-        // fresh socket are surfaced.
-        if let Some(mut conn) = self.pool.lock().unwrap().take()
-            && let Some(resp) = self.try_on_conn(&mut conn, &request_bytes)
-        {
-            if !response_says_close(&resp) {
-                *self.pool.lock().unwrap() = Some(conn);
+        // Try a recycled connection. The ONLY transparent retry case is
+        // when writing the request to a recycled socket fails — the
+        // server probably closed it during the idle window before
+        // reading any bytes from us, so resending on a fresh connection
+        // can't double-apply. If the *response* read fails after we
+        // wrote, we deliberately surface the error: the server may
+        // have already processed the request, and silently resending a
+        // POST /refs/update would be at-least-once delivery for a
+        // non-idempotent operation.
+        let recycled = self.pool.lock().unwrap().take();
+        if let Some(mut conn) = recycled {
+            match self.try_write(&mut conn, &request_bytes) {
+                Ok(()) => {
+                    // Wrote successfully. Now read; any failure surfaces
+                    // rather than retrying, to keep POSTs at-most-once.
+                    let resp = read_response(&mut conn.reader)
+                        .map_err(|e| GytError::Net(format!("response on recycled conn: {e}")))?;
+                    if !response_says_close(&resp) {
+                        *self.pool.lock().unwrap() = Some(conn);
+                    }
+                    return Ok(resp);
+                }
+                Err(_) => {
+                    // Drop `conn`; the fresh-open path below retries.
+                }
             }
-            return Ok(resp);
         }
 
         let stream = self.open_conn()?;
         let mut conn = PooledConn {
             reader: BufReader::new(stream),
         };
-        let resp = self
-            .try_on_conn(&mut conn, &request_bytes)
-            .ok_or_else(|| GytError::Net("request failed on fresh connection".into()))?;
+        self.try_write(&mut conn, &request_bytes)
+            .map_err(|e| GytError::Net(format!("write on fresh conn: {e}")))?;
+        let resp = read_response(&mut conn.reader)
+            .map_err(|e| GytError::Net(format!("response on fresh conn: {e}")))?;
         if !response_says_close(&resp) {
             *self.pool.lock().unwrap() = Some(conn);
         }
         Ok(resp)
     }
 
-    /// Run a request on `conn`. Returns `None` if writing the request or
-    /// parsing the response fails (caller decides whether to retry or
-    /// surface as an error). The conn is left in an unspecified state
-    /// on `None` — the caller must drop it.
-    fn try_on_conn(&self, conn: &mut PooledConn, request_bytes: &[u8]) -> Option<HttpResponse> {
+    /// Write `request_bytes` (already include headers + body) to `conn`,
+    /// returning the underlying I/O error if the write or flush fails.
+    /// The connection is left in an unspecified state on error.
+    fn try_write(&self, conn: &mut PooledConn, request_bytes: &[u8]) -> std::io::Result<()> {
         let w = conn.reader.get_mut();
-        w.write_all(request_bytes).ok()?;
-        w.flush().ok()?;
-        read_response(&mut conn.reader).ok()
+        w.write_all(request_bytes)?;
+        w.flush()
     }
 
     fn open_conn(&self) -> Result<Box<dyn Conn>> {
@@ -299,9 +313,17 @@ fn parse_authority(authority: &str, scheme: Scheme) -> Result<(String, u16)> {
 
 // ---------- response parsing ----------
 
-fn read_response<R: Read>(stream: &mut R) -> Result<HttpResponse> {
-    let mut reader = BufReader::new(stream);
-    let header_bytes = read_until_crlf_crlf(&mut reader)?;
+fn read_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse> {
+    // Critical: do NOT wrap `reader` in a fresh BufReader here. The
+    // caller passes a `BufReader<Box<dyn Conn>>` that survives across
+    // requests on a keep-alive connection; if we double-buffered, any
+    // bytes the server has already flushed past this response's body
+    // (the next response's headers, on a pipelined or fast-flushing
+    // server) would sit in the inner BufReader and be silently dropped
+    // when this function returns. The next request would then read
+    // mid-stream and parse-error. Read straight from the caller's
+    // BufReader so the leftover bytes stay buffered for the next call.
+    let header_bytes = read_until_crlf_crlf(reader)?;
     let header_str = std::str::from_utf8(&header_bytes)
         .map_err(|_| GytError::Net("non-utf8 response headers".into()))?;
     let mut lines = header_str.split("\r\n");
@@ -331,7 +353,7 @@ fn read_response<R: Read>(stream: &mut R) -> Result<HttpResponse> {
         .any(|(k, v)| k.eq_ignore_ascii_case("connection") && contains_token(v, "close"));
 
     let body = if is_chunked {
-        chunked_decode(&mut reader)?
+        chunked_decode(reader)?
     } else if let Some(n) = content_length {
         let mut buf = vec![0u8; n];
         reader.read_exact(&mut buf)?;
