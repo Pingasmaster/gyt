@@ -122,7 +122,6 @@ mod tests {
         assert_eq!(id1, id2);
     }
 
-    #[cfg(feature = "xz")]
     #[test]
     fn xz_round_trip_with_magic_prefix() {
         let t = tmp_repo();

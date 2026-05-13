@@ -215,6 +215,44 @@ pub fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
     Ok(out)
 }
 
+// ---------- packfile ----------
+//
+// Packfile format:
+//   byte 0: version flag (0x01 = uncompressed, 0x02 = xz-compressed)
+//   bytes 1..: body
+//
+// The body is the same format as encode_pack/parse_pack when uncompressed,
+// or xz-compressed when version 0x02.
+
+const PACKFILE_VERSION_RAW: u8 = 0x01;
+const PACKFILE_VERSION_XZ: u8 = 0x02;
+
+pub fn encode_packfile(entries: &[PackEntry]) -> Vec<u8> {
+    let inner = encode_pack(entries);
+    let compressed = crate::compress::xz_encode_raw(&inner).expect("xz compression should not fail");
+    let mut out = Vec::with_capacity(1 + compressed.len());
+    out.push(PACKFILE_VERSION_XZ);
+    out.extend_from_slice(&compressed);
+    out
+}
+
+pub fn parse_packfile(body: &[u8]) -> Result<Vec<PackEntry>> {
+    if body.is_empty() {
+        return Err(GytError::Parse("packfile: empty body".into()));
+    }
+    match body[0] {
+        PACKFILE_VERSION_RAW => parse_pack(&body[1..]),
+        PACKFILE_VERSION_XZ => {
+            let decompressed = crate::compress::xz_decode_raw(&body[1..])
+                .map_err(|e| GytError::Parse(format!("packfile: xz decompress: {e}")))?;
+            parse_pack(&decompressed)
+        }
+        v => Err(GytError::Parse(format!(
+            "packfile: unknown version byte {v:#04x}"
+        ))),
+    }
+}
+
 // Re-export so other modules can build pack entries with a placeholder id.
 pub fn pack_entry_from_bytes(bytes: Vec<u8>) -> PackEntry {
     PackEntry {
@@ -299,6 +337,53 @@ mod tests {
         buf.extend_from_slice(&10u32.to_le_bytes());
         buf.extend_from_slice(b"abcd");
         assert!(parse_pack(&buf).is_err());
+    }
+
+    #[test]
+    fn round_trip_packfile() {
+        let entries = vec![
+            PackEntry {
+                id: ObjectId([0u8; 32]),
+                bytes: vec![],
+            },
+            PackEntry {
+                id: ObjectId([0u8; 32]),
+                bytes: b"hello".to_vec(),
+            },
+        ];
+        let bytes = encode_packfile(&entries);
+        // Should start with xz version byte
+        assert_eq!(bytes[0], PACKFILE_VERSION_XZ);
+        let parsed = parse_packfile(&bytes).unwrap();
+        assert_eq!(parsed.len(), entries.len());
+        for (a, b) in parsed.iter().zip(entries.iter()) {
+            assert_eq!(a.bytes, b.bytes);
+        }
+    }
+
+    #[test]
+    fn parse_packfile_handles_raw_format() {
+        // Old format (0x01 + raw data)
+        let entries = vec![PackEntry {
+            id: ObjectId([0u8; 32]),
+            bytes: b"test".to_vec(),
+        }];
+        let inner = encode_pack(&entries);
+        let mut raw = vec![PACKFILE_VERSION_RAW];
+        raw.extend_from_slice(&inner);
+        let parsed = parse_packfile(&raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].bytes, b"test");
+    }
+
+    #[test]
+    fn parse_packfile_rejects_unknown_version() {
+        assert!(parse_packfile(&[0xff, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_packfile_rejects_empty() {
+        assert!(parse_packfile(b"").is_err());
     }
 
     #[test]

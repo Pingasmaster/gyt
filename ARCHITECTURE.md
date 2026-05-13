@@ -4,7 +4,7 @@ This document describes the architecture, design decisions, and development hist
 
 ## Overview
 
-gyt is a minimal version-control system written in Rust. It implements a workable subset of Git's functionality, designed to be safe for both human and AI agent use.
+gyt is a minimal, modern version-control system written in Rust. It is designed from scratch — not a Git clone, not Git-compatible. It has its own wire protocol, its own object format (BLAKE3, not SHA-1), and its own index format (GYTI). The design is focused on safety for both human and AI agent use.
 
 ### Key design properties
 
@@ -26,6 +26,7 @@ gyt/
 │   │   ├── init.rs          # gyt init
 │   │   ├── add.rs           # Stage files into index
 │   │   ├── status.rs        # Working tree status
+│   │   ├── clean.rs         # Remove untracked files
 │   │   ├── commit.rs        # Create commit from index
 │   │   ├── log.rs           # Walk commit history
 │   │   ├── show.rs          # Display commit/object
@@ -43,10 +44,19 @@ gyt/
 │   │   ├── push.rs          # Push to remote
 │   │   ├── clone.rs         # Clone from remote
 │   │   ├── fetch.rs         # Fetch objects from remote
+│   │   ├── remote.rs        # Remote listing/management
 │   │   ├── stash.rs         # Stash/unstash working changes
 │   │   ├── worktree.rs      # Secondary worktrees
 │   │   ├── grep_cmd.rs      # Pattern search
+│   │   ├── gc.rs            # Garbage collect unreachable objects
+│   │   ├── config_cmd.rs    # Read/list repository config
 │   │   ├── serve.rs         # HTTP server
+│   │   ├── ci.rs            # Built-in CI runner (gyt ci)
+│   │   ├── ci_env.rs        # CI env-var store (.gyt/ci-env.toml)
+│   │   ├── ci_secret.rs     # Encrypted CI secret store (AES-256-GCM)
+│   │   ├── keygen.rs        # ed25519 keypair generation
+│   │   ├── signing.rs       # Commit-signing helpers
+│   │   ├── verify.rs        # Signature verification
 │   │   ├── util.rs          # Shared utilities
 │   │   ├── test_support.rs  # Test helpers
 │   │   └── getthefuckoutofmyrepo.rs  # Safety utility
@@ -54,7 +64,7 @@ gyt/
 │   │   ├── mod.rs           # Re-exports
 │   │   ├── http.rs          # HTTP/1.1 client (hand-rolled)
 │   │   ├── tls.rs           # rustls TLS client
-│   │   ├── protocol.rs      # gyt wire protocol codec
+│   │   ├── protocol.rs      # gyt wire protocol codec (XZ-compressed packfiles)
 │   │   ├── router.rs        # REST URL routing
 │   │   ├── server.rs        # Production HTTP server
 │   │   ├── server_stub.rs   # Test-only in-memory server
@@ -67,7 +77,9 @@ gyt/
 │   │   ├── commit.rs        # Commit codec
 │   │   ├── tag.rs           # Tag codec
 │   │   └── store.rs         # Loose object storage
-│   ├── compress.rs          # XZ compression (optional)
+│   ├── compress.rs          # Object on-disk wrapping with XZ/LZMA (raw passthrough fallback for unwrapped files)
+│   ├── ci_wasm.rs           # wasmtime sandbox for WASM CI workflows
+│   ├── fuzz.rs              # Fuzzing harnesses
 │   ├── config.rs            # .gyt/config parser
 │   ├── diff.rs              # Myers diff algorithm
 │   ├── ignore.rs            # .gytignore matching
@@ -79,7 +91,9 @@ gyt/
 │   ├── hash.rs              # BLAKE3 hashing
 │   ├── fs_util.rs           # Filesystem utilities
 │   └── term.rs              # Terminal color helpers
-├── tests/smoke.sh           # End-to-end smoke test
+├── tests/
+│   ├── smoke_comprehensive.sh  # End-to-end smoke test
+│   └── wire_integration.rs     # Wire-protocol integration tests
 ├── Cargo.toml               # Dependencies + clippy config
 ├── check.sh                 # Full CI pipeline
 └── rust-toolchain.toml      # Rust edition/year pinning
@@ -131,7 +145,7 @@ Each object is stored as `"<kind> <size>\0<payload>"` where:
 - `<kind>` is one of: `blob`, `tree`, `commit`, `tag`
 - `<size>` is the uncompressed payload byte count
 - `\0` is a NUL separator
-- `<payload>` is optionally compressed via xz if the xz feature is enabled
+- on disk, the whole `<kind> <size>\0<payload>` framing is wrapped with an XZ/LZMA stream behind a 5-byte magic+flag header; files without the magic prefix are read as raw (legacy fallback)
 
 The filename is the BLAKE3 hash of the raw (uncompressed) payload, split into a 2-character prefix directory and the remaining suffix.
 
@@ -166,6 +180,8 @@ The gyt wire protocol is a minimal binary protocol over HTTP, used by clone/fetc
 
 The protocol codec (`net/protocol.rs`) handles encoding/decoding of all wire format messages.
 
+Packfiles (the body of `objects/want` responses and `objects/have` uploads) carry a 1-byte version prefix: `0x01` = uncompressed inner stream, `0x02` = XZ-compressed inner stream. See `src/net/protocol.rs`. XZ is the only compression used by gyt — both for on-disk loose objects and for wire-protocol packfiles — provided by the `lzma-rust2` crate.
+
 ## Error model
 
 All functions return `Result<T, GytError>` where `GytError` is an enum with variants:
@@ -194,7 +210,11 @@ All functions return `Result<T, GytError>` where `GytError` is an enum with vari
 | rustls | TLS for HTTP client | Yes |
 | rustls-pki-types | TLS types | Yes |
 | webpki-roots | Root certificates | Yes |
-| lzma-rust2 | XZ compression (optional) | Yes |
+| lzma-rust2 | XZ compression (objects on disk + wire packfiles) | Yes |
+| wasmtime / wasmtime-wasi | WASM sandbox for `gyt ci` | Yes |
+| ed25519-dalek | Commit signing | Yes |
+| rand | Key generation entropy | Yes |
+| aes-gcm | CI secret encryption | Yes |
 | include_dir | Include-dir macro | Yes |
 
 All dependencies are pinned to exact versions for supply-chain safety.
