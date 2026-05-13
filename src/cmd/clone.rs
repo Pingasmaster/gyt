@@ -21,7 +21,7 @@ use crate::errors::{GytError, Result};
 use crate::fs_util;
 use crate::hash::{self, ObjectId};
 use crate::net::http::HttpClient;
-use crate::net::protocol::{RefEntry, encode_wants, parse_info_refs, parse_pack};
+use crate::net::protocol::{RefEntry, encode_wants, parse_info_refs, parse_packfile};
 use crate::object::{ObjectKind, store, tag, tree};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
@@ -142,7 +142,7 @@ fn pick_head(server_refs: &[RefEntry]) -> Option<String> {
     None
 }
 
-pub(crate) fn open_client(url: &str, insecure: bool) -> Result<HttpClient> {
+pub fn open_client(url: &str, insecure: bool) -> Result<HttpClient> {
     if url.starts_with("http://") {
         if !insecure {
             return Err(GytError::Net(
@@ -155,7 +155,7 @@ pub(crate) fn open_client(url: &str, insecure: bool) -> Result<HttpClient> {
     }
 }
 
-pub(crate) fn fetch_info_refs(client: &HttpClient) -> Result<Vec<RefEntry>> {
+pub fn fetch_info_refs(client: &HttpClient) -> Result<Vec<RefEntry>> {
     let resp = client.get("info/refs", &[])?;
     if resp.status != 200 {
         return Err(GytError::Net(format!(
@@ -173,7 +173,7 @@ pub(crate) fn fetch_info_refs(client: &HttpClient) -> Result<Vec<RefEntry>> {
 /// If `mirror_all_refs` is true, all `server_refs` ids are seeds; otherwise
 /// only refs/heads/* and refs/tags/* (used by clone & fetch alike — fetch
 /// passes `true` too since the server only advertises heads/tags anyway).
-pub(crate) fn walk_and_fetch(
+pub fn walk_and_fetch(
     client: &HttpClient,
     repo: &Repo,
     server_refs: &[RefEntry],
@@ -191,8 +191,11 @@ pub(crate) fn walk_and_fetch(
     }
 
     while !wants.is_empty() {
-        // Drain the current batch.
-        let batch: Vec<ObjectId> = wants.drain(..).collect();
+        // Drain the current batch. `std::mem::take` swaps in a fresh empty
+        // `VecDeque` and gives us ownership of the old one — same effect
+        // as `drain(..).collect()` but avoids the `iter_with_drain` lint
+        // (which warns that drain doesn't reduce VecDeque's capacity).
+        let batch: Vec<ObjectId> = std::mem::take(&mut wants).into_iter().collect();
         if batch.is_empty() {
             break;
         }
@@ -204,7 +207,7 @@ pub(crate) fn walk_and_fetch(
                 resp.status, resp.reason
             )));
         }
-        let entries = parse_pack(&resp.body)?;
+        let entries = parse_packfile(&resp.body)?;
         // For each received object, verify and store; then enqueue its references.
         for entry in entries {
             let raw = compress::decode(&entry.bytes)?;
@@ -300,6 +303,7 @@ mod tests {
             committer: "A <a@x> 1 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "init\n".into(),
         };
         let commit_payload = commit::encode(&c);

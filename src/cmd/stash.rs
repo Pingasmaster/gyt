@@ -41,8 +41,7 @@ const STASH_REF: &str = "refs/stash";
 pub fn run(args: &[String]) -> Result<()> {
     let (sub, rest) = args
         .split_first()
-        .map(|(s, r)| (s.as_str(), r))
-        .unwrap_or(("push", &[][..]));
+        .map_or(("push", &[][..]), |(s, r)| (s.as_str(), r));
     match sub {
         "push" => cmd_push(rest),
         "list" => cmd_list(rest),
@@ -122,6 +121,7 @@ fn do_push(repo: &Repo, args: &[String]) -> Result<()> {
             committer: author_line.clone(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: format!("index on {branch_label}\n"),
         },
     )?;
@@ -155,6 +155,7 @@ fn do_push(repo: &Repo, args: &[String]) -> Result<()> {
             committer: author_line,
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: stash_msg.clone(),
         },
     )?;
@@ -334,7 +335,7 @@ fn cmd_drop(args: &[String]) -> Result<()> {
 }
 
 fn do_drop(repo: &Repo, args: &[String]) -> Result<()> {
-    let target = args.first().map(String::as_str).unwrap_or("stash@{0}");
+    let target = args.first().map_or("stash@{0}", String::as_str);
     if target != "stash@{0}" {
         return Err(GytError::Unsupported(format!(
             "stash drop: only stash@{{0}} is supported (got {target:?})"
@@ -400,15 +401,14 @@ fn short_branch_name(refname: &str) -> String {
 fn current_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 // ---- Tree builders -----------------------------------------------------------
 
 /// Build a tree object from the in-memory index and write all sub-trees to the
 /// object store. Returns the root tree id.
-pub(crate) fn build_tree_from_index(gyt_dir: &Path, index: &Index) -> Result<ObjectId> {
+pub fn build_tree_from_index(gyt_dir: &Path, index: &Index) -> Result<ObjectId> {
     // Group entries into a directory hierarchy.
     let mut root = DirNode::default();
     for e in &index.entries {
@@ -424,7 +424,7 @@ pub(crate) fn build_tree_from_index(gyt_dir: &Path, index: &Index) -> Result<Obj
 #[derive(Default)]
 struct DirNode {
     files: BTreeMap<Vec<u8>, (u32, ObjectId)>,
-    dirs: BTreeMap<Vec<u8>, DirNode>,
+    dirs: BTreeMap<Vec<u8>, Self>,
 }
 
 impl DirNode {
@@ -689,8 +689,7 @@ mod tests {
             let pid = std::process::id();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.subsec_nanos());
             let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -750,6 +749,7 @@ mod tests {
                 committer: "A <a@x> 1 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "initial\n".into(),
             },
         )
@@ -764,6 +764,7 @@ mod tests {
             user_email: Some(email.into()),
             remotes: Default::default(),
             create_default_gytignore: false,
+            sign_required: false,
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }

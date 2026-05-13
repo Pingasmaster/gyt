@@ -1,6 +1,14 @@
 // Minimal repo config reader. The on-disk format lives at `.gyt/config.toml`
 // and is a tiny subset of TOML — enough for what the CLI actually consults.
 //
+// Lookup precedence (later wins):
+//   1. system / global at `$GYT_CONFIG_HOME` or `$HOME/.config/gyt/config.toml`
+//   2. repo at `.gyt/config.toml`
+//   3. environment overrides (`GYT_AUTHOR_NAME`, `GYT_AUTHOR_EMAIL`)
+//
+// This means a user can set their name/email once globally and skip the
+// per-repo step. A repo file overrides the global, and env vars beat both.
+//
 // Recognized keys:
 //   [user]
 //   name  = "Alice"
@@ -12,10 +20,10 @@
 //   [init]
 //   create_default_gytignore = true  (opt-in, default false)
 //
-// Anything else is preserved syntactically but not surfaced via this API.
+//   [commit]
+//   sign_required = true  (opt-in, default false)
 //
-// Environment overrides (used for `commit` author info, useful in CI/tests):
-//   GYT_AUTHOR_NAME, GYT_AUTHOR_EMAIL
+// Anything else is preserved syntactically but not surfaced via this API.
 
 use crate::errors::{GytError, Result};
 use crate::fs_util;
@@ -35,17 +43,40 @@ pub struct Config {
     pub remotes: BTreeMap<String, String>,
     /// Whether to create a default .gytignore on `gyt init`. Defaults to false (opt-in).
     pub create_default_gytignore: bool,
+    /// If true, `gyt commit` without `--sign` is rejected.
+    pub sign_required: bool,
 }
 
 impl Config {
-    /// Load repository configuration from `.gyt/config.toml`, applying
-    /// environment overrides (`GYT_AUTHOR_NAME`, `GYT_AUTHOR_EMAIL`).
+    /// Load repository configuration. The global file (if any) supplies
+    /// defaults; the repo file overrides; env vars override both.
     pub fn load(repo: &Repo) -> Result<Self> {
+        let mut cfg = match global_config_path() {
+            Some(g) if g.exists() => parse(&fs_util::read_all(&g)?)?,
+            _ => Self::default(),
+        };
         let p = repo.gyt_dir.join("config.toml");
-        let mut cfg = if p.exists() {
-            parse(&fs_util::read_all(&p)?)?
-        } else {
-            Self::default()
+        if p.exists() {
+            let repo_cfg = parse(&fs_util::read_all(&p)?)?;
+            merge_into(&mut cfg, repo_cfg);
+        }
+        if let Ok(v) = std::env::var("GYT_AUTHOR_NAME") {
+            cfg.user_name = Some(v);
+        }
+        if let Ok(v) = std::env::var("GYT_AUTHOR_EMAIL") {
+            cfg.user_email = Some(v);
+        }
+        Ok(cfg)
+    }
+
+    /// Load the global config alone, applying env overrides. Used by code
+    /// paths that need user identity outside of a repo (e.g. `gyt clone`
+    /// before a repo exists).
+    #[allow(dead_code)] // public API: callers outside the binary entry points
+    pub fn load_global() -> Result<Self> {
+        let mut cfg = match global_config_path() {
+            Some(g) if g.exists() => parse(&fs_util::read_all(&g)?)?,
+            _ => Self::default(),
         };
         if let Ok(v) = std::env::var("GYT_AUTHOR_NAME") {
             cfg.user_name = Some(v);
@@ -60,12 +91,16 @@ impl Config {
     pub fn identity(&self) -> Result<String> {
         let name = self.user_name.as_ref().ok_or_else(|| {
             GytError::Repo(
-                "user.name not set (set in .gyt/config.toml or via GYT_AUTHOR_NAME)".into(),
+                "user.name not set (set ~/.config/gyt/config.toml, .gyt/config.toml, or \
+                 GYT_AUTHOR_NAME)"
+                    .into(),
             )
         })?;
         let email = self.user_email.as_ref().ok_or_else(|| {
             GytError::Repo(
-                "user.email not set (set in .gyt/config.toml or via GYT_AUTHOR_EMAIL)".into(),
+                "user.email not set (set ~/.config/gyt/config.toml, .gyt/config.toml, or \
+                 GYT_AUTHOR_EMAIL)"
+                    .into(),
             )
         })?;
         Ok(format!("{name} <{email}>"))
@@ -91,7 +126,41 @@ impl Config {
         if self.create_default_gytignore {
             s.push_str("\n[init]\ncreate_default_gytignore = true\n");
         }
+        if self.sign_required {
+            s.push_str("\n[commit]\nsign_required = true\n");
+        }
         fs_util::atomic_write(&gyt_dir.join("config.toml"), s.as_bytes())
+    }
+}
+
+/// Where to look for the user's global config. Honors `GYT_CONFIG_HOME` for
+/// tests and unusual setups, falling back to `$HOME/.config/gyt/config.toml`.
+/// Returns `None` if `HOME` isn't set and the override isn't given.
+pub fn global_config_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("GYT_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(p).join("config.toml"));
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".config/gyt/config.toml"))
+}
+
+/// Layer `other` on top of `base`. Set fields in `other` overwrite `base`;
+/// remotes are unioned (with `other` winning on key collisions).
+fn merge_into(base: &mut Config, other: Config) {
+    if other.user_name.is_some() {
+        base.user_name = other.user_name;
+    }
+    if other.user_email.is_some() {
+        base.user_email = other.user_email;
+    }
+    for (k, v) in other.remotes {
+        base.remotes.insert(k, v);
+    }
+    if other.create_default_gytignore {
+        base.create_default_gytignore = true;
+    }
+    if other.sign_required {
+        base.sign_required = true;
     }
 }
 
@@ -119,7 +188,7 @@ fn quote(s: &str) -> String {
 /// Tiny TOML subset parser.
 /// Supports: `[section]`, `[section.subsection]` (one level deep, used for remote.NAME),
 /// `key = "value"` with the same escapes as `quote`. Line comments with `#`.
-fn parse(bytes: &[u8]) -> Result<Config> {
+pub fn parse(bytes: &[u8]) -> Result<Config> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| GytError::Parse("config.toml is not utf-8".into()))?;
     let mut cfg = Config::default();
@@ -161,6 +230,10 @@ fn parse(bytes: &[u8]) -> Result<Config> {
         // Check [init] section first since it only needs a borrow.
         if section.len() == 1 && section[0] == "init" && key == "create_default_gytignore" {
             cfg.create_default_gytignore = raw_value == "true";
+            continue;
+        }
+        if section.len() == 1 && section[0] == "commit" && key == "sign_required" {
+            cfg.sign_required = raw_value == "true";
             continue;
         }
         match section.as_slice() {
@@ -308,5 +381,37 @@ email = "b@x"
     fn rejects_unquoted_value() {
         let toml = "[user]\nname = Bob\n";
         assert!(parse(toml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn merge_layers_global_under_repo() {
+        let mut base = Config {
+            user_name: Some("Alice".into()),
+            user_email: Some("alice@global".into()),
+            ..Config::default()
+        };
+        let repo = Config {
+            user_email: Some("alice@work".into()),
+            ..Config::default()
+        };
+        merge_into(&mut base, repo);
+        // Repo overrides email; name still from global.
+        assert_eq!(base.user_name.as_deref(), Some("Alice"));
+        assert_eq!(base.user_email.as_deref(), Some("alice@work"));
+    }
+
+    #[test]
+    fn global_config_path_default_uses_home() {
+        // Without HOME set we can't assert much portably; just verify the
+        // function returns Some when HOME is present (it normally is on CI),
+        // and the path ends with `.config/gyt/config.toml`.
+        if let Ok(home) = std::env::var("HOME") {
+            let p = global_config_path().unwrap();
+            assert!(
+                p.starts_with(&home),
+                "global config path should be under HOME: {p:?}"
+            );
+            assert!(p.ends_with(".config/gyt/config.toml"));
+        }
     }
 }

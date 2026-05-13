@@ -9,6 +9,7 @@ use crate::repo::Repo;
 enum Mode {
     Soft,
     Mixed,
+    Hard,
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -24,11 +25,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         match a.as_str() {
             "--soft" => mode = Mode::Soft,
             "--mixed" => mode = Mode::Mixed,
-            "--hard" => {
-                return Err(GytError::Unsupported(
-                    "reset --hard is not supported; use `gyt restore` or `gyt switch`".into(),
-                ));
-            }
+            "--hard" => mode = Mode::Hard,
             other if !other.starts_with('-') => {
                 if rev.is_some() {
                     return Err(GytError::InvalidArgument(
@@ -65,9 +62,36 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         )));
     }
 
+    let prev = refs::read_ref(&repo.gyt_dir, &head_ref).ok();
     refs::write_ref(&repo.gyt_dir, &head_ref, &target)?;
+    let mode_label = match mode {
+        Mode::Soft => "soft",
+        Mode::Mixed => "mixed",
+        Mode::Hard => "hard",
+    };
+    let identity = crate::config::Config::load(repo)
+        .ok()
+        .and_then(|c| c.identity().ok())
+        .unwrap_or_else(|| "-".to_string());
+    let reflog_msg = format!("reset --{mode_label}: {rev}");
+    crate::reflog::record(
+        &repo.gyt_dir,
+        &head_ref,
+        prev.as_ref(),
+        &target,
+        &identity,
+        &reflog_msg,
+    );
+    crate::reflog::record(
+        &repo.gyt_dir,
+        "HEAD",
+        prev.as_ref(),
+        &target,
+        &identity,
+        &reflog_msg,
+    );
 
-    if mode == Mode::Mixed {
+    if mode == Mode::Mixed || mode == Mode::Hard {
         let target_tree = commit::decode(&obj.payload)?.tree;
         let files = flatten_tree(repo, &target_tree)?;
         let mut idx = Index::new();
@@ -82,6 +106,13 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             });
         }
         idx.write(&repo.index_path())?;
+
+        if mode == Mode::Hard {
+            // Materialize the target tree into the workdir. We reuse the
+            // merge helper since the semantics are identical: drop tracked
+            // files that aren't in the target, overwrite files that are.
+            crate::cmd::merge::materialize_commit(repo, &target)?;
+        }
     }
     // Soft: only ref updated above, index and workdir unchanged
     Ok(())
@@ -130,10 +161,20 @@ mod tests {
     }
 
     #[test]
-    fn reset_hard_is_rejected() {
+    fn reset_hard_moves_head_index_and_workdir() {
         let r = TestRepo::new("gyt-reset-hard");
         let repo = r.open();
-        run_in(&repo, &["--hard".into(), "HEAD".into()]).unwrap_err();
+        let first = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        // Make a second commit with new content, then reset --hard to first.
+        let (_, _) = r.commit_next(&[("hello.txt", b"v2\n", false)]);
+        run_in(&repo, &["--hard".into(), first.to_hex()]).unwrap();
+        assert_eq!(
+            refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap(),
+            first
+        );
+        // After --hard, the workdir's hello.txt should match the initial commit.
+        let read = std::fs::read(repo.workdir.join("hello.txt")).unwrap();
+        assert_eq!(read, b"hello\n");
     }
 
     #[test]

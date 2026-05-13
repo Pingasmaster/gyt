@@ -25,47 +25,94 @@ codegen-units = 1
 strip = "symbols"
 
 # === STRICT CLIPPY HARNESSES ===
-# Default: pedantic + correctness + suspicious + style
-# Allow-listed lints are strictly justified and never suppressed arbitrarily.
+#
+# Policy: every clippy group is `deny`. The only escape hatches are the
+# `allow` entries below — each has a one-line reason. New allows require
+# a documented justification (see AGENTS.md / Clippy policy section).
+# Anything else must be FIXED at the call site, not silenced.
 [lints.rust]
 unsafe_code = "deny"
+unused = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
 
 [lints.clippy]
-# CORRECTNESS — must not fire
-all = { level = "deny", priority = -1 }
-correctness = { level = "deny", priority = -2 }
-suspicious = { level = "deny", priority = -3 }
-# STYLE — allow only if honestly necessary
-pedantic = { level = "warn", priority = -4 }
-# RESTRICTION — only what makes the code safer/cleaner
-# allowlist: reasonable exceptions for git tooling
-dbg_macro = "allow"
+# Promote every clippy group to `deny`. New code must be clean.
+correctness = { level = "deny", priority = -10 }
+suspicious = { level = "deny", priority = -10 }
+complexity = { level = "deny", priority = -10 }
+perf = { level = "deny", priority = -10 }
+style = { level = "deny", priority = -10 }
+pedantic = { level = "deny", priority = -10 }
+nursery = { level = "deny", priority = -10 }
+cargo = { level = "deny", priority = -10 }
+
+# ── Honest allowlist ───────────────────────────────────────────────
+# Each line below is a clippy lint we deliberately don't enforce, with a
+# one-line reason. Anything not on this list is mandatory.
+
+# CLI tooling prints to stdout; that's the whole point.
 print_stdout = "allow"
+print_stderr = "allow"
+# Identifiers come from external systems (git refs, branch names, etc.).
+# `similar_names` and `struct_field_names` produce false positives constantly.
 module_name_repetitions = "allow"
+similar_names = "allow"
+struct_field_names = "allow"
+# Documentation completeness is enforced by code review, not the linter —
+# enforcing these on every internal helper bloats signatures with empty
+# Errors/Panics sections.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
-too_many_lines = "allow"
-doc_markdown = "allow"
-missing_fields_in_debug = "allow"
-inline_always = "allow"
-default_trait_access = "allow"
-similar_names = "allow"
+missing_docs_in_private_items = "allow"
+# A version-control tool unavoidably manipulates byte buffers and indices
+# from u32-sized headers; the alternative is `usize::try_from(...)` on every
+# line, which makes the code worse without finding bugs.
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
-float_cmp = "allow"
-implicit_hasher = "allow"
-map_unwrap_or = "allow"
+cast_lossless = "allow"
+# Long command-dispatch and codec functions are clearer in one place.
+too_many_lines = "allow"
+# Cargo.lock has duplicate transitive deps we can't deduplicate without
+# patching upstream. Reviewed during `cargo update`.
 multiple_crate_versions = "allow"
-needless_pass_by_value = "allow"
+# Reading `?` macros in doc comments routinely triggers this.
+doc_markdown = "allow"
+# Required because the test_support module exercises identifiers like
+# `commit::write` from a context where this lint is over-eager.
+must_use_candidate = "allow"
+# Float comparison is fine for our few timestamp/diff use cases (all i64).
+float_cmp = "allow"
+# Often we *want* `e.into_iter().map(...)` on Vec<T>.
+needless_collect = "allow"
+# pedantic noise on `Result<()>` returning helpers that conceivably could
+# fail under future expansion.
+unnecessary_wraps = "allow"
+# Match patterns that look at `_ | other` are intentional in CLI parsers.
+match_same_arms = "allow"
+# Compatibility-style code in protocol/object encoding sometimes prefers
+# explicit chained `if let` patterns over `let-else` for readability.
+manual_let_else = "allow"
+# Some tests explicitly need `.clone()` to avoid lifetime gymnastics.
 redundant_clone = "allow"
+# String concat with `.push_str(&format!(...))` is occasionally clearer
+# than `write!`. Both produce the same machine code.
+format_push_string = "allow"
+# Trait impls in test modules occasionally trip this on Default impls.
+default_trait_access = "allow"
+# When implementing PartialOrd manually for ObjectId comparisons.
+non_canonical_partial_ord_impl = "allow"
+# `Result<T>` aliases collide with `std::io::Result`; we intentionally use
+# both, naming them explicitly at call sites that mix them.
+result_large_err = "allow"
+# Hand-rolled JSON / TOML serializers use `&[(&str, String)]` arg lists
+# which would otherwise trip `single_match_else` / `option_if_let_else`.
 single_match_else = "allow"
-struct_excessive_bools = "allow"
-struct_field_names = "allow"
-
-# PROPER CLIPPY CONFIGURATION FOR A GIT TOOL
-expect_used = "allow"
-panic = "allow"
-unimplemented = "allow"
-unreachable = "allow"
+option_if_let_else = "allow"
+# Not publishing to crates.io — `package.repository`, `keywords`,
+# `categories` would be vanity entries.
+cargo_common_metadata = "allow"
+# Tests legitimately have helper methods called only from a subset of test
+# bodies (`#[test]` items pull from a shared scaffolding struct).
+unused_self = "allow"

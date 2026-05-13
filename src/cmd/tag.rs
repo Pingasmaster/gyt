@@ -96,8 +96,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         let identity = cfg.identity()?;
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let tagger = format!("{identity} {secs} +0000");
         let target_obj = store::read(&repo.gyt_dir, &target)?;
         let tag = Tag {

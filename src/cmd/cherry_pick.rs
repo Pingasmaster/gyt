@@ -1,13 +1,27 @@
+// `gyt cherry-pick <commit>`
+//
+// Applies the *changes* introduced by <commit> on top of HEAD, using the
+// same three-way engine as `gyt merge`:
+//   base    = parent of <commit> (or empty tree if root)
+//   ours    = HEAD tree
+//   theirs  = <commit>'s tree
+//
+// On a clean merge we create a new commit on HEAD with the merged tree,
+// reusing the picked commit's message. On conflicts we write conflict-
+// marker files to the workdir and leave `.gyt/CHERRY_PICK_HEAD` plus
+// `.gyt/MERGE_MSG` for the user to resolve and re-commit.
+
 use crate::cmd::util::resolve_rev;
 use crate::config::Config;
 use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
 use crate::index::{Index, IndexEntry};
-use crate::object::{ObjectKind, blob, commit as commit_obj, store};
+use crate::merge3;
+use crate::object::{ObjectKind, blob, commit as commit_obj, store, tree};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -17,7 +31,6 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut rev: Option<String> = None;
-
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -39,9 +52,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             }
         }
     }
-
-    let rev =
-        rev.ok_or_else(|| GytError::InvalidArgument("cherry-pick: <commit> is required".into()))?;
+    let rev = rev
+        .ok_or_else(|| GytError::InvalidArgument("cherry-pick: <commit> is required".into()))?;
 
     let target_id = resolve_rev(repo, &rev)?;
     let target_obj = store::read(&repo.gyt_dir, &target_id)?;
@@ -50,119 +62,267 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             "cherry-pick: {rev} is not a commit"
         )));
     }
-
     let target_commit = commit_obj::read(&repo.gyt_dir, &target_id)?;
 
-    // Check if already applied
     let head = refs::read_head(&repo.gyt_dir)?;
-    if let (Head::Symbolic(_name), Some(head_id)) = (&head, refs::resolve(&repo.gyt_dir, &head)?) {
-        let head_commit = commit_obj::read(&repo.gyt_dir, &head_id)?;
-        if head_commit.tree == target_commit.tree && head_commit.authors == target_commit.authors {
+    let head_id = refs::resolve(&repo.gyt_dir, &head)?;
+
+    let head_tree = match head_id {
+        Some(id) => commit_obj::read(&repo.gyt_dir, &id)?.tree,
+        None => {
+            // Unborn HEAD: just adopt the target tree directly.
+            apply_tree_directly(repo, &target_commit.tree)?;
+            let parents: Vec<ObjectId> = vec![];
+            let new_id = make_commit(
+                repo,
+                target_commit.tree,
+                parents,
+                target_commit.message.clone(),
+            )?;
+            return finish(repo, &head, None, new_id, &target_commit.message);
+        }
+    };
+
+    // Already-applied detection: same tree, same author (cheap heuristic).
+    if let Some(hid) = head_id {
+        let head_commit = commit_obj::read(&repo.gyt_dir, &hid)?;
+        if head_commit.tree == target_commit.tree
+            && head_commit.authors == target_commit.authors
+        {
             return Err(GytError::Repo(
                 "HEAD is up to date: commit already applied".into(),
             ));
         }
     }
 
-    // Build new commit with target tree, current HEAD as parent
-    let parents = match refs::read_head(&repo.gyt_dir)? {
-        Head::Symbolic(_) => match refs::resolve(&repo.gyt_dir, &head)? {
-            Some(id) => vec![id],
-            None => vec![],
-        },
-        Head::Detached(id) => vec![id],
+    let base_tree = match target_commit.parents.first() {
+        Some(p) => commit_obj::read(&repo.gyt_dir, p)?.tree,
+        None => crate::object::tree::write(&repo.gyt_dir, &[])?,
     };
+    let theirs_tree = target_commit.tree;
 
+    let base_files = crate::cmd::util::flatten_tree(repo, &base_tree)?;
+    let ours_files = crate::cmd::util::flatten_tree(repo, &head_tree)?;
+    let theirs_files = crate::cmd::util::flatten_tree(repo, &theirs_tree)?;
+
+    let mut conflict_blobs: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    let tm = merge3::merge_trees(&base_files, &ours_files, &theirs_files, |path, ours, theirs, base| {
+        let ob = blob::read(&repo.gyt_dir, ours.1).unwrap_or_default();
+        let tb = blob::read(&repo.gyt_dir, theirs.1).unwrap_or_default();
+        let bb = match base {
+            Some((_, h)) => blob::read(&repo.gyt_dir, h).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let merged = merge3::merge_lines(&bb, &ob, &tb);
+        if merged.clean {
+            let bytes = merge3::render_with_markers(&merged, "ours", "theirs");
+            match blob::write(&repo.gyt_dir, &bytes) {
+                Ok(h) => merge3::ContentResult::Resolved(h),
+                Err(_) => merge3::ContentResult::Conflict {
+                    ours_hash: *ours.1,
+                    theirs_hash: *theirs.1,
+                },
+            }
+        } else {
+            let bytes = merge3::render_with_markers(&merged, "HEAD", "picked");
+            conflict_blobs.insert(path.clone(), bytes);
+            merge3::ContentResult::Conflict {
+                ours_hash: *ours.1,
+                theirs_hash: *theirs.1,
+            }
+        }
+    });
+
+    if !tm.conflicts.is_empty() {
+        apply_files_to_workdir(repo, &tm.merged)?;
+        write_index_from_map(repo, &tm.merged)?;
+        for (path, bytes) in &conflict_blobs {
+            let abs = repo.workdir.join(path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&abs, bytes)?;
+        }
+        std::fs::write(
+            repo.gyt_dir.join("CHERRY_PICK_HEAD"),
+            format!("{}\n", target_id.to_hex()).as_bytes(),
+        )?;
+        std::fs::write(repo.gyt_dir.join("MERGE_MSG"), target_commit.message.as_bytes())?;
+        let conflict_list = tm
+            .conflicts
+            .iter()
+            .map(|c| format!("  {:?}: {}", c.kind, c.path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(GytError::Repo(format!(
+            "cherry-pick: conflicts (left in workdir; resolve and re-commit):\n{conflict_list}"
+        )));
+    }
+
+    apply_files_to_workdir(repo, &tm.merged)?;
+    write_index_from_map(repo, &tm.merged)?;
+    let merged_tree_id = write_tree_from_map(repo, &tm.merged)?;
+
+    let parents = head_id.map(|h| vec![h]).unwrap_or_default();
+    let new_id = make_commit(repo, merged_tree_id, parents, target_commit.message.clone())?;
+    finish(repo, &head, head_id, new_id, &target_commit.message)
+}
+
+fn finish(
+    repo: &Repo,
+    head: &Head,
+    prev: Option<ObjectId>,
+    new_id: ObjectId,
+    target_msg: &str,
+) -> Result<()> {
+    let identity = Config::load(repo)
+        .ok()
+        .and_then(|c| c.identity().ok())
+        .unwrap_or_else(|| "-".to_string());
+    let first = target_msg.lines().next().unwrap_or("").to_string();
+    let log_msg = format!("cherry-pick: {first}");
+    match head {
+        Head::Symbolic(name) => {
+            refs::write_ref(&repo.gyt_dir, name, &new_id)?;
+            crate::reflog::record(&repo.gyt_dir, name, prev.as_ref(), &new_id, &identity, &log_msg);
+            crate::reflog::record(&repo.gyt_dir, "HEAD", prev.as_ref(), &new_id, &identity, &log_msg);
+        }
+        Head::Detached(_) => {
+            refs::write_head(&repo.gyt_dir, &Head::Detached(new_id))?;
+            crate::reflog::record(&repo.gyt_dir, "HEAD", prev.as_ref(), &new_id, &identity, &log_msg);
+        }
+    }
+    let hex = new_id.to_hex();
+    let short = &hex[..hex.len().min(8)];
+    println!("[{short}] {first}");
+    Ok(())
+}
+
+fn make_commit(
+    repo: &Repo,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    message: String,
+) -> Result<ObjectId> {
     let cfg = Config::load(repo)?;
     let identity = cfg.identity()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
+        .map_or(0, |d| d.as_secs());
     let stamped = format!("{identity} {now} +0000");
-    let authors = vec![stamped.clone()];
-
-    let new_commit = commit_obj::Commit {
-        tree: target_commit.tree,
+    let c = commit_obj::Commit {
+        tree,
         parents,
-        authors,
+        authors: vec![stamped.clone()],
         committer: stamped,
         ai_assists: Vec::new(),
         reviewers: Vec::new(),
-        message: target_commit.message.clone(),
+        signature: None,
+        message,
     };
+    commit_obj::write(&repo.gyt_dir, &c)
+}
 
-    let new_id = commit_obj::write(&repo.gyt_dir, &new_commit)?;
-
-    // Update HEAD ref
-    match refs::read_head(&repo.gyt_dir)? {
-        Head::Symbolic(name) => {
-            refs::write_ref(&repo.gyt_dir, &name, &new_id)?;
-        }
-        Head::Detached(_) => {
-            refs::write_head(&repo.gyt_dir, &Head::Detached(new_id))?;
+fn apply_files_to_workdir(repo: &Repo, merged: &BTreeMap<PathBuf, (u32, ObjectId)>) -> Result<()> {
+    let cur_index = Index::read(&repo.index_path())?;
+    for entry in &cur_index.entries {
+        if !merged.contains_key(&entry.path) {
+            let abs = repo.workdir.join(&entry.path);
+            if std::fs::symlink_metadata(&abs).is_ok() {
+                let _ = std::fs::remove_file(&abs);
+            }
         }
     }
+    for (path, (mode, hash)) in merged {
+        let abs = repo.workdir.join(path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_workdir_entry(&repo.gyt_dir, &abs, *mode, hash)?;
+    }
+    Ok(())
+}
 
-    // Update index and working tree to match target
-    let files = flatten_tree(repo, &target_commit.tree)?;
+fn write_index_from_map(repo: &Repo, merged: &BTreeMap<PathBuf, (u32, ObjectId)>) -> Result<()> {
     let mut idx = Index::new();
-    for (p, (m, h)) in &files {
+    for (path, (mode, hash)) in merged {
         idx.insert(IndexEntry {
             ctime_secs: 0,
             mtime_secs: 0,
             size: 0,
-            mode: *m,
-            hash: *h,
-            path: p.clone(),
+            mode: *mode,
+            hash: *hash,
+            path: path.clone(),
         });
     }
     idx.write(&repo.index_path())?;
-
-    for (p, (m, h)) in &files {
-        let abs = repo.workdir.join(p);
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let payload = blob::read(&repo.gyt_dir, h)?;
-        fs::write(&abs, &payload)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = if m & 0o111 != 0 {
-                std::fs::Permissions::from_mode(0o755)
-            } else {
-                std::fs::Permissions::from_mode(0o644)
-            };
-            std::fs::set_permissions(&abs, perms)?;
-        }
-    }
-
-    // Remove extra files from working tree
-    let current_index = Index::read(&repo.index_path())?;
-    for entry in &current_index.entries {
-        if !files.contains_key(&entry.path) {
-            let abs = repo.workdir.join(&entry.path);
-            if abs.exists() {
-                let _ = fs::remove_file(&abs);
-            }
-        }
-    }
-
-    let hex = new_id.to_hex();
-    let short = &hex[..hex.len().min(8)];
-    let first_line = new_commit.message.lines().next().unwrap_or("");
-    println!("[{short}] {first_line}");
-
     Ok(())
 }
 
-fn flatten_tree(
+fn write_tree_from_map(
     repo: &Repo,
-    tree_id: &ObjectId,
-) -> Result<std::collections::BTreeMap<PathBuf, (u32, ObjectId)>> {
-    crate::cmd::util::flatten_tree(repo, tree_id)
+    merged: &BTreeMap<PathBuf, (u32, ObjectId)>,
+) -> Result<ObjectId> {
+    let mut idx = Index::new();
+    for (path, (mode, hash)) in merged {
+        idx.insert(IndexEntry {
+            ctime_secs: 0,
+            mtime_secs: 0,
+            size: 0,
+            mode: *mode,
+            hash: *hash,
+            path: path.clone(),
+        });
+    }
+    crate::cmd::util::build_tree_from_index(repo, &idx)
+}
+
+fn apply_tree_directly(repo: &Repo, tree_id: &ObjectId) -> Result<()> {
+    let files = crate::cmd::util::flatten_tree(repo, tree_id)?;
+    apply_files_to_workdir(repo, &files)?;
+    write_index_from_map(repo, &files)?;
+    Ok(())
+}
+
+fn write_workdir_entry(gyt_dir: &Path, abs: &Path, mode: u32, hash: &ObjectId) -> Result<()> {
+    if mode == tree::MODE_SYMLINK {
+        let bytes = blob::read(gyt_dir, hash)?;
+        let target = std::str::from_utf8(&bytes)
+            .map_err(|_| GytError::Object("symlink target is not utf-8".into()))?;
+        let _ = std::fs::remove_file(abs);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, abs)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            return Err(GytError::Unsupported(
+                "symlinks not supported on this platform".into(),
+            ));
+        }
+    }
+    let bytes = blob::read(gyt_dir, hash)?;
+    if let Ok(md) = std::fs::symlink_metadata(abs)
+        && md.file_type().is_symlink()
+    {
+        std::fs::remove_file(abs)?;
+    }
+    std::fs::write(abs, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let want = if mode == tree::MODE_EXEC {
+            0o755
+        } else {
+            0o644
+        };
+        let mut perms = std::fs::metadata(abs)?.permissions();
+        perms.set_mode(want);
+        std::fs::set_permissions(abs, perms)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -183,32 +343,29 @@ mod tests {
     }
 
     #[test]
-    fn cherry_pick_applies_commit() {
-        let r = TestRepo::new("gyt-cherry-pick");
+    fn cherry_pick_adds_disjoint_file_cleanly() {
+        let r = TestRepo::new("gyt-cherry-pick-disjoint");
         write_identity_config(&r.gyt_dir());
-        let mut repo = r.open();
-        let first_commit_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-
-        // Create a second commit
-        r.commit_next(&[("hello.txt", b"v2\n", false)]);
-
-        // Re-open to see the new state
-        repo = Repo::open(&r.root).unwrap();
-
+        let repo = r.open();
+        // Branch off feature, add feat.txt, then return to main.
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo.workdir).unwrap();
-
-        let result = run_in(&repo, &[first_commit_id.to_hex()]);
+        crate::cmd::branch::run(&["feature".to_string()]).unwrap();
+        crate::cmd::switch::run(&["feature".to_string()]).unwrap();
+        std::fs::write(repo.workdir.join("feat.txt"), b"feat\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        crate::cmd::commit::run(&["-m".to_string(), "feat-commit".to_string()]).unwrap();
+        let feat_id = refs::read_ref(&repo.gyt_dir, "refs/heads/feature").unwrap();
+        crate::cmd::switch::run(&["main".to_string()]).unwrap();
+        // Now cherry-pick the feature commit onto main.
+        let result = run_in(&repo, &[feat_id.to_hex()]);
         std::env::set_current_dir(&prev).unwrap();
-
         result.unwrap();
-
-        // Verify the commit was created
-        let _head_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
-        // It should be a new commit
-
-        // Verify the content is from first commit
-        let content = fs::read_to_string(repo.workdir.join("hello.txt")).unwrap();
-        assert_eq!(content, "hello\n");
+        // feat.txt should now exist on main.
+        let content = fs::read_to_string(repo.workdir.join("feat.txt")).unwrap();
+        assert_eq!(content, "feat\n");
+        // hello.txt (from initial commit) should still be there.
+        let hello = fs::read_to_string(repo.workdir.join("hello.txt")).unwrap();
+        assert_eq!(hello, "hello\n");
     }
 }

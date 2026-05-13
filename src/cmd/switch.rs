@@ -162,7 +162,27 @@ fn switch_to(repo: &Repo, branch: &str) -> Result<()> {
     new_idx.write(&repo.index_path())?;
 
     // 4. Move HEAD.
-    refs::write_head(&repo.gyt_dir, &Head::Symbolic(ref_name))?;
+    let prev_head_id = refs::resolve(&repo.gyt_dir, &refs::read_head(&repo.gyt_dir)?).ok().flatten();
+    let new_head_id = refs::read_ref(&repo.gyt_dir, &ref_name).ok();
+    refs::write_head(&repo.gyt_dir, &Head::Symbolic(ref_name.clone()))?;
+    if let Some(new_id) = new_head_id {
+        let identity = crate::config::Config::load(repo)
+            .ok()
+            .and_then(|c| c.identity().ok())
+            .unwrap_or_else(|| "-".to_string());
+        let short_branch = ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&ref_name);
+        let msg = format!("checkout: moving to {short_branch}");
+        crate::reflog::record(
+            &repo.gyt_dir,
+            "HEAD",
+            prev_head_id.as_ref(),
+            &new_id,
+            &identity,
+            &msg,
+        );
+    }
     Ok(())
 }
 
@@ -231,8 +251,8 @@ fn hash_workdir_file(path: &Path, mode: u32) -> Result<ObjectId> {
 }
 
 fn write_workdir_entry(gyt_dir: &Path, abs: &Path, entry: &FlatEntry) -> Result<()> {
+    let bytes = blob::read(gyt_dir, &entry.hash)?;
     if entry.mode == tree::MODE_SYMLINK {
-        let bytes = blob::read(gyt_dir, &entry.hash)?;
         let target = std::str::from_utf8(&bytes)
             .map_err(|_| GytError::Object("symlink target is not utf-8".into()))?;
         let _ = std::fs::remove_file(abs);
@@ -249,7 +269,6 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, entry: &FlatEntry) -> Result<
             ))
         }
     } else {
-        let bytes = blob::read(gyt_dir, &entry.hash)?;
         if let Ok(md) = std::fs::symlink_metadata(abs)
             && md.file_type().is_symlink()
         {
@@ -338,6 +357,7 @@ mod tests {
             committer: "T <t@x> 1 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "alt\n".into(),
         };
         let cid = commit::write(&repo.gyt_dir, &c).unwrap();
@@ -382,6 +402,7 @@ mod tests {
             committer: "T <t@x> 1 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "alt\n".into(),
         };
         let cid = commit::write(&repo.gyt_dir, &c).unwrap();

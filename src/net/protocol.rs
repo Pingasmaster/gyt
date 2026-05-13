@@ -254,7 +254,7 @@ pub fn parse_packfile(body: &[u8]) -> Result<Vec<PackEntry>> {
 }
 
 // Re-export so other modules can build pack entries with a placeholder id.
-pub fn pack_entry_from_bytes(bytes: Vec<u8>) -> PackEntry {
+pub const fn pack_entry_from_bytes(bytes: Vec<u8>) -> PackEntry {
     PackEntry {
         id: ObjectId([0u8; 32]),
         bytes,

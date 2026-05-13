@@ -229,6 +229,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 committer: c.committer.clone(),
                 ai_assists: c.ai_assists.clone(),
                 reviewers: c.reviewers.clone(),
+                signature: c.signature.clone(),
                 message: c.message.clone(),
             };
 

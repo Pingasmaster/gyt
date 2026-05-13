@@ -8,8 +8,9 @@
 
 ### Core VCS
 - **Init / Add / Commit / Log / Diff / Show** — standard VCS operations
-- **Branch / Switch / Merge / Rebase** — branch management
-- **Cherry-pick / Reset / Restore / Stash / Worktree** — advanced workflow
+- **Branch / Switch / Merge / Rebase** — branch management with **real three-way merge**, conflict markers, merge commits
+- **Cherry-pick / Reset / Restore / Stash / Worktree** — advanced workflow (cherry-pick and rebase use the same three-way engine; reset supports `--soft`, `--mixed`, `--hard`)
+- **Reflog** — append-only audit log of HEAD/branch movement (`gyt reflog`)
 - **Grep** — content search across history
 - **Clean / RM** — file management
 - **GetTheFuckOutOfMyRepo** — bulk repository metadata cleanup
@@ -18,7 +19,8 @@
 - **`gyt keygen`** — generate ed25519 signing keypair (stored at `~/.config/gyt/`)
 - **`gyt commit --sign`** / `-S` — sign commits cryptographically
 - **`gyt verify [<commit>]`** — verify a signed commit's signature
-- **`sign_required = true`** — enforce signed commits via `[commit]` section in `.gyt/config.toml`
+- **`sign_required = true`** in `.gyt/config.toml` — enforce signed commits client-side
+- **Server-side enforcement**: when the server's repo config has `sign_required = true`, every commit reaching the server via `gyt push` is verified against the public keys listed in `<repo>.gyt/allowed_signers` (one 64-char hex pubkey per line, optionally followed by a label). Unsigned commits, commits with bad signatures, and commits signed by keys not in the allowed list are rejected.
 
 All signing uses pure Rust `ed25519-dalek` — no OpenSSL, no libc dependency.
 
@@ -35,6 +37,10 @@ Custom REST-like HTTP/1.1 protocol:
 - Optional **bearer-token authentication** via `--auth-token <secret>`
 - Optional `--webroot` for static file serving
 - REST API dashboard for repo management
+- **Hardened**: 256 MiB request body cap, bounded worker pool (64 concurrent connections), 30 s read+write timeouts per connection
+- **Fast-forward enforcement** on `POST /refs/update` unless the client passes `?force=1`
+- **Signature verification** on push when the receiving repo opts in via `sign_required = true`
+- **Audit log** at `<repo>.gyt/audit.log` recording every successful ref update with timestamp + actor
 
 ### Built-in CI (`gyt ci`)
 - Reads workflows from the `.gyt-ci/` directory
@@ -135,7 +141,7 @@ Objects are stored as content-addressed blobs in `.gyt/objects/XX/YYYYYY` where 
 
 Supported kinds: `blob`, `tree`, `commit`, `tag`
 
-On disk, the raw object is wrapped with XZ/LZMA compression — a 4-byte magic prefix (`67 79 74 01`), a 1-byte flag (bit 0 = xz), then the LZMA stream. Files written before XZ-wrapping was always on are still readable: any file without the magic prefix is decoded as raw bytes. XZ is the only compression used by gyt, both for on-disk objects and for wire-protocol packfiles.
+On disk, the raw object is wrapped with XZ/LZMA compression behind a 5-byte header: a 4-byte magic prefix (`67 79 74 01`) followed by a 1-byte flag (bit 0 = xz). Files written before XZ-wrapping was added are still readable: any file without the magic prefix is decoded as raw bytes. XZ is the only compression used by gyt, both for on-disk objects and for wire-protocol packfiles.
 
 ### Commit Format
 
@@ -186,13 +192,14 @@ Refs are stored as plain text files in `.gyt/refs/heads/` and `.gyt/refs/tags/`.
 | `branch [<name>]` | List or create branches |
 | `switch <branch>` | Switch to a branch |
 | `restore <path>...` | Discard unstaged changes |
-| `reset [--soft\|--mixed] <rev>` | Reset HEAD |
+| `reset [--soft\|--mixed\|--hard] <rev>` | Reset HEAD (and optionally index / workdir) |
+| `reflog [<ref>] [--all] [-n N]` | Show ref-movement history |
 | `tag <name> [<rev>]` | Create a tag |
 | `rm <path>...` | Remove files |
 | `grep <pattern>` | Search content |
-| `cherry-pick <commit>` | Apply a commit's changes |
-| `rebase <branch>` | Fast-forward rebase |
-| `merge --ff-only <rev>` | Fast-forward merge |
+| `cherry-pick <commit>` | Apply a commit's changes (three-way) |
+| `rebase <upstream> [--ff-only] [--abort]` | Replay commits onto upstream (three-way) |
+| `merge <rev> [--ff-only] [--no-ff] [-m <msg>]` | Merge a ref into HEAD (real three-way) |
 | `clone <url> [<dir>]` | Clone a repository |
 | `fetch [<remote>]` | Fetch from remote |
 | `pull [<remote>]` | Fetch + merge |
@@ -209,7 +216,10 @@ Refs are stored as plain text files in `.gyt/refs/heads/` and `.gyt/refs/tags/`.
 
 ## Configuration
 
-`.gyt/config.toml` (TOML format):
+Config files are layered:
+1. Global: `~/.config/gyt/config.toml` (or `$GYT_CONFIG_HOME/config.toml`) — defaults for every repo
+2. Per-repo: `.gyt/config.toml` — overrides the global
+3. Environment variables — override both
 
 ```toml
 [user]
@@ -223,9 +233,17 @@ sign_required = true
 url = "http://server:8080/myrepo.gyt/"
 ```
 
+Set your identity once globally and skip the per-repo step:
+
+```bash
+mkdir -p ~/.config/gyt
+printf '[user]\nname = "Your Name"\nemail = "you@example.com"\n' > ~/.config/gyt/config.toml
+```
+
 Environment variables:
 - `GYT_AUTHOR_NAME` — override author name
 - `GYT_AUTHOR_EMAIL` — override author email
+- `GYT_CONFIG_HOME` — override the directory holding the global config
 - `GYT_SIGNING_KEY` — override signing private key path
 - `GYT_SIGNING_PUB` — override signing public key path
 - `RUST_BACKTRACE=1` — enable backtrace on errors

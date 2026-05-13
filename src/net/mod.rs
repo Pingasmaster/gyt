@@ -4,6 +4,7 @@
 pub mod api;
 pub mod http;
 pub mod protocol;
+pub mod refs_policy;
 pub mod router;
 pub mod server;
 pub mod tls;

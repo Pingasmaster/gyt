@@ -1,4 +1,4 @@
-// URL routing + handler dispatch for the gith1b API server.
+// URL routing + handler dispatch for the gyt API server and wire protocol.
 
 #[derive(Debug, Clone)]
 pub struct RouteMatch {
@@ -16,22 +16,57 @@ pub enum Handler {
     RefsList,
     DiffRevs,
     Search,
+    /// Wire protocol: GET /{repo}/info/refs
+    InfoRefs,
+    /// Wire protocol: POST /{repo}/objects/want
+    ObjectsWant,
+    /// Wire protocol: POST /{repo}/objects/have
+    ObjectsHave,
+    /// Wire protocol: POST /{repo}/refs/update
+    RefsUpdate,
     StaticFile,
     NotFound,
 }
 
 pub fn route(method: &str, path: &str) -> RouteMatch {
-    if method != "GET" {
+    let segments = split_path(path);
+
+    // ── Wire protocol endpoints ─────────────────────────────────
+    // These are the gyt protocol endpoints, used by clone/fetch/push.
+    // They sit at /{repo_name}/{endpoint} — the repo name is the first segment.
+    // Endpoints split into multiple path segments (e.g., "info/refs" -> ["info","refs"]).
+    if segments.len() >= 3 && method == "GET" && segments[1] == "info" && segments[2] == "refs" {
         return RouteMatch {
-            handler: Handler::NotFound,
-            params: vec![],
+            handler: Handler::InfoRefs,
+            params: vec![("repo".to_string(), segments[0].clone())],
+        };
+    }
+    if segments.len() >= 3 && method == "POST" && segments[1] == "objects" && segments[2] == "want"
+    {
+        return RouteMatch {
+            handler: Handler::ObjectsWant,
+            params: vec![("repo".to_string(), segments[0].clone())],
+        };
+    }
+    if segments.len() >= 3 && method == "POST" && segments[1] == "objects" && segments[2] == "have"
+    {
+        return RouteMatch {
+            handler: Handler::ObjectsHave,
+            params: vec![("repo".to_string(), segments[0].clone())],
+        };
+    }
+    if segments.len() >= 3 && method == "POST" && segments[1] == "refs" && segments[2] == "update" {
+        return RouteMatch {
+            handler: Handler::RefsUpdate,
+            params: vec![("repo".to_string(), segments[0].clone())],
         };
     }
 
-    let segments = split_path(path);
+    // ── REST API endpoints ───────────────────────────────────────
+    // These are all GET-only.
 
     // /api/repos
-    if segments == ["api", "repos"] {
+    if method == "GET" && segments == ["api", "repos"] {
         return RouteMatch {
             handler: Handler::RepoList,
             params: vec![],
@@ -39,7 +74,7 @@ pub fn route(method: &str, path: &str) -> RouteMatch {
     }
 
     // /api/repos/:owner/:name
-    if segments.len() >= 4 && segments[0] == "api" && segments[1] == "repos" {
+    if method == "GET" && segments.len() >= 4 && segments[0] == "api" && segments[1] == "repos" {
         let owner = segments[2].clone();
         let name = segments[3].clone();
 
@@ -124,7 +159,7 @@ pub fn route(method: &str, path: &str) -> RouteMatch {
         }
     }
 
-    // If it doesn't match an API route, try serving a static file.
+    // If it doesn't match anything, try serving a static file.
     RouteMatch {
         handler: Handler::StaticFile,
         params: vec![("path".to_string(), path.to_string())],
@@ -154,6 +189,13 @@ pub fn query_params(query: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
+pub fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
 fn url_decode(s: &str) -> std::result::Result<String, ()> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -175,7 +217,7 @@ fn url_decode(s: &str) -> std::result::Result<String, ()> {
     String::from_utf8(out).map_err(|_| ())
 }
 
-fn hex_nibble(b: u8) -> std::result::Result<u8, ()> {
+const fn hex_nibble(b: u8) -> std::result::Result<u8, ()> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
@@ -184,16 +226,35 @@ fn hex_nibble(b: u8) -> std::result::Result<u8, ()> {
     }
 }
 
-pub fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    params
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_wire_info_refs() {
+        let m = route("GET", "/myrepo/info/refs");
+        assert_eq!(m.handler, Handler::InfoRefs);
+        assert_eq!(get_param(&m.params, "repo"), Some("myrepo"));
+    }
+
+    #[test]
+    fn route_wire_objects_want() {
+        let m = route("POST", "/myrepo/objects/want");
+        assert_eq!(m.handler, Handler::ObjectsWant);
+        assert_eq!(get_param(&m.params, "repo"), Some("myrepo"));
+    }
+
+    #[test]
+    fn route_wire_objects_have() {
+        let m = route("POST", "/myrepo/objects/have");
+        assert_eq!(m.handler, Handler::ObjectsHave);
+    }
+
+    #[test]
+    fn route_wire_refs_update() {
+        let m = route("POST", "/myrepo/refs/update");
+        assert_eq!(m.handler, Handler::RefsUpdate);
+    }
 
     #[test]
     fn route_repo_list() {
@@ -259,9 +320,10 @@ mod tests {
     }
 
     #[test]
-    fn route_non_get_returns_not_found() {
+    fn route_non_get_returns_static() {
+        // Non-GET to API routes no longer returns NotFound — it falls through to StaticFile
         let m = route("POST", "/api/repos/alice/myrepo");
-        assert_eq!(m.handler, Handler::NotFound);
+        assert_eq!(m.handler, Handler::StaticFile);
     }
 
     #[test]

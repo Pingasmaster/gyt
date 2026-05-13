@@ -21,6 +21,8 @@ gyt/
 ├── src/
 │   ├── main.rs              # Entry point, dispatches to cli
 │   ├── cli.rs               # Command-line parsing and dispatch
+│   ├── merge3.rs            # Three-way merge engine (line + tree level)
+│   ├── reflog.rs            # Append-only ref-movement log
 │   ├── cmd/                 # Command implementations
 │   │   ├── mod.rs           # Module declarations
 │   │   ├── init.rs          # gyt init
@@ -38,8 +40,9 @@ gyt/
 │   │   ├── rm.rs            # Remove files from index
 │   │   ├── tag.rs           # Create tags
 │   │   ├── cherry_pick.rs   # Apply a commit's changes
-│   │   ├── rebase.rs        # Fast-forward rebase
-│   │   ├── merge.rs         # Fast-forward merge only
+│   │   ├── rebase.rs        # Replay commits onto upstream (three-way)
+│   │   ├── merge.rs         # Real three-way merge with conflict markers
+│   │   ├── reflog_cmd.rs    # `gyt reflog`
 │   │   ├── pull.rs          # Fetch + merge
 │   │   ├── push.rs          # Push to remote
 │   │   ├── clone.rs         # Clone from remote
@@ -69,6 +72,7 @@ gyt/
 │   │   ├── server.rs        # Production HTTP server
 │   │   ├── server_stub.rs   # Test-only in-memory server
 │   │   ├── api.rs           # JSON DTOs (hand-rolled)
+│   │   ├── refs_policy.rs   # FF + signature enforcement on refs/update
 │   │   └── transport_tests.rs  # Client/server integration tests
 │   ├── object/              # Object store
 │   │   ├── mod.rs           # Object types and enum
@@ -145,7 +149,7 @@ Each object is stored as `"<kind> <size>\0<payload>"` where:
 - `<kind>` is one of: `blob`, `tree`, `commit`, `tag`
 - `<size>` is the uncompressed payload byte count
 - `\0` is a NUL separator
-- on disk, the whole `<kind> <size>\0<payload>` framing is wrapped with an XZ/LZMA stream behind a 5-byte magic+flag header; files without the magic prefix are read as raw (legacy fallback)
+- on disk, the whole `<kind> <size>\0<payload>` framing is wrapped with an XZ/LZMA stream behind a 5-byte header: 4-byte magic (`67 79 74 01`) + 1-byte flag (bit 0 = xz). Files without the magic prefix are read as raw bytes (legacy fallback)
 
 The filename is the BLAKE3 hash of the raw (uncompressed) payload, split into a 2-character prefix directory and the remaining suffix.
 

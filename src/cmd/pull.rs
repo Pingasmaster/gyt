@@ -17,7 +17,7 @@ pub fn run(args: &[String]) -> Result<()> {
     run_in(&repo, args)
 }
 
-pub(crate) fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut remote: Option<String> = None;
     let mut insecure = false;
     for a in args {
@@ -114,6 +114,7 @@ mod tests {
             committer: "A <a@x> 1 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "c1\n".into(),
         });
         let (c1_id, c1_disk) = mk_obj(ObjectKind::Commit, &c1);
@@ -154,6 +155,7 @@ mod tests {
             committer: "A <a@x> 2 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "c2\n".into(),
         });
         let (c2_id, c2_disk) = mk_obj(ObjectKind::Commit, &c2);
@@ -178,6 +180,29 @@ mod tests {
         assert_eq!(on_disk, b"b\n");
 
         server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_no_remote_configured_errors() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-pull-no-remote");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            remotes: Default::default(),
+            create_default_gytignore: false,
+            sign_required: false,
+        };
+        cfg.write(&repo.gyt_dir).unwrap();
+        let err = run_in(&repo, &[]).unwrap_err();
+        // Should fail because no remote "origin" is configured
+        assert!(
+            err.to_string().contains("origin"),
+            "expected origin error, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

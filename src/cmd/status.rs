@@ -15,7 +15,9 @@ pub fn run(args: &[String]) -> Result<()> {
     for a in args {
         match a.as_str() {
             "--help" | "-h" => {
-                println!("gyt status [--short|--porcelain]\n\nShow staged, modified, and untracked changes.");
+                println!(
+                    "gyt status [--short|--porcelain]\n\nShow staged, modified, and untracked changes."
+                );
                 return Ok(());
             }
             "--short" | "--porcelain" => short = true,
@@ -57,7 +59,7 @@ pub fn run(args: &[String]) -> Result<()> {
         index_map.insert(e.path.clone(), (e.mode, e.hash));
     }
 
-    let mut staged: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut staged: Vec<(PathBuf, String)> = Vec::new();
     let mut modified: Vec<PathBuf> = Vec::new();
     let mut untracked: Vec<PathBuf> = Vec::new();
     let mut staged_set: BTreeSet<PathBuf> = BTreeSet::new();
@@ -86,9 +88,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 let wd_vs_idx = wd_hash != idx_hash;
                 if idx_vs_head {
                     let label = if head_hash.is_none() {
-                        "new file"
+                        "new file".to_string()
                     } else {
-                        "modified"
+                        "modified".to_string()
                     };
                     staged.push((ent.path.clone(), label));
                     staged_set.insert(ent.path.clone());
@@ -119,24 +121,100 @@ pub fn run(args: &[String]) -> Result<()> {
             modified.push(p.clone());
             modified_set.insert(p);
         } else if !in_index && in_head {
-            staged.push((p.clone(), "deleted"));
+            staged.push((p.clone(), "deleted".to_string()));
             staged_set.insert(p);
         } else if in_index && !in_head {
-            staged.push((p.clone(), "new file"));
+            staged.push((p.clone(), "new file".to_string()));
             staged_set.insert(p.clone());
             modified.push(p.clone());
             modified_set.insert(p);
         }
-
     }
 
+    // Rename detection: turn a (deleted X, new-file Y) pair with matching
+    // content hash into a single "renamed: X -> Y" entry. The deleted path
+    // is dropped from the staged list (and any associated sets) once a
+    // partner is found. We pair greedily by traversal order.
+    detect_renames(&mut staged, &mut staged_set, &mut modified, &mut modified_set, &head_map, &index_map);
+
     if short {
-        print_short_status(&staged_set, &modified_set, &untracked);
+        print_short_status(&staged, &untracked);
     } else {
         let use_color = term::use_color();
         print_status(&staged, &modified, &untracked, use_color);
     }
     Ok(())
+}
+
+fn detect_renames(
+    staged: &mut Vec<(PathBuf, String)>,
+    staged_set: &mut BTreeSet<PathBuf>,
+    modified: &mut Vec<PathBuf>,
+    modified_set: &mut BTreeSet<PathBuf>,
+    head_map: &BTreeMap<PathBuf, (u32, ObjectId)>,
+    index_map: &BTreeMap<PathBuf, (u32, ObjectId)>,
+) {
+    use std::collections::HashMap;
+    // Build hash -> deleted-path list, and hash -> new-file path list.
+    let mut deleted_by_hash: HashMap<ObjectId, Vec<PathBuf>> = HashMap::new();
+    let mut new_by_hash: HashMap<ObjectId, Vec<PathBuf>> = HashMap::new();
+    for (path, label) in staged.iter() {
+        match label.as_str() {
+            "deleted" => {
+                if let Some((_, h)) = head_map.get(path) {
+                    deleted_by_hash.entry(*h).or_default().push(path.clone());
+                }
+            }
+            "new file" => {
+                if let Some((_, h)) = index_map.get(path) {
+                    new_by_hash.entry(*h).or_default().push(path.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    // Walk hashes shared by both maps; pair them off.
+    let mut rename_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (hash, dels) in &mut deleted_by_hash {
+        let Some(news) = new_by_hash.get_mut(hash) else {
+            continue;
+        };
+        let pairs = dels.len().min(news.len());
+        for _ in 0..pairs {
+            let from = dels.remove(0);
+            let to = news.remove(0);
+            rename_pairs.push((from, to));
+        }
+    }
+    if rename_pairs.is_empty() {
+        return;
+    }
+    // Drop the "deleted" entries that got paired; rewrite the "new file"
+    // entries into "renamed: from -> to" entries.
+    let mut paired_deletes: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut rename_for_new: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for (from, to) in &rename_pairs {
+        paired_deletes.insert(from.clone());
+        rename_for_new.insert(to.clone(), from.clone());
+    }
+    let mut out: Vec<(PathBuf, String)> = Vec::with_capacity(staged.len());
+    for (path, label) in staged.drain(..) {
+        if label == "deleted" && paired_deletes.contains(&path) {
+            staged_set.remove(&path);
+            continue;
+        }
+        if label == "new file"
+            && let Some(from) = rename_for_new.get(&path)
+        {
+            let new_label = format!("renamed: {} -> {}", forward_slash(from), forward_slash(&path));
+            out.push((path.clone(), new_label));
+            modified.retain(|p| p != &path);
+            modified_set.remove(&path);
+            continue;
+        }
+        out.push((path, label));
+    }
+    *staged = out;
 }
 
 fn forward_slash(p: &Path) -> String {
@@ -154,17 +232,22 @@ fn forward_slash(p: &Path) -> String {
 }
 
 fn print_status(
-    staged: &[(PathBuf, &'static str)],
+    staged: &[(PathBuf, String)],
     modified: &[PathBuf],
     untracked: &[PathBuf],
     use_color: bool,
 ) {
     if !staged.is_empty() {
         println!("Staged for commit:");
-        let mut sorted: Vec<&(PathBuf, &'static str)> = staged.iter().collect();
+        let mut sorted: Vec<&(PathBuf, String)> = staged.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         for (p, label) in sorted {
-            let line = format!("  {label}: {}", forward_slash(p));
+            // Renamed labels already include source and target; print as-is.
+            let line = if label.starts_with("renamed:") {
+                format!("  {label}")
+            } else {
+                format!("  {label}: {}", forward_slash(p))
+            };
             println!("{}", term::paint_when(use_color, term::GREEN, &line));
         }
         println!();
@@ -195,39 +278,40 @@ fn print_status(
     }
 }
 
-fn print_short_status(
-    staged: &BTreeSet<PathBuf>,
-    modified: &BTreeSet<PathBuf>,
-    untracked: &[PathBuf],
-) {
-    let mut all: BTreeSet<PathBuf> = BTreeSet::new();
-    for k in staged {
-        all.insert(k.clone());
-    }
-    for k in modified {
-        all.insert(k.clone());
-    }
-    for p in untracked {
-        all.insert(p.clone());
-    }
-
-    // Use a stable sorted iteration for reproducible output.
-    let sorted: Vec<&PathBuf> = all.iter().collect();
-    // sorted is already in BTree order (alphabetical)
-
-    let seen_untracked: BTreeSet<&PathBuf> = untracked.iter().collect();
-
-    for p in &sorted {
-        let x = if staged.contains(*p) { 'M' } else { ' ' };
-        let y = if modified.contains(*p) { 'M' } else { ' ' };
-        let line = format!("{x}{y} {}", forward_slash(p));
-        if seen_untracked.contains(p) {
-            println!("?? {}", forward_slash(p));
-        } else {
-            println!("{line}");
+fn print_short_status(staged: &[(PathBuf, String)], untracked: &[PathBuf]) {
+    use std::collections::BTreeMap as Map;
+    // We need a single line per path showing the staged status code.
+    // Codes: 'A' new, 'M' modified, 'D' deleted, 'R' renamed.
+    let mut codes: Map<PathBuf, char> = Map::new();
+    let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (path, label) in staged {
+        if label == "deleted" {
+            codes.insert(path.clone(), 'D');
+        } else if label == "modified" {
+            codes.insert(path.clone(), 'M');
+        } else if label == "new file" {
+            codes.insert(path.clone(), 'A');
+        } else if let Some(rest) = label.strip_prefix("renamed: ") {
+            // "renamed: from -> to"
+            if let Some((from, to)) = rest.split_once(" -> ") {
+                renames.push((PathBuf::from(from), PathBuf::from(to)));
+            }
+            codes.insert(path.clone(), 'R');
         }
     }
-    if sorted.is_empty() {
+    for (path, code) in &codes {
+        if *code == 'R'
+            && let Some((from, to)) = renames.iter().find(|(_, t)| t == path)
+        {
+            println!("R  {} -> {}", forward_slash(from), forward_slash(to));
+            continue;
+        }
+        println!("{}  {}", code, forward_slash(path));
+    }
+    for p in untracked {
+        println!("?? {}", forward_slash(p));
+    }
+    if codes.is_empty() && untracked.is_empty() {
         println!("clean");
     }
 }

@@ -17,47 +17,92 @@ use crate::net::api::{
     self, BlobInfo, CommitInfo, DiffFileInfo, DiffHunkInfo, DiffLine, RefInfo, RepoInfo,
     TreeEntryInfo,
 };
+use crate::net::refs_policy;
 use crate::net::router::{self, Handler};
 use crate::object::{commit, tree};
 use crate::refs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+
+/// Hard cap on request body size. Anything over this is refused before
+/// the server tries to allocate a buffer for it.
+const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum number of concurrent connection workers.
+const MAX_WORKERS: usize = 64;
 
 pub struct ServeConfig {
     pub listen_addr: String,
     pub repos_root: PathBuf,
     pub webroot: PathBuf,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub auth_token: Option<String>,
 }
 
 struct Request {
     method: String,
     target: String,
     body: Vec<u8>,
+    auth_header: Option<String>,
 }
 
 pub fn serve(config: &ServeConfig) -> Result<()> {
     let listener = TcpListener::bind(&config.listen_addr)?;
     let addr = listener.local_addr()?;
-    eprintln!("gyt serve: listening on http://{addr}");
+
+    let tls_config = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => Some(crate::net::tls::server_config(cert, key)?),
+        (None, None) => None,
+        _ => {
+            return Err(crate::errors::GytError::InvalidArgument(
+                "--cert and --key must be provided together".into(),
+            ));
+        }
+    };
+
+    if tls_config.is_some() {
+        eprintln!("gyt serve: listening on https://{addr}");
+    } else {
+        eprintln!("gyt serve: listening on http://{addr}");
+    }
 
     let state = Arc::new(ServerState {
         repos_root: config.repos_root.clone(),
         webroot: config.webroot.clone(),
+        auth_token: config.auth_token.clone(),
         shutdown: Mutex::new(false),
     });
+    let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
 
     for stream in listener.incoming() {
         let st = state.clone();
+        let tls = tls_config.clone();
         if *state.shutdown.lock().unwrap() {
             break;
         }
         match stream {
             Ok(s) => {
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+                let permit = workers.clone().acquire();
                 thread::spawn(move || {
-                    let _ = handle_conn(s, &st);
+                    let _hold = permit;
+                    if let Some(cfg) = &tls {
+                        match crate::net::tls::accept_tls(s, cfg) {
+                            Ok(tls_stream) => {
+                                let _ = handle_tls_conn(tls_stream, &st);
+                            }
+                            Err(e) => {
+                                eprintln!("gyt serve: tls accept error: {e}");
+                            }
+                        }
+                    } else {
+                        let _ = handle_conn(s, &st);
+                    }
                 });
             }
             Err(_) => break,
@@ -69,12 +114,57 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
 struct ServerState {
     repos_root: PathBuf,
     webroot: PathBuf,
+    auth_token: Option<String>,
     shutdown: Mutex<bool>,
 }
 
+/// Bounded-concurrency limiter. Each accepted connection acquires a permit
+/// that is released when its handler thread exits. Connections beyond the
+/// cap block in `accept` until a permit frees up.
+struct WorkerLimiter {
+    inner: Mutex<usize>,
+    cv: Condvar,
+    cap: usize,
+}
+
+impl WorkerLimiter {
+    const fn new(cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(0),
+            cv: Condvar::new(),
+            cap,
+        }
+    }
+
+    fn acquire(self: Arc<Self>) -> WorkerPermit {
+        let mut n = self.inner.lock().unwrap();
+        while *n >= self.cap {
+            n = self.cv.wait(n).unwrap();
+        }
+        *n += 1;
+        drop(n);
+        WorkerPermit {
+            limiter: self.clone(),
+        }
+    }
+}
+
+struct WorkerPermit {
+    limiter: Arc<WorkerLimiter>,
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        {
+            let mut n = self.limiter.inner.lock().unwrap();
+            *n = n.saturating_sub(1);
+        }
+        self.limiter.cv.notify_one();
+    }
+}
+
 fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
     let req = match read_request(&mut reader) {
@@ -91,6 +181,20 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
         }
     };
 
+    // Token authentication check
+    if let Some(ref token) = state.auth_token
+        && !check_auth(&req, token)
+    {
+        write_response(
+            &mut writer,
+            401,
+            "Unauthorized",
+            "text/plain",
+            b"unauthorized\n",
+        )?;
+        return Ok(());
+    }
+
     let (path, query) = match req.target.find('?') {
         Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
         None => (req.target.as_str(), None),
@@ -99,18 +203,93 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
 
-    let (status, reason, body, ctype) = dispatch(route, &params, &req.body, state);
+    let (status, reason, body, ctype) = dispatch(&route, &params, query, &req.body, state);
 
     write_response(&mut writer, status, &reason, &ctype, &body)
 }
 
+/// Handle a TLS-wrapped connection.
+fn handle_tls_conn(
+    mut stream: crate::net::tls::ServerTlsStream,
+    state: &ServerState,
+) -> std::io::Result<()> {
+    // Read request using a BufReader that borrows the stream mutably.
+    // We drop the reader after read_request returns, so we can write
+    // back through the same stream.
+    let req = {
+        let mut reader = std::io::BufReader::new(&mut stream);
+        match read_request(&mut reader) {
+            Ok(r) => r,
+            Err(e) => {
+                drop(reader);
+                write_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    e.to_string().as_bytes(),
+                )?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Token authentication check
+    if let Some(ref token) = state.auth_token
+        && !check_auth(&req, token)
+    {
+        write_response(
+            &mut stream,
+            401,
+            "Unauthorized",
+            "text/plain",
+            b"unauthorized\n",
+        )?;
+        return Ok(());
+    }
+
+    let (path, query) = match req.target.find('?') {
+        Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
+        None => (req.target.as_str(), None),
+    };
+
+    let params = router::query_params(query);
+    let route = router::route(&req.method, path);
+
+    let (status, reason, body, ctype) = dispatch(&route, &params, query, &req.body, state);
+
+    write_response(&mut stream, status, &reason, &ctype, &body)
+}
+
+/// Check the request's Authorization header against the expected bearer token.
+fn check_auth(req: &Request, expected_token: &str) -> bool {
+    match &req.auth_header {
+        Some(val) => {
+            // Expect "Bearer <token>"
+            if let Some(token) = val.strip_prefix("Bearer ") {
+                token == expected_token
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
 fn dispatch(
-    route: router::RouteMatch,
+    route: &router::RouteMatch,
     params: &[(String, String)],
-    _body: &[u8],
+    raw_query: Option<&str>,
+    body: &[u8],
     state: &ServerState,
 ) -> (u16, String, Vec<u8>, String) {
     match route.handler {
+        // Wire protocol handlers use route.params (repo from URL path), not query params
+        Handler::InfoRefs => wire_info_refs(state, &route.params),
+        Handler::ObjectsWant => wire_objects_want(state, &route.params, body),
+        Handler::ObjectsHave => wire_objects_have(state, &route.params, body),
+        Handler::RefsUpdate => wire_refs_update(state, &route.params, raw_query, body),
+        // REST API handlers use query params
         Handler::RepoList => repo_list(state, params),
         Handler::RepoInfo => repo_info(state, params),
         Handler::CommitList => commit_list(state, params),
@@ -186,6 +365,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         .to_string();
 
     let mut content_length: usize = 0;
+    let mut auth_header: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -195,6 +375,16 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("authorization")
+        {
+            auth_header = Some(v.trim().to_string());
+        }
+    }
+    if content_length > MAX_BODY_BYTES {
+        return Err(std::io::Error::other(format!(
+            "request body too large: {content_length} bytes (max {MAX_BODY_BYTES})"
+        )));
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
@@ -204,6 +394,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         method,
         target,
         body,
+        auth_header,
     })
 }
 
@@ -877,6 +1068,223 @@ fn guess_content_type(path: &str) -> String {
     .into()
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Wire protocol handlers (gyt-protocol v1)
+// Used by gyt clone, fetch, push against this server.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Extract a repo path from wire protocol params: repos_root / {repo_name}
+fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std::path::PathBuf> {
+    let repo = router::get_param(params, "repo")?;
+    let p = state.repos_root.join(repo);
+    if p.join(".gyt").is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// GET /{repo}/info/refs - list all refs as tab-separated text
+fn wire_info_refs(
+    state: &ServerState,
+    params: &[(String, String)],
+) -> (u16, String, Vec<u8>, String) {
+    let dir = match wire_repo_dir(state, params) {
+        Some(d) => d.join(".gyt"),
+        None => {
+            return (
+                404,
+                "Not Found".into(),
+                b"repo not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+    };
+    let Ok(refs) = crate::refs::list_refs(&dir, "refs") else {
+        return (
+            500,
+            "Internal Error".into(),
+            b"failed to list refs".to_vec(),
+            "text/plain".into(),
+        );
+    };
+    let mut body = Vec::new();
+    for (name, oid) in &refs {
+        writeln!(body, "{oid}\t{name}").ok();
+    }
+    (200, "OK".into(), body, "text/plain".into())
+}
+
+/// POST /{repo}/objects/want - given list of object IDs, return the compressed objects
+fn wire_objects_want(
+    state: &ServerState,
+    params: &[(String, String)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>, String) {
+    let gyt_dir = match wire_repo_dir(state, params) {
+        Some(d) => d.join(".gyt"),
+        None => {
+            return (
+                404,
+                "Not Found".into(),
+                b"repo not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+    };
+    // Body is newline-separated object IDs (hex)
+    let ids: Vec<String> = String::from_utf8_lossy(body)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Read each object, reconstruct on-disk bytes, then packfile them
+    let mut entries = Vec::new();
+    for id_str in &ids {
+        let Ok(id) = ObjectId::from_hex(id_str) else {
+            continue;
+        };
+        let Ok(obj) = crate::object::store::read(&gyt_dir, &id) else {
+            continue;
+        };
+        let raw = crate::object::store::build_raw(obj.kind, &obj.payload);
+        let on_disk = crate::compress::encode(&raw);
+        entries.push(crate::net::protocol::PackEntry {
+            id,
+            bytes: on_disk,
+        });
+    }
+    let out = crate::net::protocol::encode_packfile(&entries);
+    (200, "OK".into(), out, "application/octet-stream".into())
+}
+
+/// POST /{repo}/objects/have - receive objects from client, store them
+/// Body is pack format (see `encode_pack` in protocol.rs):
+///   [u32 LE len][on-disk compressed bytes]...
+fn wire_objects_have(
+    state: &ServerState,
+    params: &[(String, String)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>, String) {
+    let gyt_dir = match wire_repo_dir(state, params) {
+        Some(d) => d.join(".gyt"),
+        None => {
+            return (
+                404,
+                "Not Found".into(),
+                b"repo not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+    };
+    // Parse body as packfile format
+    let entries = match crate::net::protocol::parse_packfile(body) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request".into(),
+                format!("invalid pack: {e}").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
+    let mut n_stored = 0u32;
+    let mut n_skipped = 0u32;
+    for entry in &entries {
+        // Decompress on-disk bytes to get raw: "<kind> <size>\0<payload>"
+        let Ok(raw) = crate::compress::decode(&entry.bytes) else {
+            n_skipped += 1;
+            continue;
+        };
+        let Ok((kind, payload)) = crate::object::store::parse_raw(&raw) else {
+            n_skipped += 1;
+            continue;
+        };
+        match crate::object::store::write_bytes(&gyt_dir, kind, &payload) {
+            Ok(_) => n_stored += 1,
+            Err(_) => n_skipped += 1,
+        }
+    }
+    let body = format!("stored={n_stored} skipped={n_skipped}");
+    (200, "OK".into(), body.into_bytes(), "text/plain".into())
+}
+
+/// POST /{repo}/refs/update - update refs on the server
+/// Body is tab-separated "OLD_HEX\tNEW_HEX\tREFNAME\n" entries.
+/// Enforces fast-forward (unless `?force=1`) and, when the repo config has
+/// `sign_required = true`, verifies every new commit against the allowed
+/// signers listed in `.gyt/allowed_signers`. Audit lines are appended to
+/// `.gyt/audit.log` for successful updates.
+fn wire_refs_update(
+    state: &ServerState,
+    params: &[(String, String)],
+    raw_query: Option<&str>,
+    body: &[u8],
+) -> (u16, String, Vec<u8>, String) {
+    let gyt_dir = match wire_repo_dir(state, params) {
+        Some(d) => d.join(".gyt"),
+        None => {
+            return (
+                404,
+                "Not Found".into(),
+                b"repo not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+    };
+    let updates = match crate::net::protocol::parse_ref_updates(body) {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request".into(),
+                format!("invalid ref updates: {e}").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
+
+    let force = raw_query
+        .is_some_and(|q| q.split('&').any(|p| p == "force=1"));
+
+    let (sign_required, allowed) = refs_policy::server_policy(&gyt_dir);
+    let eval = refs_policy::evaluate(&gyt_dir, &updates, force, sign_required, &allowed);
+    if !eval.is_clean() {
+        let mut msg = String::new();
+        for (refname, err) in &eval.blocked {
+            msg.push_str(&format!("{refname}: {}\n", err.user_message()));
+        }
+        return (409, "Conflict".into(), msg.into_bytes(), "text/plain".into());
+    }
+
+    let mut n_updated = 0u32;
+    let mut n_failed = 0u32;
+    for update in &updates {
+        let ref_path = gyt_dir.join(&update.name);
+        if let Some(parent) = ref_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&ref_path, format!("{}\n", update.new).as_bytes()) {
+            Ok(()) => {
+                n_updated += 1;
+                refs_policy::append_audit(&gyt_dir, update, None);
+                crate::reflog::record(
+                    &gyt_dir,
+                    &update.name,
+                    update.old.as_ref(),
+                    &update.new,
+                    "remote",
+                    "wire: refs/update",
+                );
+            }
+            Err(_) => n_failed += 1,
+        }
+    }
+    let body = format!("updated={n_updated} failed={n_failed}");
+    (200, "OK".into(), body.into_bytes(), "text/plain".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,6 +1346,7 @@ mod tests {
         Arc::new(ServerState {
             repos_root: repos_root.to_path_buf(),
             webroot: webroot.to_path_buf(),
+            auth_token: None,
             shutdown: Mutex::new(false),
         })
     }

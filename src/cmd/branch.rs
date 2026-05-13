@@ -57,7 +57,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 }
 
 /// Validate a branch name: only [A-Za-z0-9_./-], not "HEAD" or "..".
-pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
+pub fn validate_branch_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(GytError::InvalidArgument(
             "branch name must not be empty".into(),
@@ -84,7 +84,7 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn current_branch(gyt_dir: &Path) -> Result<Option<String>> {
+pub fn current_branch(gyt_dir: &Path) -> Result<Option<String>> {
     let head = refs::read_head(gyt_dir)?;
     match head {
         Head::Symbolic(name) => Ok(name.strip_prefix("refs/heads/").map(String::from)),
@@ -244,11 +244,7 @@ mod tests {
         run_in(&repo, &["unmerged".into()]).unwrap();
 
         // Switch to the new branch and advance it with a new commit
-        refs::write_head(
-            &repo.gyt_dir,
-            &Head::Symbolic("refs/heads/unmerged".into()),
-        )
-        .unwrap();
+        refs::write_head(&repo.gyt_dir, &Head::Symbolic("refs/heads/unmerged".into())).unwrap();
         r.commit_next(&[("new.txt", b"content\n", false)]);
 
         // Switch back to main
@@ -259,9 +255,7 @@ mod tests {
         let err = run_in(&repo, &["-d".into(), "unmerged".into()]);
         assert!(err.is_err(), "expected error deleting unmerged branch");
         assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("not fully merged"),
+            err.unwrap_err().to_string().contains("not fully merged"),
             "error should mention merge safety"
         );
 

@@ -12,9 +12,9 @@ use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
 use crate::index::{Index, IndexEntry};
 use crate::object::commit as commit_obj;
-use crate::object::tree::{self, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
 #[cfg(test)]
 use crate::object::tree::TreeEntry;
+use crate::object::tree::{self, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
 use crate::refs::{self, Head};
 use crate::repo::{GYT_DIR, Repo};
 use std::path::{Path, PathBuf};
@@ -92,9 +92,7 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     }
 
     // Determine the target branch and its commit id.
-    let branch_name: String;
-    let branch_commit: ObjectId;
-    if let Some(new) = new_branch.clone() {
+    let (branch_name, branch_commit): (String, ObjectId) = if let Some(new) = new_branch.clone() {
         // Create new branch at base-rev (or HEAD).
         let base_rev = positional.get(1).cloned();
         let base_id = match base_rev {
@@ -111,8 +109,7 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
             return Err(GytError::Refs(format!("branch {new} already exists")));
         }
         refs::write_ref(&repo.gyt_dir, &full_ref, &base_id)?;
-        branch_name = new;
-        branch_commit = base_id;
+        (new, base_id)
     } else {
         // No -b: the second positional must be an existing branch name.
         let name = positional.get(1).cloned().ok_or_else(|| {
@@ -124,9 +121,8 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
         let id = refs::read_ref(&repo.gyt_dir, &full_ref).map_err(|_| {
             GytError::InvalidArgument(format!("worktree add: branch {name} does not exist"))
         })?;
-        branch_name = name;
-        branch_commit = id;
-    }
+        (name, id)
+    };
 
     // Create the worktree directory.
     std::fs::create_dir_all(&path)?;
@@ -142,6 +138,15 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     if wt_dir.exists() {
         return Err(GytError::InvalidArgument(format!(
             "worktree add: {wt_name} already registered"
+        )));
+    }
+
+    // Prevent the same branch from being checked out in two worktrees at
+    // once. This guards against confusing situations where a `gyt commit`
+    // in one tree silently advances HEAD in another.
+    if let Some(holder) = branch_already_checked_out(&repo.gyt_dir, &branch_name)? {
+        return Err(GytError::InvalidArgument(format!(
+            "worktree add: branch {branch_name} is already checked out at {holder}"
         )));
     }
     std::fs::create_dir_all(&wt_dir)?;
@@ -184,6 +189,54 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Returns the path of any existing worktree whose HEAD points at the named
+/// branch. Walks both the main worktree (parent of `gyt_dir`) and every
+/// subdirectory under `<gyt>/worktrees/`. Returns Ok(None) if free.
+fn branch_already_checked_out(gyt_dir: &Path, branch_name: &str) -> Result<Option<String>> {
+    let target = format!("refs/heads/{branch_name}");
+
+    // Main worktree
+    let main_head = refs::read_head(gyt_dir).ok();
+    if let Some(Head::Symbolic(b)) = main_head
+        && b == target
+    {
+        let main_workdir = gyt_dir
+            .parent().map_or_else(|| "<main>".to_string(), |p| p.display().to_string());
+        return Ok(Some(main_workdir));
+    }
+
+    let wts_root = gyt_dir.join("worktrees");
+    if !wts_root.is_dir() {
+        return Ok(None);
+    }
+    for entry in std::fs::read_dir(&wts_root)? {
+        let entry = entry?;
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let wt_dir = entry.path();
+        let head = match refs::read_head(&wt_dir) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if let Head::Symbolic(b) = head
+            && b == target
+        {
+            let gytdir_marker = std::fs::read_to_string(wt_dir.join("gytdir"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .and_then(|s| {
+                    PathBuf::from(s)
+                        .parent()
+                        .map(|p| p.display().to_string())
+                })
+                .unwrap_or_else(|| wt_dir.display().to_string());
+            return Ok(Some(gytdir_marker));
+        }
+    }
+    Ok(None)
+}
+
 // -----------------------------------------------------------------------------
 // list
 // -----------------------------------------------------------------------------
@@ -207,9 +260,7 @@ fn do_list_at(cwd: &Path) -> Result<()> {
 
     // Main worktree info.
     let main_workdir = main_gyt
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| workdir.clone());
+        .parent().map_or_else(|| workdir.clone(), Path::to_path_buf);
     print_worktree_line(&main_workdir, &main_gyt)?;
 
     // Aux worktrees in <main_gyt>/worktrees/<name>/.
@@ -217,7 +268,7 @@ fn do_list_at(cwd: &Path) -> Result<()> {
     if wts_dir.is_dir() {
         let mut names: Vec<String> = std::fs::read_dir(&wts_dir)?
             .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
@@ -246,9 +297,7 @@ fn print_worktree_line(workdir: &Path, gyt_dir_for_head: &Path) -> Result<()> {
         Head::Symbolic(name) => {
             let id = refs::read_ref(&main_gyt, name).ok();
             let short = id
-                .as_ref()
-                .map(short_hex)
-                .unwrap_or_else(|| "0000000".to_string());
+                .as_ref().map_or_else(|| "0000000".to_string(), short_hex);
             (
                 name.strip_prefix("refs/heads/").unwrap_or(name).to_string(),
                 short,
@@ -324,7 +373,9 @@ fn resolve_worktree(main_gyt: &Path, target: &str) -> Result<(PathBuf, PathBuf)>
             continue;
         };
         // Collapsed via stable let-chains (edition 2024).
-        if let Some(cabs) = &candidate_abs && aux == *cabs {
+        if let Some(cabs) = &candidate_abs
+            && aux == *cabs
+        {
             return Ok((wt_dir, aux));
         }
         if aux.file_name().map(|s| s.to_string_lossy().into_owned()) == Some(target.to_string()) {
@@ -453,7 +504,9 @@ fn short_hex(id: &ObjectId) -> String {
 fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
     // Accept: full hex, or branch/tag name (refs/heads/<x>, refs/tags/<x>).
     // Collapsed via stable let-chains (edition 2024).
-    if rev.len() == crate::hash::HEX_LEN && let Ok(id) = ObjectId::from_hex(rev) {
+    if rev.len() == crate::hash::HEX_LEN
+        && let Ok(id) = ObjectId::from_hex(rev)
+    {
         return Ok(id);
     }
     if let Ok(id) = refs::read_ref(&repo.gyt_dir, &format!("refs/heads/{rev}")) {
@@ -584,8 +637,6 @@ fn build_index_from_tree(gyt_dir: &Path, tree_id: &ObjectId, workdir: &Path) -> 
     Ok(idx)
 }
 
-
-
 // -----------------------------------------------------------------------------
 // tests
 // -----------------------------------------------------------------------------
@@ -605,8 +656,7 @@ mod tests {
             let pid = std::process::id();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.subsec_nanos());
             let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
             std::fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -638,6 +688,7 @@ mod tests {
             user_email: Some(email.into()),
             remotes: Default::default(),
             create_default_gytignore: false,
+            sign_required: false,
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }
@@ -671,6 +722,7 @@ mod tests {
                 committer: "A <a@x> 1 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "initial\n".into(),
             },
         )

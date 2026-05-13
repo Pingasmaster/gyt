@@ -15,6 +15,7 @@ pub enum GytError {
     NotFound(String),
     InvalidArgument(String),
     Unsupported(String),
+    Ci(String),
 }
 
 impl fmt::Display for GytError {
@@ -30,6 +31,7 @@ impl fmt::Display for GytError {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::InvalidArgument(s) => write!(f, "invalid argument: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::Ci(s) => write!(f, "ci: {s}"),
         }
     }
 }

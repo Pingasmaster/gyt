@@ -20,7 +20,7 @@ use crate::errors::{GytError, Result};
 use crate::fs_util;
 use crate::hash::ObjectId;
 use crate::net::protocol::{
-    PackEntry, RefEntry, RefUpdate, encode_pack, encode_ref_updates, pack_entry_from_bytes,
+    PackEntry, RefEntry, RefUpdate, encode_packfile, encode_ref_updates, pack_entry_from_bytes,
 };
 use crate::object::{ObjectKind, store, tag, tree};
 use crate::refs;
@@ -33,17 +33,19 @@ pub fn run(args: &[String]) -> Result<()> {
     run_in(&repo, args)
 }
 
-pub(crate) fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut remote: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut force = false;
     let mut insecure = false;
+    let mut push_all = false;
     for a in args {
         match a.as_str() {
             "--force" | "-f" => force = true,
             "--insecure" => insecure = true,
+            "--all" => push_all = true,
             "-h" | "--help" => {
-                println!("gyt push [<remote>] [<branch>] [--force] [--insecure]");
+                println!("gyt push [<remote>] [<branch>] [--force] [--insecure] [--all]");
                 return Ok(());
             }
             other if other.starts_with('-') => {
@@ -65,50 +67,80 @@ pub(crate) fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         }
     }
     let remote = remote.unwrap_or_else(|| "origin".to_string());
-    let branch = match branch {
-        Some(b) => b,
-        None => {
-            let (branch_ref, _) = current_branch_and_head(repo)?;
-            branch_ref
-                .ok_or_else(|| GytError::Repo("push: HEAD is detached".into()))?
-                .strip_prefix("refs/heads/")
-                .ok_or_else(|| GytError::Repo("push: HEAD is not on a local branch".into()))?
-                .to_string()
-        }
-    };
-
     let cfg = Config::load(repo)?;
     let url = cfg
         .remotes
         .get(&remote)
         .ok_or_else(|| GytError::InvalidArgument(format!("push: unknown remote {remote:?}")))?
         .clone();
+
+    let branches_to_push: Vec<String> = if push_all {
+        let heads_dir = repo.gyt_dir.join("refs/heads");
+        let mut bs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&heads_dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    bs.push(name.to_string());
+                }
+            }
+        }
+        if bs.is_empty() {
+            return Err(GytError::Repo("push: no local branches found".into()));
+        }
+        bs.sort();
+        bs
+    } else {
+        let b = match branch {
+            Some(b) => b,
+            None => {
+                let (branch_ref, _) = current_branch_and_head(repo)?;
+                branch_ref
+                    .ok_or_else(|| GytError::Repo("push: HEAD is detached".into()))?
+                    .strip_prefix("refs/heads/")
+                    .ok_or_else(|| GytError::Repo("push: HEAD is not on a local branch".into()))?
+                    .to_string()
+            }
+        };
+        vec![b]
+    };
+
     let client = open_client(&url, insecure)?;
-
-    // Resolve local branch tip.
-    let local_ref = format!("refs/heads/{branch}");
-    let local_tip = refs::read_ref(&repo.gyt_dir, &local_ref).map_err(|_| {
-        GytError::Refs(format!(
-            "push: local branch {branch} not found at {local_ref}"
-        ))
-    })?;
-
-    // Discover remote tip.
     let server_refs = fetch_info_refs(&client)?;
-    let remote_tip: Option<ObjectId> = server_refs
-        .iter()
-        .find(|r: &&RefEntry| r.name == local_ref)
-        .map(|r| r.id);
 
-    // Compute the upload closure: ancestors of local_tip stopping at remote_tip
-    // (and any objects already known to be on the server, conservatively
-    // approximated by the first-parent chain hitting remote_tip). v1 sends
-    // the FULL closure if remote_tip is None or not on the first-parent chain.
-    let entries = collect_upload_pack(repo, &local_tip, remote_tip.as_ref())?;
+    // Collect all objects to send and all ref updates.
+    let mut all_entries: Vec<PackEntry> = Vec::new();
+    let mut seen_ids: HashSet<ObjectId> = HashSet::new();
+    let mut updates: Vec<RefUpdate> = Vec::new();
 
-    // Send objects.
-    if !entries.is_empty() {
-        let body = encode_pack(&entries);
+    for branch_name in &branches_to_push {
+        let local_ref = format!("refs/heads/{branch_name}");
+        let Ok(local_tip) = refs::read_ref(&repo.gyt_dir, &local_ref) else {
+            eprintln!("push: branch {branch_name} not found, skipping");
+            continue;
+        };
+
+        let remote_tip: Option<ObjectId> = server_refs
+            .iter()
+            .find(|r: &&RefEntry| r.name == local_ref)
+            .map(|r| r.id);
+
+        let entries = collect_upload_pack(repo, &local_tip, remote_tip.as_ref())?;
+        for e in entries {
+            if seen_ids.insert(e.id) {
+                all_entries.push(e);
+            }
+        }
+
+        updates.push(RefUpdate {
+            old: remote_tip,
+            new: local_tip,
+            name: local_ref,
+        });
+    }
+
+    // Send all objects.
+    if !all_entries.is_empty() {
+        let body = encode_packfile(&all_entries);
         let resp = client.post("objects/have", &body, &[])?;
         if resp.status != 200 {
             return Err(GytError::Net(format!(
@@ -118,13 +150,8 @@ pub(crate) fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         }
     }
 
-    // Send ref-update.
-    let update = RefUpdate {
-        old: remote_tip,
-        new: local_tip,
-        name: local_ref.clone(),
-    };
-    let body = encode_ref_updates(&[update]);
+    // Send all ref-updates.
+    let body = encode_ref_updates(&updates);
     let suffix = if force {
         "refs/update?force=1"
     } else {
@@ -143,18 +170,20 @@ pub(crate) fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         )));
     }
 
-    let old_short = remote_tip
-        .map(|id| short(&id))
-        .unwrap_or_else(|| "(new)".to_string());
-    let new_short = short(&local_tip);
+    let branch_count = branches_to_push.len();
     println!(
-        "pushed {} objects, {local_ref}: {old_short}..{new_short}",
-        entries.len()
+        "pushed {} objects across {branch_count} branch(es)",
+        all_entries.len()
     );
+    for u in &updates {
+        let old_short = u.old.map_or_else(|| "(new)".to_string(), short);
+        let new_short = short(u.new);
+        println!("  {}: {old_short}..{new_short}", u.name);
+    }
     Ok(())
 }
 
-fn short(id: &ObjectId) -> String {
+fn short(id: ObjectId) -> String {
     let s = id.to_hex();
     s[..12].to_string()
 }
@@ -311,6 +340,7 @@ mod tests {
                 committer: "A <a@x> 1 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "init\n".into(),
             },
         )
@@ -363,6 +393,7 @@ mod tests {
             committer: "A <a@x> 1 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "c1\n".into(),
         });
         let c1_raw = crate::object::store::build_raw(ObjectKind::Commit, &c1_payload);
@@ -410,6 +441,7 @@ mod tests {
                 committer: "A <a@x> 1 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "c1\n".into(),
             },
         )
@@ -436,6 +468,7 @@ mod tests {
                 committer: "A <a@x> 2 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "c2\n".into(),
             },
         )
@@ -534,6 +567,7 @@ mod tests {
                 committer: "A <a@x> 1 +0000".into(),
                 ai_assists: vec![],
                 reviewers: vec![],
+                signature: None,
                 message: "c\n".into(),
             },
         )

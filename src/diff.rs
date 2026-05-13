@@ -1,9 +1,13 @@
-// Hand-rolled Myers' line-based diff. No external dependencies.
-//
-// Reference: https://blog.jcoglan.com/2017/02/12/the-myers-diff-algorithm-part-1/
-// We implement the basic O(ND) variant; the linear-space refinement is not
-// needed at this scale. Inputs are split on `\n`; a trailing line without a
-// newline is retained as its own line.
+//! Hand-rolled Myers' line-based diff. No external dependencies.
+//!
+//! Reference: https://blog.jcoglan.com/2017/02/12/the-myers-diff-algorithm-part-1/
+//! We implement the basic O(ND) variant; the linear-space refinement is not
+//! needed at this scale. Inputs are split on `\n`; a trailing line without a
+//! newline is retained as its own line.
+//!
+//! ## `diff --stat`
+//! The `render_stat` function provides a compact summary of changes per file:
+//! how many insertions and deletions, shown as a proportional bar.
 
 use crate::term;
 
@@ -77,7 +81,10 @@ pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
                 v[idx(k - 1)] + 1
             };
             let mut y = x - k;
-            // follow the diagonal (snake)
+            // Follow the diagonal (snake). The cast indices are non-negative
+            // by construction (we just initialized x ≥ 0 and y = x − k where
+            // both bounds are checked above), so a usize cast is safe.
+            #[allow(clippy::suspicious_operation_groupings)] // Reason: Myers' algorithm checks (x < n) && (y < m) with x = a-index, y = b-index — they are independent dimensions, not interchangeable.
             while x < n_i && y < m_i && a[x as usize] == b[y as usize] {
                 x += 1;
                 y += 1;
@@ -309,13 +316,12 @@ pub fn render_unified(
         out.push_str(&term::paint_when(use_color, term::BOLD, &head_a_line));
         out.push('\n');
         out.push_str(&term::paint_when(use_color, term::BOLD, &head_b_line));
-        out.push('\n');
     } else {
         out.push_str(&head_a_line);
         out.push('\n');
         out.push_str(&head_b_line);
-        out.push('\n');
     }
+    out.push('\n');
 
     for h in &hunks {
         let header = format!(
@@ -335,6 +341,50 @@ pub fn render_unified(
     }
 
     out
+}
+
+/// Compute a stat summary for a single file diff: returns (insertions, deletions).
+pub fn count_changes(a: &[u8], b: &[u8]) -> (usize, usize) {
+    if is_binary(a) || is_binary(b) {
+        return (0, 0);
+    }
+    let ops = diff_lines(a, b);
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    for op in &ops {
+        match op {
+            DiffOp::Insert(_) => ins += 1,
+            DiffOp::Delete(_) => del += 1,
+            DiffOp::Equal(_) => {}
+        }
+    }
+    (ins, del)
+}
+
+/// Render a `--stat` line for one file:  `filename | N +++++---`
+/// Bar width max 20 chars. Shows inserts as `+`, deletes as `-`.
+pub fn render_stat(filename: &str, ins: usize, del: usize) -> String {
+    let total = ins + del;
+    if total == 0 {
+        return format!(" {filename} | 0\n");
+    }
+    let bar_width = total.min(20);
+    let ins_bar = if ins > 0 && bar_width > 0 {
+        let ins_chars = (ins * bar_width + total / 2) / total;
+        let ins_chars = ins_chars.max(1.min(ins));
+        "+".repeat(ins_chars)
+    } else {
+        String::new()
+    };
+    let del_bar = if del > 0 && bar_width > ins_bar.len() {
+        let del_chars = bar_width - ins_bar.len();
+        "-".repeat(del_chars)
+    } else if del > 0 && ins_bar.is_empty() {
+        "-".repeat(bar_width.max(1))
+    } else {
+        String::new()
+    };
+    format!(" {filename} | {total} {ins_bar}{del_bar}\n")
 }
 
 #[cfg(test)]

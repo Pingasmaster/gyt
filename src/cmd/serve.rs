@@ -6,16 +6,30 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut listen = "127.0.0.1:8080".to_string();
     let mut repos_root = PathBuf::from(".");
     let mut webroot = PathBuf::from("site");
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
+    let mut auth_token: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
-                println!("gyt serve [--listen <addr>] [--repos <dir>] [--webroot <dir>]");
+                println!("Usage: gyt serve [options]");
+                println!();
+                println!("Options:");
+                println!("  --listen <addr>       Listen address (default: 127.0.0.1:8080)");
+                println!("  --repos <dir>         Repositories root directory (default: .)");
+                println!("  --webroot <dir>       Static file webroot (default: site)");
+                println!("  --cert <file>         TLS certificate PEM file");
+                println!("  --key <file>          TLS private key PEM file");
+                println!("  --auth-token <token>  Bearer token required on all requests");
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     repos_root,
                     webroot,
+                    tls_cert,
+                    tls_key,
+                    auth_token,
                 });
             }
             "--listen" => {
@@ -40,6 +54,29 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 webroot = PathBuf::from(s);
             }
+            "--cert" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument("--cert requires a file path".into())
+                })?;
+                tls_cert = Some(PathBuf::from(s));
+            }
+            "--key" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument("--key requires a file path".into())
+                })?;
+                tls_key = Some(PathBuf::from(s));
+            }
+            "--auth-token" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--auth-token requires a token string".into(),
+                    )
+                })?;
+                auth_token = Some(s);
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -49,10 +86,20 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         i += 1;
     }
 
+    // Validate that cert and key are provided together
+    if tls_cert.is_some() != tls_key.is_some() {
+        return Err(crate::errors::GytError::InvalidArgument(
+            "--cert and --key must be provided together".into(),
+        ));
+    }
+
     Ok(ServeConfig {
         listen_addr: listen,
         repos_root,
         webroot,
+        tls_cert,
+        tls_key,
+        auth_token,
     })
 }
 
@@ -74,6 +121,9 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:8080");
         assert_eq!(config.repos_root, PathBuf::from("."));
         assert_eq!(config.webroot, PathBuf::from("site"));
+        assert_eq!(config.tls_cert, None);
+        assert_eq!(config.tls_key, None);
+        assert_eq!(config.auth_token, None);
     }
 
     #[test]
@@ -177,6 +227,80 @@ mod tests {
         assert_eq!(config.listen_addr, "127.0.0.1:9999");
         assert_eq!(config.repos_root, tmp);
         assert_eq!(config.webroot, PathBuf::from("custom_site"));
+        assert_eq!(config.tls_cert, None);
+        assert_eq!(config.tls_key, None);
+        assert_eq!(config.auth_token, None);
+    }
+
+    #[test]
+    fn serve_tls_flags() {
+        let _g = lock();
+        let config = parse_args(&[
+            "--cert".into(),
+            "/tmp/cert.pem".into(),
+            "--key".into(),
+            "/tmp/key.pem".into(),
+        ])
+        .unwrap();
+        assert_eq!(config.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
+        assert_eq!(config.tls_key, Some(PathBuf::from("/tmp/key.pem")));
+    }
+
+    #[test]
+    fn serve_cert_without_key_errors() {
+        let _g = lock();
+        let result = parse_args(&["--cert".into(), "/tmp/cert.pem".into()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serve_key_without_cert_errors() {
+        let _g = lock();
+        let result = parse_args(&["--key".into(), "/tmp/key.pem".into()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serve_cert_without_value_errors() {
+        let _g = lock();
+        let result = parse_args(&["--cert".into()]);
+        assert!(result.is_err());
+        if let Err(GytError::InvalidArgument(msg)) = result {
+            assert!(msg.contains("--cert requires a file path"));
+        } else {
+            panic!("expected InvalidArgument");
+        }
+    }
+
+    #[test]
+    fn serve_key_without_value_errors() {
+        let _g = lock();
+        let result = parse_args(&["--key".into()]);
+        assert!(result.is_err());
+        if let Err(GytError::InvalidArgument(msg)) = result {
+            assert!(msg.contains("--key requires a file path"));
+        } else {
+            panic!("expected InvalidArgument");
+        }
+    }
+
+    #[test]
+    fn serve_auth_token() {
+        let _g = lock();
+        let config = parse_args(&["--auth-token".into(), "my-secret-token".into()]).unwrap();
+        assert_eq!(config.auth_token, Some("my-secret-token".to_string()));
+    }
+
+    #[test]
+    fn serve_auth_token_without_value_errors() {
+        let _g = lock();
+        let result = parse_args(&["--auth-token".into()]);
+        assert!(result.is_err());
+        if let Err(GytError::InvalidArgument(msg)) = result {
+            assert!(msg.contains("--auth-token requires a token string"));
+        } else {
+            panic!("expected InvalidArgument");
+        }
     }
 
     #[test]

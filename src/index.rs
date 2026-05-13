@@ -6,7 +6,7 @@
 
 use crate::errors::{GytError, Result};
 use crate::fs_util;
-use crate::hash::{ObjectId, HASH_LEN};
+use crate::hash::{HASH_LEN, ObjectId};
 use std::path::{Path, PathBuf};
 
 /// Magic bytes that identify a GYT index file.
@@ -157,7 +157,7 @@ impl Index {
         Ok(())
     }
 
-    fn parse(data: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_LEN {
             return Err(GytError::Index(format!(
                 "index truncated: {} bytes (need at least {HEADER_LEN})",
@@ -235,7 +235,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{ObjectId, HASH_LEN};
+    use crate::hash::{HASH_LEN, ObjectId};
 
     fn dummy_id(byte: u8) -> ObjectId {
         ObjectId([byte; HASH_LEN])
@@ -395,8 +395,7 @@ mod tests {
                 let pid = std::process::id();
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0);
+                    .map_or(0, |d| d.subsec_nanos());
                 let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
                 std::fs::create_dir_all(&p).unwrap();
                 Self(p)

@@ -16,7 +16,7 @@
 use crate::compress;
 use crate::errors::Result;
 use crate::hash::{self, ObjectId};
-use crate::net::protocol::{self, PackEntry, RefEntry, encode_info_refs, encode_pack};
+use crate::net::protocol::{self, PackEntry, RefEntry, encode_info_refs, encode_packfile};
 use crate::object;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -100,6 +100,10 @@ struct Request {
     body: Vec<u8>,
 }
 
+// Reason: each thread spawned to handle a connection takes owned `Arc`s
+// rather than references because the spawn outlives the calling stack
+// frame. Clippy can't see across the spawn boundary.
+#[allow(clippy::needless_pass_by_value)]
 fn handle_conn(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
@@ -148,6 +152,11 @@ fn handle_conn(
     Ok(())
 }
 
+// Reason: this is the in-memory test stub. Locks are held across small
+// codec calls and `Vec` builds for code clarity; the alternative (fine-
+// grained scopes around every helper) hurts readability without buying
+// throughput because the test stub is single-threaded per request.
+#[allow(clippy::significant_drop_tightening)]
 fn route(
     method: &str,
     path: &str,
@@ -185,11 +194,11 @@ fn route(
                     );
                 }
             }
-            let body = encode_pack(&entries);
+            let body = encode_packfile(&entries);
             (200, "OK", body, "application/x-gyt-pack")
         }
         ("POST", "/objects/have") => {
-            let entries = match protocol::parse_pack(body) {
+            let entries = match protocol::parse_packfile(body) {
                 Ok(e) => e,
                 Err(e) => {
                     return (400, "Bad Request", e.to_string().into_bytes(), "text/plain");
@@ -225,8 +234,7 @@ fn route(
         }
         ("POST", "/refs/update") => {
             let force = query
-                .map(|q| q.split('&').any(|p| p == "force=1"))
-                .unwrap_or(false);
+                .is_some_and(|q| q.split('&').any(|p| p == "force=1"));
             let updates = match protocol::parse_ref_updates(body) {
                 Ok(u) => u,
                 Err(e) => {
@@ -361,9 +369,7 @@ fn write_response<W: Write>(
     if chunked {
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
         // Split body into a couple of chunks if non-empty, to exercise the decoder.
-        if body.is_empty() {
-            out.extend_from_slice(b"0\r\n\r\n");
-        } else {
+        if !body.is_empty() {
             let mid = body.len() / 2;
             let (a, b) = body.split_at(mid);
             if !a.is_empty() {
@@ -374,8 +380,8 @@ fn write_response<W: Write>(
             out.extend_from_slice(format!("{:x}\r\n", b.len()).as_bytes());
             out.extend_from_slice(b);
             out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(b"0\r\n\r\n");
         }
+        out.extend_from_slice(b"0\r\n\r\n");
     } else {
         out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         out.extend_from_slice(body);

@@ -13,8 +13,10 @@ gyt (pronounced "gift" but with a 'g') is a modern version control system design
 - **Object format**: `<kind> <size>\0<payload>` with BLAKE3 hashing
 - **Wire protocol**: Custom REST-like endpoints (info/refs, objects/want, objects/have, refs/update)
 - **Storage**: Loose objects in `.gyt/objects/XX/YYYYYY`. The raw object is `<kind> <size>\0<payload>` framing; on disk it is wrapped with XZ/LZMA compression (via the `lzma-rust2` crate). Files written before XZ-wrapping was added still decode (raw-passthrough fallback when the magic prefix is absent).
-- **Signing**: ed25519-dalek cryptographically signed commits
-- **CI**: Built-in `gyt ci` command with WASM sandbox or shell fallback
+- **Signing**: ed25519-dalek cryptographically signed commits. The server enforces signatures when its repo config has `sign_required = true` — every commit hitting `POST /refs/update` is verified against `<repo>.gyt/allowed_signers`.
+- **Merge**: Real three-way merge (file-level Myers + tree-level reconciliation) in `src/merge3.rs`. Used by `merge`, `cherry-pick`, and `rebase`. Conflicts produce standard `<<<<<<<` / `=======` / `>>>>>>>` markers and leave `.gyt/MERGE_HEAD` (or `CHERRY_PICK_HEAD`, `REBASE_HEAD`).
+- **Reflog**: Every HEAD/branch movement records an entry under `<gyt>/logs/<refname>`; `gyt reflog` reads it back.
+- **CI**: Built-in `gyt ci` command with WASM sandbox or shell fallback. Docker mode (`--docker`) runs with `--network none --cap-drop ALL --read-only` and feeds secrets via a private `--env-file` so they don't leak via `docker inspect`.
 
 ## Testing
 
@@ -22,12 +24,44 @@ gyt (pronounced "gift" but with a 'g') is a modern version control system design
 - Run `timeout 30 bash tests/smoke_comprehensive.sh` for end-to-end smoke test
 - Wire protocol integration tests are in `tests/wire_integration.rs`
 
-## Build
+## Build & lint
 
 ```bash
 cargo build --release --all-features
-cargo clippy --all-features -- -D warnings
+cargo clippy --all-features --all-targets -- -D warnings
 ```
+
+## Clippy policy
+
+We run with **every clippy group at `deny`** — `correctness`, `suspicious`,
+`complexity`, `perf`, `style`, `pedantic`, `nursery`, and `cargo`. The full
+configuration lives in the workspace `[lints.clippy]` table in `Cargo.toml`.
+The only escape hatches are the `allow` entries listed there, each
+preceded by a one-line reason describing why enforcement would harm
+clarity or duplicate effort handled elsewhere.
+
+Rules for contributors:
+
+- **Default action is to fix.** If clippy fires, change the code, not the
+  lint level.
+- **Per-line/per-item `#[allow(clippy::xyz)]` requires a `// Reason:`
+  comment** that names the *specific* situation the allow covers — not a
+  generic "false positive" handwave. Bad reasons get rejected at review.
+- **No module-wide `#![allow(...)]`** for clippy lints. If a whole module
+  legitimately needs a relaxation, raise it as a new entry in the
+  Cargo.toml allowlist with the same one-line justification.
+- **Adding a new entry to the Cargo.toml allowlist requires its own
+  one-line reason and reviewer approval.** Don't bundle this into an
+  unrelated PR.
+- **CI gates this.** `cargo clippy --all-features --all-targets -- -D
+  warnings` must be clean on every push, and so must `cargo test
+  --all-features -- --test-threads=1`.
+
+The reasoning behind such a strict policy: this is a version-control
+tool that handles user history. Subtle correctness bugs (loop counters
+that desync from data, `match` arms that quietly do nothing, `Drop`
+ordering surprises around locks) cause silent data loss. Catching them
+at lint time is cheaper than catching them in `git bisect`.
 
 ## Branch Strategy
 

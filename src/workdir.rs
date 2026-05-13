@@ -177,8 +177,7 @@ mod tests {
             let pid = std::process::id();
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.subsec_nanos());
             let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
             fs::create_dir_all(&p).unwrap();
             Self(p)

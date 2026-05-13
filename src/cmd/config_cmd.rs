@@ -67,7 +67,57 @@ fn cmd_get(cfg: &Config, key: &str) {
 
 fn print_usage() {
     eprintln!(
-        "usage: gyt config --list                  list all config
-       gyt config --get <key>            get a single value"
+        "usage: gyt config --list                  list all config\n       gyt config --get <key>            get a single value"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::util::test_helpers::{lock, tmp_dir};
+    use std::fs;
+
+    #[test]
+    fn config_list_shows_values() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-config-list");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = Config {
+            user_name: Some("Tester".into()),
+            user_email: Some("t@x".into()),
+            remotes: Default::default(),
+            create_default_gytignore: false,
+            sign_required: false,
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["--list".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_get_returns_correct_value() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-config-get");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = Config {
+            user_name: Some("Tester".into()),
+            user_email: Some("t@x".into()),
+            remotes: Default::default(),
+            create_default_gytignore: false,
+            sign_required: false,
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["--get".to_string(), "user.name".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

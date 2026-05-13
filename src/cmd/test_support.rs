@@ -85,6 +85,7 @@ impl TestRepo {
             committer: "Tester <t@x> 1700000000 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "init\n".into(),
         };
         let cid = commit::write(&gyt, &c).unwrap();
@@ -130,6 +131,7 @@ impl TestRepo {
             committer: "Tester <t@x> 1700000001 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "next\n".into(),
         };
         let cid = commit::write(&gyt, &c).unwrap();
@@ -173,8 +175,7 @@ impl TmpDir {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         // Add a per-call counter so prefix collisions across tests are avoided.
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}"));

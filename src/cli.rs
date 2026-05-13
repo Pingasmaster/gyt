@@ -15,6 +15,8 @@ pub fn dispatch(args: &[String]) -> Result<()> {
             Ok(())
         }
         "init" => crate::cmd::init::run(rest),
+        "keygen" => crate::cmd::keygen::run(rest),
+        "verify" => crate::cmd::verify::run(rest),
         "add" => crate::cmd::add::run(rest),
         "status" => crate::cmd::status::run(rest),
         "commit" => crate::cmd::commit::run(rest),
@@ -22,6 +24,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "show" => crate::cmd::show::run(rest),
         "diff" => crate::cmd::diff::run(rest),
         "branch" => crate::cmd::branch::run(rest),
+        "clean" => crate::cmd::clean::run(rest),
         "switch" => crate::cmd::switch::run(rest),
         "restore" => crate::cmd::restore::run(rest),
         "reset" => crate::cmd::reset::run(rest),
@@ -29,7 +32,9 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "tag" => crate::cmd::tag::run(rest),
         "cherry-pick" => crate::cmd::cherry_pick::run(rest),
         "rebase" => crate::cmd::rebase::run(rest),
+        "reflog" => crate::cmd::reflog_cmd::run(rest),
         "grep" => crate::cmd::grep_cmd::run(rest),
+        "gc" => crate::cmd::gc::run(rest),
         "stash" => crate::cmd::stash::run(rest),
         "worktree" => crate::cmd::worktree::run(rest),
         "clone" => crate::cmd::clone::run(rest),
@@ -39,6 +44,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "push" => crate::cmd::push::run(rest),
         "remote" => crate::cmd::remote::run(rest),
         "merge" => crate::cmd::merge::run(rest),
+        "ci" => crate::cmd::ci::run(rest),
         "serve" => crate::cmd::serve::run(rest),
         "getthefuckoutofmyrepo" | "filter" => crate::cmd::getthefuckoutofmyrepo::run(rest),
         other => Err(GytError::InvalidArgument(format!(
@@ -56,25 +62,37 @@ USAGE:
 
 COMMANDS:
     init                 create a new repository
-    add <path>...        stage files
+    keygen               generate ed25519 signing keypair
+    verify [<commit>]    verify a signed commit's signature
+    add <path>...|[-A]   stage files (use -A to also stage removals)
     status               show working tree status
-    commit -m <msg>      record staged changes
-    log                  show commit history
+    clean [-n]           remove untracked files (dry-run with -n)
+    commit -m <msg> [--allow-empty] [--sign|-S]
+    log [--oneline] [--graph] [--all]
     show <rev>           show a commit or object
-    diff [<rev>]         show changes
+    diff [<rev>] [--cached|--staged] [--stat]
     branch [<name>]      list or create branches
     switch <branch>      switch to a branch
     restore <path>...    discard unstaged changes
-    reset [--soft|--mixed] <rev>
+    reset [--soft|--mixed|--hard] <rev>
+    reflog [<ref>] [--all] [-n N]  show ref-movement history
     tag <name> [<rev>]   create a tag
+    rm <path>...         remove files
+    grep <pattern>       search content
+    gc                   garbage collect unreachable objects
+    cherry-pick <commit> apply a commit's changes
+    rebase <branch>      fast-forward rebase
+    merge --ff-only <rev>  fast-forward merge
+    pull   [<remote>]    fetch + merge
+    push   [<remote>]    push to remote
+    fetch  [<remote>]    fetch from remote
+    clone  <url> [<dir>] clone a repository
+    remote -v            list remotes
+    config --list|--get <key>
     stash {{push|pop|list|drop}}
     worktree {{add|list|remove}}
-    clone <url> [<dir>]
-    fetch [<remote>]
-    pull   [<remote>]
-    push   [<remote>]
-    merge --ff-only <rev>
     serve [--listen <addr>] [--repos <dir>] [--webroot <dir>]
+    getthefuckoutofmyrepo  clear repo metadata
 ",
         env!("CARGO_PKG_VERSION")
     );

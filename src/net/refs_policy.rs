@@ -1,0 +1,596 @@
+// Server-side enforcement of ref-update policy: fast-forward checks and
+// commit-signature verification.
+//
+// Two distinct policies, evaluated for every ref-update batch hitting the
+// wire `/refs/update` endpoint:
+//
+//   1. Fast-forward: unless the client passes `?force=1` AND the server
+//      allows it, the new commit must be a descendant of the old commit.
+//      Branch creation (no old) is always allowed; tag updates follow the
+//      same rule.
+//
+//   2. Signature: if the server-side repo config has `sign_required = true`,
+//      every commit that is new to the repo (reachable from `new` but not
+//      from `old`) must carry a valid ed25519 signature verifying against a
+//      key listed in `.gyt/allowed_signers`.
+//
+// The `allowed_signers` file is one entry per line. Each line is a 64-char
+// lowercase hex ed25519 public key, optionally followed by whitespace and a
+// label (ignored). Blank lines and lines starting with `#` are skipped.
+
+use crate::cmd::signing;
+use crate::errors::{GytError, Result};
+use crate::hash::ObjectId;
+use crate::object::commit;
+use ed25519_dalek::{Verifier, VerifyingKey};
+use std::collections::HashSet;
+use std::path::Path;
+
+/// Outcome of a policy check.
+#[derive(Debug, Clone)]
+pub enum PolicyError {
+    NotFastForward { refname: String },
+    UnsignedCommit { commit: ObjectId },
+    BadSignature { commit: ObjectId },
+    SignerNotAllowed { commit: ObjectId },
+    MissingAllowedSigners,
+    Internal(String),
+}
+
+impl PolicyError {
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::NotFastForward { refname } => {
+                format!("ref {refname}: non-fast-forward update refused (use ?force=1 to override)")
+            }
+            Self::UnsignedCommit { commit } => {
+                format!("commit {} is unsigned but sign_required is set", commit.to_hex())
+            }
+            Self::BadSignature { commit } => {
+                format!("commit {}: signature failed verification", commit.to_hex())
+            }
+            Self::SignerNotAllowed { commit } => {
+                format!(
+                    "commit {}: signature did not match any allowed signer",
+                    commit.to_hex()
+                )
+            }
+            Self::MissingAllowedSigners => {
+                "sign_required is set but .gyt/allowed_signers is missing or empty".to_string()
+            }
+            Self::Internal(s) => format!("internal policy error: {s}"),
+        }
+    }
+}
+
+/// Is `ancestor` an ancestor of `descendant` along the parent DAG?
+/// Walks all parents (not just first-parent) so merge commits are handled.
+/// Returns Ok(true) if reachable, Ok(false) otherwise, Err if a commit can't
+/// be read.
+pub fn is_ancestor(
+    gyt_dir: &Path,
+    ancestor: &ObjectId,
+    descendant: &ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let mut stack = vec![*descendant];
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if id == *ancestor {
+            return Ok(true);
+        }
+        // If the commit isn't present, the caller is pushing without the
+        // ancestor in our store; we treat that as "not an ancestor".
+        let c = match commit::read(gyt_dir, &id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for p in c.parents {
+            stack.push(p);
+        }
+    }
+    Ok(false)
+}
+
+/// Walk commits reachable from `new` that are NOT reachable from `old`.
+/// Returns the list of new commit ids. If `old` is None, returns every
+/// commit reachable from `new`.
+fn commits_new_since(
+    gyt_dir: &Path,
+    old: Option<&ObjectId>,
+    new: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let mut excluded: HashSet<ObjectId> = HashSet::new();
+    if let Some(old_id) = old {
+        let mut stack = vec![*old_id];
+        while let Some(id) = stack.pop() {
+            if !excluded.insert(id) {
+                continue;
+            }
+            if let Ok(c) = commit::read(gyt_dir, &id) {
+                for p in c.parents {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut stack = vec![*new];
+    while let Some(id) = stack.pop() {
+        if excluded.contains(&id) {
+            continue;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        // If we can't read the commit, it's not actually a commit (e.g. tag,
+        // tree, blob) — skip silently rather than refusing the entire batch.
+        let c = match commit::read(gyt_dir, &id) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        out.push(id);
+        for p in c.parents {
+            stack.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Load the allowed-signer public keys from `.gyt/allowed_signers`.
+/// Returns an empty vec if the file is missing.
+pub fn load_allowed_signers(gyt_dir: &Path) -> Result<Vec<VerifyingKey>> {
+    let path = gyt_dir.join("allowed_signers");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| GytError::Repo(format!("read allowed_signers: {e}")))?;
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let hex_part = line.split_whitespace().next().unwrap_or("");
+        if hex_part.len() != 64 {
+            return Err(GytError::Parse(format!(
+                "allowed_signers line {}: expected 64 hex chars, got {}",
+                i + 1,
+                hex_part.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        for (j, b) in bytes.iter_mut().enumerate() {
+            let hi = (hex_part.as_bytes()[j * 2] as char)
+                .to_digit(16)
+                .ok_or_else(|| {
+                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
+                })?;
+            let lo = (hex_part.as_bytes()[j * 2 + 1] as char)
+                .to_digit(16)
+                .ok_or_else(|| {
+                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
+                })?;
+            *b = ((hi << 4) | lo) as u8;
+        }
+        let vk = VerifyingKey::from_bytes(&bytes)
+            .map_err(|e| GytError::Parse(format!("allowed_signers line {}: {e}", i + 1)))?;
+        out.push(vk);
+    }
+    Ok(out)
+}
+
+/// Verify a single commit object: it must have a signature line, the
+/// signature must decode, and at least one of `allowed` must verify it.
+fn verify_commit_signed(
+    gyt_dir: &Path,
+    id: &ObjectId,
+    allowed: &[VerifyingKey],
+) -> std::result::Result<(), PolicyError> {
+    let c = commit::read(gyt_dir, id).map_err(|e| PolicyError::Internal(e.to_string()))?;
+    let Some(b64) = &c.signature else {
+        return Err(PolicyError::UnsignedCommit { commit: *id });
+    };
+    // Decode the base64 signature using the same logic the verify command uses.
+    // We re-encode the payload without the signature line to obtain the bytes
+    // that were signed.
+    let payload = signing::commit_payload_without_sig(&c);
+    let sig_bytes = match decode_b64(b64) {
+        Some(b) if b.len() == 64 => b,
+        _ => return Err(PolicyError::BadSignature { commit: *id }),
+    };
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| PolicyError::BadSignature { commit: *id })?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    for key in allowed {
+        if key.verify(&payload, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(PolicyError::SignerNotAllowed { commit: *id })
+}
+
+/// Tiny base64 decoder so we don't need to expose the one in `signing`.
+fn decode_b64(input: &str) -> Option<Vec<u8>> {
+    let input = input.trim();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in input.chars() {
+        if ch == '=' {
+            break;
+        }
+        let val: u32 = match ch {
+            'A'..='Z' => u32::from(ch as u8 - b'A'),
+            'a'..='z' => u32::from(ch as u8 - b'a' + 26),
+            '0'..='9' => u32::from(ch as u8 - b'0' + 52),
+            '+' => 62,
+            '/' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Result of evaluating a ref-update batch against server policy.
+pub struct PolicyEvaluation {
+    pub blocked: Vec<(String, PolicyError)>,
+}
+
+impl PolicyEvaluation {
+    pub const fn is_clean(&self) -> bool {
+        self.blocked.is_empty()
+    }
+}
+
+/// Check a list of ref updates against the configured server policy.
+/// `force` lets the caller bypass FF checks (sign-check is never bypassed).
+pub fn evaluate(
+    gyt_dir: &Path,
+    updates: &[crate::net::protocol::RefUpdate],
+    force: bool,
+    sign_required: bool,
+    allowed_signers: &[VerifyingKey],
+) -> PolicyEvaluation {
+    let mut blocked = Vec::new();
+
+    for u in updates {
+        // FF check (skipped for branch creation, for force, and for deletes).
+        if !force && let Some(old) = u.old {
+            // Resolve the current on-disk value of the ref; if it doesn't
+            // exist or doesn't match `old`, the client is racing — return a
+            // distinct error.
+            let cur = read_ref(gyt_dir, &u.name).unwrap_or_default();
+            match cur {
+                None => {
+                    blocked.push((
+                        u.name.clone(),
+                        PolicyError::NotFastForward {
+                            refname: u.name.clone(),
+                        },
+                    ));
+                    continue;
+                }
+                Some(actual) if actual != old => {
+                    blocked.push((
+                        u.name.clone(),
+                        PolicyError::NotFastForward {
+                            refname: u.name.clone(),
+                        },
+                    ));
+                    continue;
+                }
+                Some(_) => {}
+            }
+            // True FF: new must descend from old.
+            match is_ancestor(gyt_dir, &old, &u.new) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    blocked.push((
+                        u.name.clone(),
+                        PolicyError::NotFastForward {
+                            refname: u.name.clone(),
+                        },
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        // Signature check for new commits brought in by this update.
+        if sign_required {
+            if allowed_signers.is_empty() {
+                blocked.push((u.name.clone(), PolicyError::MissingAllowedSigners));
+                continue;
+            }
+            let new_commits = match commits_new_since(gyt_dir, u.old.as_ref(), &u.new) {
+                Ok(c) => c,
+                Err(e) => {
+                    blocked.push((u.name.clone(), PolicyError::Internal(e.to_string())));
+                    continue;
+                }
+            };
+            for id in &new_commits {
+                if let Err(err) = verify_commit_signed(gyt_dir, id, allowed_signers) {
+                    blocked.push((u.name.clone(), err));
+                    break;
+                }
+            }
+        }
+    }
+
+    PolicyEvaluation { blocked }
+}
+
+fn read_ref(gyt_dir: &Path, refname: &str) -> std::io::Result<Option<ObjectId>> {
+    let path = gyt_dir.join(refname);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match ObjectId::from_hex(s.trim()) {
+            Ok(id) => Ok(Some(id)),
+            Err(_) => Ok(None),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Convenience: read sign_required from a repo's config without going
+/// through the full Repo opener (server runs on raw gyt_dir paths).
+pub fn read_sign_required(gyt_dir: &Path) -> bool {
+    let path = gyt_dir.join("config.toml");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    crate::config::parse(&bytes)
+        .is_ok_and(|c| c.sign_required)
+}
+
+/// Wrapper: load both the sign_required flag and allowed signers in one go.
+pub fn server_policy(gyt_dir: &Path) -> (bool, Vec<VerifyingKey>) {
+    let sign_required = read_sign_required(gyt_dir);
+    let allowed = if sign_required {
+        load_allowed_signers(gyt_dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    (sign_required, allowed)
+}
+
+/// Append an entry to `<gyt>/audit.log` describing a successful ref update.
+/// Crash-resistant best-effort: errors are dropped because audit is advisory.
+pub fn append_audit(
+    gyt_dir: &Path,
+    update: &crate::net::protocol::RefUpdate,
+    actor: Option<&str>,
+) {
+    use std::io::Write as _;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let actor_str = actor.unwrap_or("-");
+    let old_hex = update
+        .old.map_or_else(|| "0".repeat(64), super::super::hash::ObjectId::to_hex);
+    let line = format!(
+        "{ts}\t{actor_str}\t{}\t{}\t{}\n",
+        old_hex,
+        update.new.to_hex(),
+        update.name
+    );
+    let path = gyt_dir.join("audit.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::init;
+    use crate::cmd::test_support::TestRepo;
+    use crate::hash;
+    use crate::object::commit;
+    use crate::object::tree;
+
+    fn make_commit(repo: &crate::repo::Repo, parents: Vec<ObjectId>, msg: &str) -> ObjectId {
+        let blob = crate::object::blob::write(&repo.gyt_dir, msg.as_bytes()).unwrap();
+        let tree_id = tree::write(
+            &repo.gyt_dir,
+            &[tree::TreeEntry {
+                mode: tree::MODE_FILE,
+                name: b"f".to_vec(),
+                hash: blob,
+            }],
+        )
+        .unwrap();
+        let c = commit::Commit {
+            tree: tree_id,
+            parents,
+            authors: vec!["T <t@x> 1 +0000".into()],
+            committer: "T <t@x> 1 +0000".into(),
+            ai_assists: vec![],
+            reviewers: vec![],
+            signature: None,
+            message: msg.into(),
+        };
+        commit::write(&repo.gyt_dir, &c).unwrap()
+    }
+
+    #[test]
+    fn is_ancestor_finds_parent_chain() {
+        let r = TestRepo::new("gyt-policy-anc");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let b = make_commit(&repo, vec![a], "b");
+        let c = make_commit(&repo, vec![b], "c");
+        assert!(is_ancestor(&repo.gyt_dir, &a, &c).unwrap());
+        assert!(!is_ancestor(&repo.gyt_dir, &c, &a).unwrap());
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)] // Reason: a/b/c/m are the conventional letters for a merge DAG (parent, sibling, sibling, merge); renaming would obscure the test's intent.
+    fn is_ancestor_handles_merge_parents() {
+        let r = TestRepo::new("gyt-policy-merge-anc");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let b = make_commit(&repo, vec![a], "b");
+        let c = make_commit(&repo, vec![a], "c");
+        let m = make_commit(&repo, vec![b, c], "m");
+        assert!(is_ancestor(&repo.gyt_dir, &b, &m).unwrap());
+        assert!(is_ancestor(&repo.gyt_dir, &c, &m).unwrap());
+    }
+
+    #[test]
+    fn commits_new_since_excludes_old() {
+        let r = TestRepo::new("gyt-policy-newsince");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let b = make_commit(&repo, vec![a], "b");
+        let c = make_commit(&repo, vec![b], "c");
+        let new = commits_new_since(&repo.gyt_dir, Some(&a), &c).unwrap();
+        let set: HashSet<ObjectId> = new.into_iter().collect();
+        assert!(set.contains(&b));
+        assert!(set.contains(&c));
+        assert!(!set.contains(&a));
+    }
+
+    #[test]
+    fn evaluate_rejects_non_ff() {
+        let r = TestRepo::new("gyt-policy-noff");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let b_alt = make_commit(&repo, vec![], "b-alt");
+        // Pretend `refs/heads/main` is at `a` on disk:
+        std::fs::create_dir_all(repo.gyt_dir.join("refs/heads")).unwrap();
+        std::fs::write(
+            repo.gyt_dir.join("refs/heads/main"),
+            format!("{}\n", a.to_hex()),
+        )
+        .unwrap();
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: Some(a),
+            new: b_alt,
+            name: "refs/heads/main".into(),
+        }];
+        let e = evaluate(&repo.gyt_dir, &upd, false, false, &[]);
+        assert_eq!(e.blocked.len(), 1);
+        match &e.blocked[0].1 {
+            PolicyError::NotFastForward { refname } => assert_eq!(refname, "refs/heads/main"),
+            other => panic!("expected NotFastForward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_ff_passes() {
+        let r = TestRepo::new("gyt-policy-ff");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let b = make_commit(&repo, vec![a], "b");
+        std::fs::create_dir_all(repo.gyt_dir.join("refs/heads")).unwrap();
+        std::fs::write(
+            repo.gyt_dir.join("refs/heads/main"),
+            format!("{}\n", a.to_hex()),
+        )
+        .unwrap();
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: Some(a),
+            new: b,
+            name: "refs/heads/main".into(),
+        }];
+        let e = evaluate(&repo.gyt_dir, &upd, false, false, &[]);
+        assert!(e.is_clean(), "blocked: {:?}", e.blocked);
+    }
+
+    #[test]
+    fn evaluate_signature_required_blocks_unsigned() {
+        let r = TestRepo::new("gyt-policy-unsigned");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        // Stub a key — verification will fail (no signature) but we need a
+        // non-empty allowed set to differentiate from MissingAllowedSigners.
+        let keys = vec![VerifyingKey::from_bytes(&[0u8; 32]).unwrap_or_else(|_| {
+            // Generate a real key for testing
+            let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            sk.verifying_key()
+        })];
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: None,
+            new: a,
+            name: "refs/heads/feature".into(),
+        }];
+        let e = evaluate(&repo.gyt_dir, &upd, false, true, &keys);
+        assert!(!e.is_clean());
+        match &e.blocked[0].1 {
+            PolicyError::UnsignedCommit { .. } => {}
+            other => panic!("expected UnsignedCommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_signature_required_no_signers_fails() {
+        let r = TestRepo::new("gyt-policy-nosigners");
+        let repo = r.open();
+        let a = make_commit(&repo, vec![], "a");
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: None,
+            new: a,
+            name: "refs/heads/feature".into(),
+        }];
+        let e = evaluate(&repo.gyt_dir, &upd, false, true, &[]);
+        assert!(matches!(
+            e.blocked[0].1,
+            PolicyError::MissingAllowedSigners
+        ));
+    }
+
+    #[test]
+    fn load_allowed_signers_parses_hex() {
+        let dir = std::env::temp_dir().join(format!(
+            "gyt-allowed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut pk_hex = String::with_capacity(64);
+        for b in sk.verifying_key().to_bytes() {
+            use std::fmt::Write as _;
+            write!(pk_hex, "{b:02x}").unwrap();
+        }
+        std::fs::write(
+            dir.join("allowed_signers"),
+            format!("# comment\n{pk_hex} alice@example\n\n"),
+        )
+        .unwrap();
+        let got = load_allowed_signers(&dir).unwrap();
+        assert_eq!(got.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Silence unused-import warnings in this test module if a test is removed.
+    #[allow(dead_code)]
+    fn _suppress_unused() {
+        let _ = init::init_at;
+        let _ = hash::hash_bytes;
+    }
+}

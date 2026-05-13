@@ -13,6 +13,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut co_authors: Vec<String> = Vec::new();
     let mut reviewers: Vec<String> = Vec::new();
     let mut amend = false;
+    let mut allow_empty = false;
+    let mut sign = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -20,7 +22,7 @@ pub fn run(args: &[String]) -> Result<()> {
         match a.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt commit -m <msg> [--amend] [--ai <id>]... [--co-author <Name <email>>]... [--reviewer <Name <email>>]..."
+                    "gyt commit -m <msg> [--amend] [--allow-empty] [--sign|-S] [--ai <id>]... [--co-author <Name <email>>]... [--reviewer <Name <email>>]..."
                 );
                 return Ok(());
             }
@@ -65,6 +67,12 @@ pub fn run(args: &[String]) -> Result<()> {
                         .clone(),
                 );
             }
+            "--allow-empty" => {
+                allow_empty = true;
+            }
+            "--sign" | "-S" => {
+                sign = true;
+            }
             other => {
                 return Err(GytError::InvalidArgument(format!(
                     "commit: unexpected argument {other}"
@@ -80,39 +88,51 @@ pub fn run(args: &[String]) -> Result<()> {
     let identity = cfg.identity()?;
 
     let index = Index::read(&repo.index_path())?;
-    if index.entries.is_empty() {
+    if index.entries.is_empty() && !allow_empty {
         return Err(GytError::Repo("nothing to commit".into()));
     }
 
     // Build tree.
-    let tree_id = util::build_tree_from_index(&repo, &index)?;
+    let tree_id = if index.entries.is_empty() && allow_empty {
+        // Empty index with --allow-empty: use HEAD's tree if available,
+        // or create a root commit with an empty tree.
+        match util::resolve_tree(&repo, "HEAD") {
+            Ok(id) => id,
+            Err(_) => crate::object::tree::write(&repo.gyt_dir, &[])?,
+        }
+    } else {
+        util::build_tree_from_index(&repo, &index)?
+    };
 
     // Resolve HEAD.
     let head = refs::read_head(&repo.gyt_dir)?;
     let parent = refs::resolve(&repo.gyt_dir, &head)?;
 
     let (parents, commit_message) = if amend {
-        let prev_id = parent.ok_or_else(|| {
-            GytError::Repo("cannot amend: HEAD has no commit yet".into())
-        })?;
+        let prev_id =
+            parent.ok_or_else(|| GytError::Repo("cannot amend: HEAD has no commit yet".into()))?;
         let prev = commit::read(&repo.gyt_dir, &prev_id)?;
         let msg = message.unwrap_or(prev.message);
         (prev.parents, msg)
     } else {
-        let msg = message.ok_or_else(|| {
-            GytError::InvalidArgument("commit: -m <msg> is required".into())
-        })?;
+        let msg = message
+            .ok_or_else(|| GytError::InvalidArgument("commit: -m <msg> is required".into()))?;
         (parent.into_iter().collect::<Vec<_>>(), msg)
     };
 
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let stamped = format!("{identity} {secs} +0000");
     let mut authors = vec![stamped.clone()];
     authors.extend(co_authors);
+
+    if cfg.sign_required && !sign {
+        return Err(GytError::Repo(
+            "this repository requires signed commits; use --sign (-S)".into(),
+        ));
+    }
 
     let c = Commit {
         tree: tree_id,
@@ -121,19 +141,65 @@ pub fn run(args: &[String]) -> Result<()> {
         committer: stamped,
         ai_assists,
         reviewers,
+        signature: None,
         message: commit_message,
     };
 
-    let id = commit::write(&repo.gyt_dir, &c)?;
+    let id = if sign {
+        let payload = super::signing::commit_payload_without_sig(&c);
+        let key_path =
+            crate::cmd::signing::resolve_key_path(std::env::var("GYT_SIGNING_KEY").ok().as_deref());
+        let b64_sig = super::signing::sign_commit(&payload, &key_path)?;
+        let signed = Commit {
+            signature: Some(b64_sig),
+            ..c.clone()
+        };
+        commit::write(&repo.gyt_dir, &signed)?
+    } else {
+        commit::write(&repo.gyt_dir, &c)?
+    };
 
     // Update the symbolic HEAD's ref (or detached HEAD).
+    let prev_for_log = parent;
+    let first_line_for_log = c.message.lines().next().unwrap_or("").to_string();
+    let reflog_msg = if amend {
+        format!("commit (amend): {first_line_for_log}")
+    } else if prev_for_log.is_none() {
+        format!("commit (initial): {first_line_for_log}")
+    } else {
+        format!("commit: {first_line_for_log}")
+    };
     let branch_label = match &head {
         Head::Symbolic(name) => {
             refs::write_ref(&repo.gyt_dir, name, &id)?;
+            crate::reflog::record(
+                &repo.gyt_dir,
+                name,
+                prev_for_log.as_ref(),
+                &id,
+                &identity,
+                &reflog_msg,
+            );
+            crate::reflog::record(
+                &repo.gyt_dir,
+                "HEAD",
+                prev_for_log.as_ref(),
+                &id,
+                &identity,
+                &reflog_msg,
+            );
             short_branch(name)
         }
         Head::Detached(_) => {
             refs::write_head(&repo.gyt_dir, &Head::Detached(id))?;
+            crate::reflog::record(
+                &repo.gyt_dir,
+                "HEAD",
+                prev_for_log.as_ref(),
+                &id,
+                &identity,
+                &reflog_msg,
+            );
             "HEAD".to_string()
         }
     };
@@ -148,9 +214,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn short_branch(refname: &str) -> String {
     refname
-        .strip_prefix("refs/heads/")
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| refname.to_string())
+        .strip_prefix("refs/heads/").map_or_else(|| refname.to_string(), std::string::ToString::to_string)
 }
 
 #[cfg(test)]
@@ -255,7 +319,10 @@ mod tests {
         assert_ne!(id1, id2, "amend should produce a new commit id");
         let c2 = commit::read(&repo.gyt_dir, &id2).unwrap();
         assert_eq!(c2.message, "first commit", "should reuse previous message");
-        assert!(c2.parents.is_empty(), "root commit parents should stay empty");
+        assert!(
+            c2.parents.is_empty(),
+            "root commit parents should stay empty"
+        );
         // Tree should reflect the new index content.
         assert_ne!(c2.tree, c1.tree, "tree should reflect new index");
         std::env::set_current_dir(&prev).unwrap();
@@ -276,7 +343,12 @@ mod tests {
         // Amend with new -m.
         fs::write(dir.join("b.txt"), b"b\n").unwrap();
         crate::cmd::add::run(&[".".to_string()]).unwrap();
-        run(&["--amend".to_string(), "-m".to_string(), "new msg".to_string()]).unwrap();
+        run(&[
+            "--amend".to_string(),
+            "-m".to_string(),
+            "new msg".to_string(),
+        ])
+        .unwrap();
         let repo = Repo::open(&dir).unwrap();
         let id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
         let c = commit::read(&repo.gyt_dir, &id).unwrap();
@@ -298,6 +370,73 @@ mod tests {
         // No initial commit yet - amend should fail.
         let r = run(&["--amend".to_string()]);
         assert!(r.is_err(), "amend should fail on unborn HEAD");
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_allow_empty_creates_commit_with_no_changes() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-allow-empty-root");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&[
+            "-m".to_string(),
+            "empty root".to_string(),
+            "--allow-empty".to_string(),
+        ]);
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        let c = commit::read(&repo.gyt_dir, &id).unwrap();
+        assert_eq!(c.message, "empty root");
+        assert!(c.parents.is_empty(), "should be root commit");
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_allow_empty_with_files_works_normally() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-allow-empty-with-files");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        let r = run(&[
+            "-m".to_string(),
+            "normal".to_string(),
+            "--allow-empty".to_string(),
+        ]);
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
+        let c = commit::read(&repo.gyt_dir, &id).unwrap();
+        assert_eq!(c.message, "normal");
+        // The tree should have entries since we added a file
+        let entries = crate::object::tree::read(&repo.gyt_dir, &c.tree).unwrap();
+        assert!(!entries.is_empty(), "tree should contain the staged file");
+        std::env::set_current_dir(&prev).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn commit_still_fails_without_allow_empty_if_index_empty() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-commit-no-allow-empty");
+        crate::cmd::init::init_at(&dir).unwrap();
+        write_identity_config(&dir.join(".gyt"));
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["-m".to_string(), "nope".to_string()]);
+        assert!(
+            r.is_err(),
+            "should fail without --allow-empty on empty index"
+        );
         std::env::set_current_dir(&prev).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }

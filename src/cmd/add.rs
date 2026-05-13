@@ -9,20 +9,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        return Err(GytError::InvalidArgument(
-            "add: at least one path required".into(),
-        ));
-    }
     let mut paths: Vec<String> = Vec::new();
+    let mut all = false;
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt add <path>...\n\nStage files into the index. Use `.` to stage all non-ignored files."
+                    "gyt add <path>...\n\nStage files into the index. Use `.` to stage all non-ignored files.\n\
+                     Use `-A` / `--all` to stage all files (including removals)."
                 );
                 return Ok(());
             }
+            "-A" | "--all" => all = true,
             other if other.starts_with('-') => {
                 return Err(GytError::InvalidArgument(format!(
                     "add: unknown flag {other}"
@@ -39,6 +37,41 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut index = Index::read(&repo.index_path())?;
 
     let mut staged: Vec<PathBuf> = Vec::new();
+    let mut removed: Vec<PathBuf> = Vec::new();
+
+    if all {
+        // Stage all workdir files (same as `add .`).
+        let entries = workdir::walk(&workdir, &ignore)?;
+        for ent in &entries {
+            stage_one(&repo, &workdir, ent, &mut index, &mut staged)?;
+        }
+        // Remove index entries for files that no longer exist in workdir
+        // (files that were in the index but have been deleted).
+        let to_remove: Vec<PathBuf> = index
+            .entries
+            .iter()
+            .filter(|e| !workdir.join(&e.path).exists())
+            .map(|e| e.path.clone())
+            .collect();
+        for p in &to_remove {
+            index.remove(p);
+            removed.push(p.clone());
+        }
+        index.write(&repo.index_path())?;
+        for p in &staged {
+            println!("added: {}", forward_slash(p));
+        }
+        for p in &removed {
+            println!("removed: {}", forward_slash(p));
+        }
+        return Ok(());
+    }
+
+    if paths.is_empty() {
+        return Err(GytError::InvalidArgument(
+            "add: at least one path required".into(),
+        ));
+    }
 
     for arg in &paths {
         if arg == "." {
@@ -215,8 +248,7 @@ fn times(md: &fs::Metadata) -> (i64, i64) {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     #[cfg(unix)]
     let ctime = {
         use std::os::unix::fs::MetadataExt;
@@ -315,6 +347,79 @@ mod tests {
         let paths: Vec<String> = idx.entries.iter().map(|e| forward_slash(&e.path)).collect();
         assert!(paths.contains(&"a.txt".to_string()));
         assert!(paths.contains(&"sub/b.txt".to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_all_stages_and_removes() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-add-all");
+        crate::cmd::init::init_at(&dir).unwrap();
+        fs::write(dir.join("a.txt"), b"hello").unwrap();
+        fs::write(dir.join("b.txt"), b"world").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        // Stage and commit initial files.
+        let r = run(&[".".to_string()]);
+        r.unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+        // Delete b.txt, create c.txt
+        fs::remove_file(dir.join("b.txt")).unwrap();
+        fs::write(dir.join("c.txt"), b"new").unwrap();
+        // Run add -A
+        let r = run(&["-A".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let idx = Index::read(&repo.index_path()).unwrap();
+        assert!(
+            idx.find(Path::new("a.txt")).is_some(),
+            "a.txt should be staged"
+        );
+        assert!(
+            idx.find(Path::new("b.txt")).is_none(),
+            "b.txt should be removed from index"
+        );
+        assert!(
+            idx.find(Path::new("c.txt")).is_some(),
+            "c.txt should be staged"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_all_no_files_is_ok() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-add-all-empty");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["-A".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_all_flag_long_form() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-add-all-long");
+        crate::cmd::init::init_at(&dir).unwrap();
+        fs::write(dir.join("x.txt"), b"data").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let r = run(&["--all".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        let repo = Repo::open(&dir).unwrap();
+        let idx = Index::read(&repo.index_path()).unwrap();
+        assert!(idx.find(Path::new("x.txt")).is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -5,8 +5,8 @@ use crate::compress;
 use crate::hash::{self, ObjectId};
 use crate::net::http::HttpClient;
 use crate::net::protocol::{
-    self, PackEntry, RefEntry, RefUpdate, encode_ref_updates, encode_wants, parse_info_refs,
-    parse_pack,
+    self, PackEntry, RefEntry, RefUpdate, encode_ref_updates, encode_wants,
+    parse_info_refs, parse_packfile,
 };
 use crate::net::server_stub::{self, ServerState};
 use crate::object::ObjectKind;
@@ -76,7 +76,7 @@ fn post_objects_want_returns_pack() {
         .expect("post");
     assert_eq!(resp.status, 200, "reason={}", resp.reason);
 
-    let entries = parse_pack(&resp.body).expect("parse pack");
+    let entries = parse_packfile(&resp.body).expect("parse pack");
     assert_eq!(entries.len(), 2);
     // Verify decoding & hashing matches.
     for entry in &entries {
@@ -199,7 +199,7 @@ fn objects_have_round_trip() {
     let (id1, on_disk1) = mk_object(b"hello");
     let (id2, on_disk2) = mk_object(b"world");
 
-    let body = protocol::encode_pack(&[
+    let body = protocol::encode_packfile(&[
         PackEntry {
             id: id1,
             bytes: on_disk1.clone(),
@@ -216,7 +216,7 @@ fn objects_have_round_trip() {
     let want = encode_wants(&[id1, id2]);
     let resp = client.post("objects/want", &want, &[]).expect("want");
     assert_eq!(resp.status, 200);
-    let entries = parse_pack(&resp.body).expect("parse pack");
+    let entries = parse_packfile(&resp.body).expect("parse pack");
     assert_eq!(entries.len(), 2);
 
     server.shutdown();

@@ -108,7 +108,7 @@ pub fn build_tree_from_index(repo: &Repo, index: &Index) -> Result<ObjectId> {
 #[derive(Default)]
 struct DirNode {
     files: Vec<(String, u32, ObjectId)>,
-    subdirs: BTreeMap<String, DirNode>,
+    subdirs: BTreeMap<String, Self>,
 }
 
 fn insert_entry(root: &mut DirNode, entry: &IndexEntry) {
@@ -182,8 +182,7 @@ pub mod test_helpers {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         // Add a random component to dedupe within the same nanosecond.
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{n}"));

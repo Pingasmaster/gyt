@@ -187,7 +187,7 @@ impl HttpClient {
         body: Option<&[u8]>,
         extra_headers: &[(&str, &str)],
     ) -> Vec<u8> {
-        let mut req = Vec::with_capacity(256 + body.map(<[u8]>::len).unwrap_or(0));
+        let mut req = Vec::with_capacity(256 + body.map_or(0, <[u8]>::len));
         let _ = write!(req, "{method} {target} HTTP/1.1\r\n");
         let host_header = if (self.scheme == Scheme::Https && self.port == 443)
             || (self.scheme == Scheme::Http && self.port == 80)

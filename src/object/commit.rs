@@ -29,12 +29,14 @@ pub struct Commit {
     pub committer: String,
     pub ai_assists: Vec<String>,
     pub reviewers: Vec<String>,
+    pub signature: Option<String>, // base64-encoded ed25519 sig; None = unsigned
     pub message: String,
 }
 
 impl Commit {
+    #[allow(dead_code)] // scaffolding for future log --format features
     pub fn primary_author(&self) -> &str {
-        self.authors.first().map(String::as_str).unwrap_or("")
+        self.authors.first().map_or("", String::as_str)
     }
 }
 
@@ -54,6 +56,9 @@ pub fn encode(c: &Commit) -> Vec<u8> {
     for r in &c.reviewers {
         writeln!(s, "reviewer {r}").unwrap();
     }
+    if let Some(ref sig) = c.signature {
+        writeln!(s, "signature {sig}").unwrap();
+    }
     s.push('\n');
     s.push_str(&c.message);
     s.into_bytes()
@@ -71,6 +76,7 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
     let mut committer: Option<String> = None;
     let mut ai_assists = Vec::new();
     let mut reviewers = Vec::new();
+    let mut signature: Option<String> = None;
     for line in header.lines() {
         if let Some(rest) = line.strip_prefix("tree ") {
             if rest.len() != HEX_LEN {
@@ -90,6 +96,11 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
             ai_assists.push(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("reviewer ") {
             reviewers.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("signature ") {
+            if signature.is_some() {
+                return Err(GytError::Object("commit: multiple signature lines".into()));
+            }
+            signature = Some(rest.to_string());
         } else {
             return Err(GytError::Object(format!("commit: unknown line {line:?}")));
         }
@@ -104,6 +115,7 @@ pub fn decode(payload: &[u8]) -> Result<Commit> {
         committer: committer.ok_or_else(|| GytError::Object("commit: missing committer".into()))?,
         ai_assists,
         reviewers,
+        signature,
         message: message.to_string(),
     })
 }
@@ -136,6 +148,7 @@ mod tests {
             committer: "Alice <a@x> 1700000000 +0000".into(),
             ai_assists: vec![],
             reviewers: vec![],
+            signature: None,
             message: "msg".into(),
         }
     }
@@ -158,6 +171,7 @@ mod tests {
             committer: "Alice <a@x> 1700000000 +0000".into(),
             ai_assists: vec!["claude-opus-4-7".into(), "auto:rustfmt".into()],
             reviewers: vec!["Carol <c@x>".into()],
+            signature: None,
             message: "init\n\nbody line\n".into(),
         };
         assert_eq!(decode(&encode(&c)).unwrap(), c);

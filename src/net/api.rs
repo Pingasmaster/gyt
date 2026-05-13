@@ -9,6 +9,7 @@ use crate::hash::ObjectId;
 // ---------- JSON helpers ----------
 
 pub fn json_string(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -18,9 +19,20 @@ pub fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            // C0 controls — must be \uXXXX in JSON.
             c if (c as u32) < 0x20 => {
-                out.push_str(&format_args!("\\u{:04x}", c as u32).to_string());
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
+            // U+2028/U+2029 are valid JSON but break naive JavaScript
+            // <script> parsers; escape them defensively.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            // U+007F DELETE — strictly not required to escape, but it's a
+            // control char and confuses some tooling.
+            '\u{007f}' => out.push_str("\\u007f"),
+            // Anything else (including non-BMP) goes through as UTF-8.
             c => out.push(c),
         }
     }
@@ -73,9 +85,7 @@ impl RepoInfo {
             (
                 "head_commit",
                 self.head_commit
-                    .as_deref()
-                    .map(json_string)
-                    .unwrap_or_else(json_null),
+                    .as_deref().map_or_else(json_null, json_string),
             ),
         ])
     }
@@ -152,7 +162,7 @@ impl TreeEntryInfo {
             ("mode", format!("0o{:o}", self.mode)),
             ("kind", json_string(&self.kind)),
             ("hash", json_string(&self.hash)),
-            ("size", self.size.map(json_u64).unwrap_or_else(json_null)),
+            ("size", self.size.map_or_else(json_null, json_u64)),
         ])
     }
 }
@@ -170,11 +180,11 @@ impl DiffLine {
         json_object(&[
             (
                 "old_no",
-                self.old_no.map(json_u64).unwrap_or_else(json_null),
+                self.old_no.map_or_else(json_null, json_u64),
             ),
             (
                 "new_no",
-                self.new_no.map(json_u64).unwrap_or_else(json_null),
+                self.new_no.map_or_else(json_null, json_u64),
             ),
             ("kind", json_string(&self.kind)),
             ("text", json_string(&self.text)),

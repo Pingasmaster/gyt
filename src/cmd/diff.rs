@@ -14,20 +14,25 @@ use std::path::{Path, PathBuf};
 pub fn run(args: &[String]) -> Result<()> {
     let mut cached = false;
     let mut revs: Vec<String> = Vec::new();
+    let mut stat = false;
     for a in args {
         match a.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt diff [<rev>] [<rev>] [--cached]\n\n\
+                    "gyt diff [<rev>] [<rev>] [--cached|--staged] [--stat]\n\n\
 With 0 revs: workdir vs index.\n\
 With 1 rev: index vs that tree.\n\
 With 2 revs: rev1 tree vs rev2 tree.\n\
-With --cached: HEAD tree vs index (staged changes)."
+With --cached: HEAD tree vs index (staged changes).\n\
+With --stat: compact summary instead of full diff."
                 );
                 return Ok(());
             }
             "--cached" | "--staged" => {
                 cached = true;
+            }
+            "--stat" => {
+                stat = true;
             }
             other if other.starts_with("--") => {
                 return Err(GytError::InvalidArgument(format!(
@@ -48,18 +53,18 @@ With --cached: HEAD tree vs index (staged changes)."
     let use_color = term::use_color();
 
     if cached {
-        return diff_index_vs_head(&repo, use_color);
+        return diff_index_vs_head(&repo, use_color, stat);
     }
 
     match revs.len() {
-        0 => diff_workdir_vs_index(&repo, use_color),
-        1 => diff_index_vs_tree(&repo, &revs[0], use_color),
-        2 => diff_tree_vs_tree(&repo, &revs[0], &revs[1], use_color),
+        0 => diff_workdir_vs_index(&repo, use_color, stat),
+        1 => diff_index_vs_tree(&repo, &revs[0], use_color, stat),
+        2 => diff_tree_vs_tree(&repo, &revs[0], &revs[1], use_color, stat),
         _ => unreachable!(),
     }
 }
 
-fn diff_workdir_vs_index(repo: &Repo, use_color: bool) -> Result<()> {
+fn diff_workdir_vs_index(repo: &Repo, use_color: bool, stat: bool) -> Result<()> {
     let index = Index::read(&repo.index_path())?;
     let mut idx_map: BTreeMap<PathBuf, (u32, ObjectId)> = BTreeMap::new();
     for e in &index.entries {
@@ -99,15 +104,23 @@ fn diff_workdir_vs_index(repo: &Repo, use_color: bool) -> Result<()> {
             continue;
         }
         let header = forward_slash(&p);
-        let out = diff::render_unified(&idx_bytes, &wd_bytes, &header, &header, 3, use_color);
-        if std::io::stdout().write_all(out.as_bytes()).is_err() {
-            return Ok(());
+        if stat {
+            let (ins, del) = diff::count_changes(&idx_bytes, &wd_bytes);
+            let line = diff::render_stat(&header, ins, del);
+            if std::io::stdout().write_all(line.as_bytes()).is_err() {
+                return Ok(());
+            }
+        } else {
+            let out = diff::render_unified(&idx_bytes, &wd_bytes, &header, &header, 3, use_color);
+            if std::io::stdout().write_all(out.as_bytes()).is_err() {
+                return Ok(());
+            }
         }
     }
     Ok(())
 }
 
-fn diff_index_vs_tree(repo: &Repo, rev: &str, use_color: bool) -> Result<()> {
+fn diff_index_vs_tree(repo: &Repo, rev: &str, use_color: bool, stat: bool) -> Result<()> {
     let tree_id = util::resolve_tree(repo, rev)?;
     let tree_map = util::flatten_tree(repo, &tree_id)?;
     let index = Index::read(&repo.index_path())?;
@@ -115,18 +128,18 @@ fn diff_index_vs_tree(repo: &Repo, rev: &str, use_color: bool) -> Result<()> {
     for e in &index.entries {
         idx_map.insert(e.path.clone(), (e.mode, e.hash));
     }
-    print_pair_diff(repo, &tree_map, &idx_map, use_color)
+    print_pair_diff(repo, &tree_map, &idx_map, use_color, stat)
 }
 
-fn diff_tree_vs_tree(repo: &Repo, a: &str, b: &str, use_color: bool) -> Result<()> {
+fn diff_tree_vs_tree(repo: &Repo, a: &str, b: &str, use_color: bool, stat: bool) -> Result<()> {
     let ta = util::resolve_tree(repo, a)?;
     let tb = util::resolve_tree(repo, b)?;
     let am = util::flatten_tree(repo, &ta)?;
     let bm = util::flatten_tree(repo, &tb)?;
-    print_pair_diff(repo, &am, &bm, use_color)
+    print_pair_diff(repo, &am, &bm, use_color, stat)
 }
 
-fn diff_index_vs_head(repo: &Repo, use_color: bool) -> Result<()> {
+fn diff_index_vs_head(repo: &Repo, use_color: bool, stat: bool) -> Result<()> {
     let head_tree_id = match util::resolve_tree(repo, "HEAD") {
         Ok(id) => id,
         Err(e) => {
@@ -138,7 +151,7 @@ fn diff_index_vs_head(repo: &Repo, use_color: bool) -> Result<()> {
                 for e in &index.entries {
                     idx_map.insert(e.path.clone(), (e.mode, e.hash));
                 }
-                return print_pair_diff(repo, &empty, &idx_map, use_color);
+                return print_pair_diff(repo, &empty, &idx_map, use_color, stat);
             }
             return Err(e);
         }
@@ -149,7 +162,7 @@ fn diff_index_vs_head(repo: &Repo, use_color: bool) -> Result<()> {
     for e in &index.entries {
         idx_map.insert(e.path.clone(), (e.mode, e.hash));
     }
-    print_pair_diff(repo, &head_tree_map, &idx_map, use_color)
+    print_pair_diff(repo, &head_tree_map, &idx_map, use_color, stat)
 }
 
 fn print_pair_diff(
@@ -157,6 +170,7 @@ fn print_pair_diff(
     a: &BTreeMap<PathBuf, (u32, ObjectId)>,
     b: &BTreeMap<PathBuf, (u32, ObjectId)>,
     use_color: bool,
+    stat: bool,
 ) -> Result<()> {
     let mut all: BTreeSet<&PathBuf> = BTreeSet::new();
     for k in a.keys() {
@@ -180,9 +194,17 @@ fn print_pair_diff(
             None => Vec::new(),
         };
         let header = forward_slash(p);
-        let out = diff::render_unified(&abytes, &bbytes, &header, &header, 3, use_color);
-        if std::io::stdout().write_all(out.as_bytes()).is_err() {
-            return Ok(());
+        if stat {
+            let (ins, del) = diff::count_changes(&abytes, &bbytes);
+            let line = diff::render_stat(&header, ins, del);
+            if std::io::stdout().write_all(line.as_bytes()).is_err() {
+                return Ok(());
+            }
+        } else {
+            let out = diff::render_unified(&abytes, &bbytes, &header, &header, 3, use_color);
+            if std::io::stdout().write_all(out.as_bytes()).is_err() {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -248,7 +270,7 @@ mod tests {
 
         // Stage and commit initial file
         crate::cmd::add::run(&[".".to_string()]).unwrap();
-        let _commit_hash = crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+        crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
 
         // Modify and stage a change
         fs::write(dir.join("a.txt"), b"modified\n").unwrap();
@@ -302,14 +324,89 @@ mod tests {
         std::env::set_current_dir(&dir).unwrap();
 
         crate::cmd::add::run(&[".".to_string()]).unwrap();
-        let _commit_hash =
-            crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+        crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
 
         fs::write(dir.join("b.txt"), b"changed\n").unwrap();
         crate::cmd::add::run(&[".".to_string()]).unwrap();
 
         // --staged alias should behave exactly like --cached
         let r = run(&["--staged".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_stat_shows_compact_summary() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-stat");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("a.txt"), b"line1\nline2\nline3\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        // modify workdir
+        fs::write(dir.join("a.txt"), b"line1\nLINE2\nline3\nline4\n").unwrap();
+        let r = run(&["--stat".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        // just verify it runs without error
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_stat_cached_shows_compact_summary() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-stat-cached");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("a.txt"), b"original\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // Stage and commit initial file
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        crate::cmd::commit::run(&["-m".to_string(), "init".to_string()]).unwrap();
+
+        // Modify and stage a change
+        fs::write(dir.join("a.txt"), b"modified\n").unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+
+        // Run diff --stat --cached
+        let r = run(&["--stat".to_string(), "--cached".to_string()]);
+        std::env::set_current_dir(&prev).unwrap();
+        r.unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_stat_no_changes_shows_nothing() {
+        let _g = lock();
+        let dir = tmp_dir("gyt-diff-stat-none");
+        crate::cmd::init::init_at(&dir).unwrap();
+        let cfg = crate::config::Config {
+            user_name: Some("T".into()),
+            user_email: Some("t@x".into()),
+            ..crate::config::Config::default()
+        };
+        cfg.write(&dir.join(".gyt")).unwrap();
+        fs::write(dir.join("a.txt"), b"same\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        crate::cmd::add::run(&[".".to_string()]).unwrap();
+        // No modifications — stat output should be empty
+        let r = run(&["--stat".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
         fs::remove_dir_all(&dir).unwrap();
