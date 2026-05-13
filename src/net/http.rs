@@ -1,17 +1,26 @@
 // Hand-rolled HTTP/1.1 client. Phase 6a.
 //
-// Each request opens a fresh connection (no keepalive). HTTPS uses
-// `tls::connect_tls`; plain HTTP uses `TcpStream` and is gated behind
-// `HttpClient::new_plain` (test/local-server use only — `HttpClient::new`
-// rejects non-https schemes).
+// We keep one cached connection per `HttpClient` and send
+// `Connection: keep-alive`. Each `request()` reuses the cached connection
+// if present; if write/read fails (server-side idle close, etc.) we
+// transparently reconnect once. The cache is a `Mutex<Option<_>>` so
+// `HttpClient` stays `Sync`, but a single client serializes its requests:
+// callers wanting parallelism should hold multiple clients.
+//
+// HTTPS uses `tls::connect_tls`; plain HTTP uses `TcpStream` and is gated
+// behind `HttpClient::new_plain` (test/local-server use only —
+// `HttpClient::new` rejects non-https schemes).
 //
 // Body framing: we honour `Content-Length` and `Transfer-Encoding: chunked`.
-// If neither header is present we read until EOF (server closes connection).
+// If neither header is present *and* the response is keep-alive, we treat
+// that as zero-length (the spec calls this an error; we lean conservative
+// so the connection stays usable). With `Connection: close` we read to EOF.
 
 use crate::errors::{GytError, Result};
 use crate::net::tls;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 
 const USER_AGENT: &str = concat!("gyt/", env!("CARGO_PKG_VERSION"));
 
@@ -39,6 +48,19 @@ enum Scheme {
     Http,
 }
 
+/// A connection that supports both reading (with buffering, for parsing
+/// HTTP responses) and writing (unbuffered, going straight to the wire).
+trait Conn: Read + Write + Send {}
+impl<T: Read + Write + Send> Conn for T {}
+
+/// A previously-opened HTTP/1.1 connection kept around for the next
+/// request on the same `HttpClient`. We wrap the stream in a `BufReader`
+/// because keep-alive responses can leave bytes in the buffer that the
+/// next response's headers start in.
+struct PooledConn {
+    reader: BufReader<Box<dyn Conn>>,
+}
+
 /// HTTPS-by-default HTTP/1.1 client.
 pub struct HttpClient {
     scheme: Scheme,
@@ -47,6 +69,12 @@ pub struct HttpClient {
     base_path: String,
     base_query: Option<String>,
     auth: Option<String>,
+    /// Cached keep-alive connection. None on first use or after the
+    /// server has signalled `Connection: close`. We serialize access so
+    /// concurrent `request()` calls don't tear the request/response
+    /// stream — the perf win we care about is amortizing the TLS
+    /// handshake across the *sequential* batches a clone/fetch emits.
+    pool: Mutex<Option<PooledConn>>,
 }
 
 impl HttpClient {
@@ -104,6 +132,7 @@ impl HttpClient {
             base_path: path,
             base_query: query,
             auth: None,
+            pool: Mutex::new(None),
         })
     }
 
@@ -137,19 +166,53 @@ impl HttpClient {
         let target = self.build_target(path_suffix);
         let request_bytes = self.build_request(method, &target, body, extra_headers);
 
+        // Try cached connection. If write/parse fails on a recycled
+        // socket, that's usually the server having closed it during the
+        // idle window — silently reopen and retry once. Failures on a
+        // fresh socket are surfaced.
+        if let Some(mut conn) = self.pool.lock().unwrap().take()
+            && let Some(resp) = self.try_on_conn(&mut conn, &request_bytes)
+        {
+            if !response_says_close(&resp) {
+                *self.pool.lock().unwrap() = Some(conn);
+            }
+            return Ok(resp);
+        }
+
+        let stream = self.open_conn()?;
+        let mut conn = PooledConn {
+            reader: BufReader::new(stream),
+        };
+        let resp = self
+            .try_on_conn(&mut conn, &request_bytes)
+            .ok_or_else(|| GytError::Net("request failed on fresh connection".into()))?;
+        if !response_says_close(&resp) {
+            *self.pool.lock().unwrap() = Some(conn);
+        }
+        Ok(resp)
+    }
+
+    /// Run a request on `conn`. Returns `None` if writing the request or
+    /// parsing the response fails (caller decides whether to retry or
+    /// surface as an error). The conn is left in an unspecified state
+    /// on `None` — the caller must drop it.
+    fn try_on_conn(&self, conn: &mut PooledConn, request_bytes: &[u8]) -> Option<HttpResponse> {
+        let w = conn.reader.get_mut();
+        w.write_all(request_bytes).ok()?;
+        w.flush().ok()?;
+        read_response(&mut conn.reader).ok()
+    }
+
+    fn open_conn(&self) -> Result<Box<dyn Conn>> {
         match self.scheme {
             Scheme::Https => {
-                let mut stream = tls::connect_tls(&self.host, self.port)?;
-                stream.write_all(&request_bytes)?;
-                stream.flush()?;
-                read_response(&mut stream)
+                let s = tls::connect_tls(&self.host, self.port)?;
+                Ok(Box::new(s))
             }
             Scheme::Http => {
-                let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+                let s = TcpStream::connect((self.host.as_str(), self.port))
                     .map_err(|e| GytError::Net(format!("tcp connect: {e}")))?;
-                stream.write_all(&request_bytes)?;
-                stream.flush()?;
-                read_response(&mut stream)
+                Ok(Box::new(s))
             }
         }
     }
@@ -198,7 +261,7 @@ impl HttpClient {
         };
         let _ = write!(req, "Host: {host_header}\r\n");
         let _ = write!(req, "User-Agent: {USER_AGENT}\r\n");
-        let _ = write!(req, "Connection: close\r\n");
+        let _ = write!(req, "Connection: keep-alive\r\n");
         let _ = write!(req, "Accept: */*\r\n");
         if let Some(auth) = &self.auth {
             let _ = write!(req, "Authorization: {auth}\r\n");
@@ -263,16 +326,27 @@ fn read_response<R: Read>(stream: &mut R) -> Result<HttpResponse> {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse().ok());
 
+    let conn_close = headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("connection") && contains_token(v, "close"));
+
     let body = if is_chunked {
         chunked_decode(&mut reader)?
     } else if let Some(n) = content_length {
         let mut buf = vec![0u8; n];
         reader.read_exact(&mut buf)?;
         buf
-    } else {
+    } else if conn_close {
+        // No framing + server is closing — read to EOF.
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf)?;
         buf
+    } else {
+        // No framing on a keep-alive response would deadlock the next
+        // request. Refuse rather than guess.
+        return Err(GytError::Net(
+            "response has no Content-Length / chunked encoding on a keep-alive connection".into(),
+        ));
     };
 
     Ok(HttpResponse {
@@ -331,6 +405,15 @@ fn parse_header_line(line: &str) -> Result<(String, String)> {
         .split_once(':')
         .ok_or_else(|| GytError::Net(format!("bad header line: {line:?}")))?;
     Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+/// True iff the server signalled `Connection: close` on this response.
+/// HTTP/1.1 keep-alive is the default; only an explicit `close` token
+/// retires the cached connection.
+fn response_says_close(resp: &HttpResponse) -> bool {
+    resp.headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("connection") && contains_token(v, "close"))
 }
 
 fn contains_token(value: &str, token: &str) -> bool {

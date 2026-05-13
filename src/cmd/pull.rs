@@ -44,7 +44,13 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
     let remote = remote.unwrap_or_else(|| "origin".to_string());
 
-    let summary: FetchSummary = fetch::fetch(repo, &remote, insecure, false)?;
+    // Hold the repo lock for the WHOLE pull. Previously fetch acquired
+    // and released its own lock, then merge acquired again — leaving a
+    // small window in which a third process could push something the
+    // user's merge then races against. Now: one lock, two phases.
+    let _lock = repo.lock()?;
+
+    let summary: FetchSummary = fetch::fetch_with_refspec_inner(repo, &remote, None, insecure, false)?;
     println!(
         "fetch: {} new objects, {} refs updated",
         summary.new_objects, summary.updated_refs
@@ -70,9 +76,10 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     })?;
 
     // `resolve_rev` accepts `<remote>/<branch>` as a shorthand for the
-    // remote-tracking ref. Pass that form so merge picks it up.
+    // remote-tracking ref. Pass that form so merge picks it up. We use
+    // the `_inner` variant because we already hold the lock.
     let remote_short = format!("{remote}/{branch}");
-    merge::run_in(repo, &["--ff-only".into(), remote_short])?;
+    merge::run_in_inner(repo, &["--ff-only".into(), remote_short])?;
     Ok(())
 }
 

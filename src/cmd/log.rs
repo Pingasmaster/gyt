@@ -272,6 +272,11 @@ fn walk(gyt_dir: &std::path::Path, roots: &[ObjectId]) -> Result<HashMap<ObjectI
         if nodes.contains_key(&id) {
             continue;
         }
+        // Shallow clones leave parent commits absent on disk by design.
+        // Silently stop walking at that boundary rather than erroring.
+        if !crate::object::store::exists(gyt_dir, &id) {
+            continue;
+        }
         let c = commit::read(gyt_dir, &id)?;
         let (ts, tz) = parse_timestamp_tz(&c.committer);
         let author = c.authors.first().cloned().unwrap_or_default();

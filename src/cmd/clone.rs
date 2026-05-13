@@ -25,18 +25,43 @@ use crate::net::protocol::{RefEntry, encode_wants, parse_info_refs, parse_packfi
 use crate::object::{ObjectKind, store, tag, tree};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut url: Option<String> = None;
     let mut dir: Option<String> = None;
     let mut insecure = false;
-    for a in args {
+    let mut depth: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
         match a.as_str() {
             "--insecure" => insecure = true,
+            "--depth" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--depth needs a value".into())
+                })?;
+                let n: u32 = v.parse().map_err(|_| {
+                    GytError::InvalidArgument(format!("--depth: not a number: {v}"))
+                })?;
+                if n == 0 {
+                    return Err(GytError::InvalidArgument(
+                        "--depth must be >= 1".into(),
+                    ));
+                }
+                depth = Some(n);
+            }
             "-h" | "--help" => {
-                println!("gyt clone <url> [<dir>] [--insecure]");
+                println!(
+                    "gyt clone <url> [<dir>] [--insecure] [--depth <N>]\n\n\
+                     --depth <N>   Shallow clone: stop walking commit parents\n\
+                                   after N levels per ref tip. Boundary commits\n\
+                                   are recorded in .gyt/shallow so the local\n\
+                                   tree honors the truncation. The default is\n\
+                                   to fetch the full history."
+                );
                 return Ok(());
             }
             other if other.starts_with('-') => {
@@ -56,13 +81,14 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
             }
         }
+        i += 1;
     }
     let url = url.ok_or_else(|| GytError::InvalidArgument("clone <url> [<dir>]".into()))?;
     let dir = match dir {
         Some(d) => PathBuf::from(d),
         None => PathBuf::from(default_dir_from_url(&url)?),
     };
-    clone_into(&url, &dir, insecure)
+    clone_into(&url, &dir, insecure, depth)
 }
 
 fn default_dir_from_url(url: &str) -> Result<String> {
@@ -82,7 +108,7 @@ fn default_dir_from_url(url: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-fn clone_into(url: &str, dir: &PathBuf, insecure: bool) -> Result<()> {
+fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> Result<()> {
     if dir.exists() {
         let mut iter = std::fs::read_dir(dir)?;
         if iter.next().is_some() {
@@ -105,7 +131,7 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool) -> Result<()> {
     let client = open_client(url, insecure)?;
     let server_refs = fetch_info_refs(&client)?;
 
-    let n_objects = walk_and_fetch(&client, &repo, &server_refs, true)?;
+    let n_objects = walk_and_fetch(&client, &repo, &server_refs, true, depth)?;
 
     // Mirror server refs locally as heads/tags.
     let mut n_refs = 0usize;
@@ -178,15 +204,25 @@ pub fn walk_and_fetch(
     repo: &Repo,
     server_refs: &[RefEntry],
     mirror_all_refs: bool,
+    depth: Option<u32>,
 ) -> Result<usize> {
     let _ = mirror_all_refs;
     let mut wants: VecDeque<ObjectId> = VecDeque::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
+    // Depth annotation for ids that *might* be commits (we can't tell
+    // until we decode). Tip refs and tag targets enter at depth 0.
+    // Parents of a commit at depth d enter at depth d+1; if depth+1
+    // exceeds the configured `--depth`, we record the commit in
+    // `shallow_boundary` instead of enqueueing its parents.
+    let mut commit_depth: HashMap<ObjectId, u32> = HashMap::new();
+    let mut shallow_boundary: HashSet<ObjectId> = HashSet::new();
     let mut downloaded = 0usize;
 
     for r in server_refs {
-        if r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/") {
-            enqueue_if_new(repo, &r.id, &mut wants, &mut seen);
+        if (r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/"))
+            && enqueue_if_new(repo, &r.id, &mut wants, &mut seen)
+        {
+            commit_depth.insert(r.id, 0);
         }
     }
 
@@ -233,37 +269,94 @@ pub fn walk_and_fetch(
                 downloaded += 1;
             }
             // Enqueue references.
-            enqueue_refs(repo, kind, &payload, &mut wants, &mut seen)?;
+            enqueue_refs(
+                repo,
+                kind,
+                &payload,
+                &id,
+                &mut wants,
+                &mut seen,
+                &mut commit_depth,
+                &mut shallow_boundary,
+                depth,
+            )?;
         }
     }
+
+    if depth.is_some() && !shallow_boundary.is_empty() {
+        write_shallow(repo, &shallow_boundary)?;
+    }
+
     Ok(downloaded)
 }
 
+/// Persist `.gyt/shallow`: one boundary commit hex per line. The presence
+/// of this file tells the local tree that the commits listed have their
+/// parents intentionally absent from `objects/`, so log/gc/etc. should
+/// treat them as roots rather than reporting missing objects.
+fn write_shallow(repo: &Repo, boundary: &HashSet<ObjectId>) -> Result<()> {
+    let mut ids: Vec<String> = boundary.iter().map(|id| id.to_hex()).collect();
+    ids.sort();
+    let mut body = String::with_capacity(ids.len() * 65);
+    for id in &ids {
+        body.push_str(id);
+        body.push('\n');
+    }
+    fs_util::atomic_write(&repo.gyt_dir.join("shallow"), body.as_bytes())?;
+    Ok(())
+}
+
+/// Mark `id` as needing-fetch (or already known). Returns true iff this
+/// was the first time we saw the id — callers use the return to gate
+/// recording a per-id depth annotation.
 fn enqueue_if_new(
     repo: &Repo,
     id: &ObjectId,
     wants: &mut VecDeque<ObjectId>,
     seen: &mut HashSet<ObjectId>,
-) {
-    if seen.insert(*id) && !store::exists(&repo.gyt_dir, id) {
-        wants.push_back(*id);
+) -> bool {
+    if seen.insert(*id) {
+        if !store::exists(&repo.gyt_dir, id) {
+            wants.push_back(*id);
+        }
+        true
+    } else {
+        false
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Reason: shallow walk threads multiple parallel maps; bundling them into a struct would just rename the noise.
 fn enqueue_refs(
     repo: &Repo,
     kind: ObjectKind,
     payload: &[u8],
+    self_id: &ObjectId,
     wants: &mut VecDeque<ObjectId>,
     seen: &mut HashSet<ObjectId>,
+    commit_depth: &mut HashMap<ObjectId, u32>,
+    shallow_boundary: &mut HashSet<ObjectId>,
+    max_depth: Option<u32>,
 ) -> Result<()> {
     match kind {
         ObjectKind::Blob => {}
         ObjectKind::Commit => {
             let c = crate::object::commit::decode(payload)?;
+            // Tree contents are always fetched in full within the commits
+            // we *do* download — shallow truncates history, not breadth.
             enqueue_if_new(repo, &c.tree, wants, seen);
-            for p in &c.parents {
-                enqueue_if_new(repo, p, wants, seen);
+            let d = commit_depth.get(self_id).copied().unwrap_or(0);
+            let next = d.saturating_add(1);
+            let truncated = matches!(max_depth, Some(max) if next > max);
+            if truncated {
+                if !c.parents.is_empty() {
+                    shallow_boundary.insert(*self_id);
+                }
+            } else {
+                for p in &c.parents {
+                    if enqueue_if_new(repo, p, wants, seen) {
+                        commit_depth.insert(*p, next);
+                    }
+                }
             }
         }
         ObjectKind::Tree => {
@@ -274,7 +367,11 @@ fn enqueue_refs(
         }
         ObjectKind::Tag => {
             let t = tag::decode(payload)?;
-            enqueue_if_new(repo, &t.target, wants, seen);
+            // A tag's target may itself be a commit; treat it as a fresh
+            // tip so its depth restarts at 0 within the shallow walk.
+            if enqueue_if_new(repo, &t.target, wants, seen) {
+                commit_depth.insert(t.target, 0);
+            }
         }
     }
     Ok(())
@@ -343,7 +440,7 @@ mod tests {
         // remove the empty dir; clone should create it
         std::fs::remove_dir_all(&dir).unwrap();
 
-        clone_into(&url, &dir, true).unwrap();
+        clone_into(&url, &dir, true, None).unwrap();
 
         let repo = Repo::open(&dir).unwrap();
         // Verify head ref
@@ -374,7 +471,7 @@ mod tests {
         let dir = tmp_dir("gyt-clone-exists");
         std::fs::write(dir.join("file"), b"x").unwrap();
 
-        let err = clone_into("http://127.0.0.1:1/", &dir, true).unwrap_err();
+        let err = clone_into("http://127.0.0.1:1/", &dir, true, None).unwrap_err();
         match err {
             GytError::Repo(_) => {}
             other => panic!("expected Repo error, got {other:?}"),

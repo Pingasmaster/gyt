@@ -12,24 +12,33 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
-    let mut expire_days: Option<u64> = None;
+    // Default: expire reflog entries older than 90 days (matches git's
+    // gc.reflogExpire default). Without this, commits referenced *only*
+    // by the reflog stay reachable forever and gc reclaims nothing for
+    // the common amend/reset/switch case.
+    let mut expire_days: Option<u64> = Some(90);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 println!(
-                    "gyt gc [--expire-reflog <days>]\n\n\
+                    "gyt gc [--expire-reflog <days>] [--keep-reflog]\n\n\
                      Prune unreachable loose objects from .gyt/objects.\n\n\
                      Reachability roots include every ref (heads, tags, remotes,\n\
                      stash), the detached HEAD if any, any in-progress merge /\n\
-                     rebase / cherry-pick state, AND every reflog entry. This\n\
-                     means commits referenced *only* by the reflog (e.g.\n\
-                     commit-amend orphans) are never pruned — which keeps\n\
-                     `gyt reflog` usable but means the reflog must be expired\n\
-                     before reclaiming their disk.\n\n\
-                     --expire-reflog <days>   First drop reflog entries older\n\
-                                              than <days> days, then run gc.\n\
-                                              Use 0 to wipe the whole reflog."
+                     rebase / cherry-pick state, AND every reflog entry that is\n\
+                     not yet expired.\n\n\
+                     By default reflog entries older than 90 days are dropped\n\
+                     before computing reachability, so commits kept alive only\n\
+                     by the reflog (e.g. commit-amend orphans) eventually get\n\
+                     reclaimed.\n\n\
+                     --expire-reflog <days>   Drop reflog entries older than\n\
+                                              <days> instead of the default 90.\n\
+                                              Use 0 to wipe the whole reflog.\n\
+                     --keep-reflog            Don't drop any reflog entries\n\
+                                              (everything in the reflog stays\n\
+                                              reachable; gc only reclaims\n\
+                                              objects unreachable from any ref)."
                 );
                 return Ok(());
             }
@@ -41,6 +50,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 expire_days = Some(v.parse().map_err(|_| {
                     GytError::InvalidArgument(format!("--expire-reflog: not a number: {v}"))
                 })?);
+            }
+            "--keep-reflog" => {
+                expire_days = None;
             }
             other if other.starts_with('-') => {
                 return Err(GytError::InvalidArgument(format!(

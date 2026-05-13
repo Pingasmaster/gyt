@@ -9,6 +9,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut auth_token: Option<String> = None;
+    let mut auth_tokens_file: Option<PathBuf> = None;
     let mut signers_file: Option<PathBuf> = None;
     let mut policy_config: Option<PathBuf> = None;
 
@@ -24,7 +25,13 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 println!("  --webroot <dir>       Static file webroot (default: site)");
                 println!("  --cert <file>         TLS certificate PEM file");
                 println!("  --key <file>          TLS private key PEM file");
-                println!("  --auth-token <token>  Bearer token required on all requests");
+                println!("  --auth-token <token>  Single bearer token, granting rw on every repo");
+                println!(
+                    "  --auth-tokens <file>  TSV file: <token>\\t<repo-pattern>\\t<rw|ro>"
+                );
+                println!("                        Pattern is a single segment, optionally with a");
+                println!("                        trailing `*` (`*` alone matches every repo).");
+                println!("                        Mutually exclusive with --auth-token.");
                 println!("  --signers <file>      Trusted allowed_signers file (overrides per-repo)");
                 println!(
                     "  --policy-config <f>   Server-side TOML overriding per-repo [commit].sign_required"
@@ -36,6 +43,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     tls_cert,
                     tls_key,
                     auth_token,
+                    auth_tokens_file,
                     signers_file,
                     policy_config,
                 });
@@ -85,6 +93,15 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 auth_token = Some(s);
             }
+            "--auth-tokens" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--auth-tokens requires a file path".into(),
+                    )
+                })?;
+                auth_tokens_file = Some(PathBuf::from(s));
+            }
             "--signers" => {
                 i += 1;
                 let s = args.get(i).cloned().ok_or_else(|| {
@@ -118,6 +135,11 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
             "--cert and --key must be provided together".into(),
         ));
     }
+    if auth_token.is_some() && auth_tokens_file.is_some() {
+        return Err(crate::errors::GytError::InvalidArgument(
+            "--auth-token and --auth-tokens are mutually exclusive".into(),
+        ));
+    }
 
     Ok(ServeConfig {
         listen_addr: listen,
@@ -126,6 +148,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         tls_cert,
         tls_key,
         auth_token,
+        auth_tokens_file,
         signers_file,
         policy_config,
     })

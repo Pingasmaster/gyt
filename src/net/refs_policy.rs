@@ -434,8 +434,20 @@ fn parse_allowed_signers(text: &str) -> Result<Vec<VerifyingKey>> {
     Ok(out)
 }
 
+/// Maximum size of the active `.gyt/audit.log` before rotation (8 MiB).
+const AUDIT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Number of rotated generations to keep (`audit.log.1` .. `audit.log.5`).
+/// At 8 MiB each, the on-disk audit footprint is bounded by ~48 MiB
+/// (active log + 5 rotated). Older rotations are discarded.
+const AUDIT_LOG_KEEP: usize = 5;
+
 /// Append an entry to `<gyt>/audit.log` describing a successful ref update.
 /// Crash-resistant best-effort: errors are dropped because audit is advisory.
+///
+/// Rotation: when the active log crosses `AUDIT_LOG_MAX_BYTES` we rename
+/// `audit.log.{N-1} -> audit.log.N` down through `.1`, then rotate the
+/// active file to `.1` and start a fresh `audit.log`. `audit.log.5`'s
+/// rename to `.6` overwrites nothing; the oldest entries simply fall off.
 pub fn append_audit(
     gyt_dir: &Path,
     update: &crate::net::protocol::RefUpdate,
@@ -455,6 +467,7 @@ pub fn append_audit(
         update.name
     );
     let path = gyt_dir.join("audit.log");
+    rotate_audit_if_needed(gyt_dir, &path);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -462,6 +475,31 @@ pub fn append_audit(
     {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// If `audit.log` exists and exceeds the size threshold, rotate it.
+/// Best-effort: any rename failure aborts the rotation; the next call
+/// will retry. We never panic and never block.
+fn rotate_audit_if_needed(gyt_dir: &Path, path: &Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() < AUDIT_LOG_MAX_BYTES {
+        return;
+    }
+    let slot = |n: usize| gyt_dir.join(format!("audit.log.{n}"));
+    // Drop the oldest, then shift each generation down by one. The
+    // descending order matters: we must vacate slot N+1 before renaming
+    // slot N into it.
+    let _ = std::fs::remove_file(slot(AUDIT_LOG_KEEP));
+    for n in (1..AUDIT_LOG_KEEP).rev() {
+        let from = slot(n);
+        let to = slot(n + 1);
+        if from.exists() {
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
+    let _ = std::fs::rename(path, slot(1));
 }
 
 #[cfg(test)]

@@ -41,6 +41,13 @@ pub struct ServeConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auth_token: Option<String>,
+    /// Path to a TSV ACL file. Each non-blank, non-comment line is
+    /// `<token>\t<repo-pattern>\t<rw|ro>`. When set, this replaces the
+    /// single-token `auth_token` mode: every request must present a
+    /// bearer token that matches at least one ACL entry whose pattern
+    /// covers the requested repo and whose perm is sufficient for the
+    /// operation (writes require `rw`; reads accept either).
+    pub auth_tokens_file: Option<PathBuf>,
     /// Path to an allowed_signers file used by *every* repo this server
     /// hosts. Takes precedence over a per-repo `<gyt>/allowed_signers` so
     /// a pusher with write access to a repo can't bootstrap trust by
@@ -60,7 +67,15 @@ struct Request {
     target: String,
     body: Vec<u8>,
     auth_header: Option<String>,
+    /// True iff the request sent `Connection: close`. We default to
+    /// HTTP/1.1 keep-alive otherwise and reuse the connection for the
+    /// next request from the same client.
+    client_wants_close: bool,
 }
+
+/// Maximum number of requests served on one keep-alive connection.
+/// After this we close so a single client can't pin a worker forever.
+const MAX_REQUESTS_PER_CONN: u32 = 256;
 
 pub fn serve(config: &ServeConfig) -> Result<()> {
     // Fail fast: if the operator passed `--signers <file>` but the file
@@ -104,10 +119,16 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         eprintln!("gyt serve: listening on http://{addr}");
     }
 
+    let auth_acl = match &config.auth_tokens_file {
+        Some(p) => Some(load_acl(p)?),
+        None => None,
+    };
+
     let state = Arc::new(ServerState {
         repos_root: config.repos_root.clone(),
         webroot: config.webroot.clone(),
         auth_token: config.auth_token.clone(),
+        auth_acl,
         signers_file: config.signers_file.clone(),
         policy_config: config.policy_config.clone(),
         shutdown: Mutex::new(false),
@@ -151,9 +172,94 @@ struct ServerState {
     repos_root: PathBuf,
     webroot: PathBuf,
     auth_token: Option<String>,
+    /// Parsed ACL entries. None means no per-repo ACL configured (fall
+    /// back to the simple `auth_token` model). An empty Some(_) means
+    /// the file existed but contained no entries — every request is
+    /// denied, because anything else would be a surprising upgrade
+    /// from "ACL configured" to "wide open".
+    auth_acl: Option<Vec<AclEntry>>,
     signers_file: Option<PathBuf>,
     policy_config: Option<PathBuf>,
     shutdown: Mutex<bool>,
+}
+
+/// One row in the `--auth-tokens` TSV. A token may appear in multiple
+/// rows to grant separate scopes (e.g. rw on one repo, ro on others).
+struct AclEntry {
+    /// Bearer token as presented by the client (plain string compared
+    /// in constant time). Stored plaintext — the ACL file is read at
+    /// startup and is expected to be owner-readable only.
+    token: String,
+    /// Single-segment repo pattern. Either an exact name, `prefix*` for
+    /// starts-with, or `*` for any repo.
+    pattern: String,
+    /// True iff this entry permits writes (objects/have, refs/update).
+    /// False means read-only (info/refs, objects/want).
+    write: bool,
+}
+
+impl AclEntry {
+    fn matches_repo(&self, repo: &str) -> bool {
+        if self.pattern == "*" {
+            return true;
+        }
+        if let Some(prefix) = self.pattern.strip_suffix('*') {
+            return repo.starts_with(prefix);
+        }
+        self.pattern == repo
+    }
+}
+
+/// Parse a `--auth-tokens` file. Lines that are blank or start with `#`
+/// are ignored. Other lines must have exactly three TAB-separated
+/// fields: `token`, `pattern`, `rw|ro`. Anything else is a hard error
+/// because silently dropping a malformed line could downgrade trust.
+fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        crate::errors::GytError::InvalidArgument(format!("read {}: {e}", path.display()))
+    })?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 3 {
+            return Err(crate::errors::GytError::InvalidArgument(format!(
+                "{}: line {}: expected <token>\\t<pattern>\\t<rw|ro>",
+                path.display(),
+                i + 1
+            )));
+        }
+        let token = parts[0].trim().to_string();
+        let pattern = parts[1].trim().to_string();
+        let perm = parts[2].trim();
+        let write = match perm {
+            "rw" => true,
+            "ro" => false,
+            other => {
+                return Err(crate::errors::GytError::InvalidArgument(format!(
+                    "{}: line {}: perm must be `rw` or `ro`, got {other:?}",
+                    path.display(),
+                    i + 1
+                )));
+            }
+        };
+        if token.is_empty() || pattern.is_empty() {
+            return Err(crate::errors::GytError::InvalidArgument(format!(
+                "{}: line {}: token and pattern must be non-empty",
+                path.display(),
+                i + 1
+            )));
+        }
+        out.push(AclEntry {
+            token,
+            pattern,
+            write,
+        });
+    }
+    Ok(out)
 }
 
 /// Bounded-concurrency limiter. Each accepted connection acquires a permit
@@ -204,34 +310,31 @@ impl Drop for WorkerPermit {
 fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
+    for _ in 0..MAX_REQUESTS_PER_CONN {
+        if !serve_one(&mut reader, &mut writer, state)? {
+            break;
+        }
+    }
+    Ok(())
+}
 
-    let req = match read_request(&mut reader) {
+/// Serve one HTTP request on a plain (non-TLS) connection. Returns
+/// `Ok(true)` if the connection may be reused for another request,
+/// `Ok(false)` if it should be closed (client requested close, parse
+/// error, or auth failure).
+fn serve_one<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    state: &ServerState,
+) -> std::io::Result<bool> {
+    let req = match read_request(reader) {
         Ok(r) => r,
-        Err(e) => {
-            write_response(
-                &mut writer,
-                400,
-                "Bad Request",
-                "text/plain",
-                e.to_string().as_bytes(),
-            )?;
-            return Ok(());
+        Err(_) => {
+            // EOF or read timeout: just close. No 400 — the client may
+            // have walked away mid-keep-alive, which is normal.
+            return Ok(false);
         }
     };
-
-    // Token authentication check
-    if let Some(ref token) = state.auth_token
-        && !check_auth(&req, token)
-    {
-        write_response(
-            &mut writer,
-            401,
-            "Unauthorized",
-            "text/plain",
-            b"unauthorized\n",
-        )?;
-        return Ok(());
-    }
 
     let (path, query) = match req.target.find('?') {
         Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
@@ -240,25 +343,34 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
 
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
-    let actor = actor_for(&req);
 
+    if !authorize(state, &req, &route) {
+        write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
+        return Ok(false);
+    }
+
+    let actor = actor_for(&req);
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
-    write_response(&mut writer, status, &reason, &ctype, &body)
+    let keep_alive = !req.client_wants_close;
+    write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
+    Ok(keep_alive)
 }
 
 /// Derive an audit-log actor identifier for the request. We fingerprint
-/// the presented bearer token so two different tokens look distinct in
-/// the log without ever writing the token itself. Anonymous (no token)
-/// requests get "anon".
+/// the presented bearer token with full-strength BLAKE3 (32 bytes →
+/// 64 hex chars) so two distinct tokens are distinguishable AND a
+/// forensic adversary can't feasibly brute-force a target fingerprint
+/// to forge audit entries. Anonymous requests get None → the audit
+/// path records "anon".
 fn actor_for(req: &Request) -> Option<String> {
     let header = req.auth_header.as_deref()?;
     let token = header.strip_prefix("Bearer ")?;
     let h = blake3::hash(token.as_bytes());
     let bytes = h.as_bytes();
-    let mut hex = String::with_capacity(16);
-    for &b in &bytes[..8] {
+    let mut hex = String::with_capacity(64);
+    for &b in bytes {
         use std::fmt::Write as _;
         let _ = write!(hex, "{b:02x}");
     }
@@ -267,43 +379,26 @@ fn actor_for(req: &Request) -> Option<String> {
 
 /// Handle a TLS-wrapped connection.
 fn handle_tls_conn(
-    mut stream: crate::net::tls::ServerTlsStream,
+    stream: crate::net::tls::ServerTlsStream,
     state: &ServerState,
 ) -> std::io::Result<()> {
-    // Read request using a BufReader that borrows the stream mutably.
-    // We drop the reader after read_request returns, so we can write
-    // back through the same stream.
-    let req = {
-        let mut reader = std::io::BufReader::new(&mut stream);
-        match read_request(&mut reader) {
-            Ok(r) => r,
-            Err(e) => {
-                drop(reader);
-                write_response(
-                    &mut stream,
-                    400,
-                    "Bad Request",
-                    "text/plain",
-                    e.to_string().as_bytes(),
-                )?;
-                return Ok(());
-            }
+    let mut reader = std::io::BufReader::new(stream);
+    for _ in 0..MAX_REQUESTS_PER_CONN {
+        if !serve_one_tls(&mut reader, state)? {
+            break;
         }
-    };
-
-    // Token authentication check
-    if let Some(ref token) = state.auth_token
-        && !check_auth(&req, token)
-    {
-        write_response(
-            &mut stream,
-            401,
-            "Unauthorized",
-            "text/plain",
-            b"unauthorized\n",
-        )?;
-        return Ok(());
     }
+    Ok(())
+}
+
+fn serve_one_tls(
+    reader: &mut std::io::BufReader<crate::net::tls::ServerTlsStream>,
+    state: &ServerState,
+) -> std::io::Result<bool> {
+    let req = match read_request(reader) {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
 
     let (path, query) = match req.target.find('?') {
         Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
@@ -312,12 +407,90 @@ fn handle_tls_conn(
 
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
-    let actor = actor_for(&req);
 
+    if !authorize(state, &req, &route) {
+        let writer = reader.get_mut();
+        write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
+        return Ok(false);
+    }
+
+    let actor = actor_for(&req);
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
-    write_response(&mut stream, status, &reason, &ctype, &body)
+    let keep_alive = !req.client_wants_close;
+    let writer = reader.get_mut();
+    write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
+    Ok(keep_alive)
+}
+
+/// Authorize a request. Resolution order:
+///
+/// 1. `auth_acl` set → must present a bearer token matching at least
+///    one entry whose pattern covers the requested repo (or whose entry
+///    is global) and whose perm is sufficient for the route (writes
+///    need `rw`).
+/// 2. `auth_token` set → must present that exact token; full rw on every
+///    route (legacy single-token mode).
+/// 3. Neither set → open server. Reads and writes accepted.
+fn authorize(state: &ServerState, req: &Request, route: &router::RouteMatch) -> bool {
+    if let Some(acl) = &state.auth_acl {
+        let Some(token) = req
+            .auth_header
+            .as_deref()
+            .and_then(|h| h.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        let needs_write = route_needs_write(route);
+        let repo = wire_repo_name(route);
+        // Walk every entry so a non-matching prefix doesn't short-circuit
+        // and leak whether *some* row had the same token. The bool is
+        // accumulated; we never return early on a mismatch.
+        let mut allowed = false;
+        for entry in acl {
+            let token_ok = constant_time_eq(token.as_bytes(), entry.token.as_bytes());
+            let scope_ok = match repo {
+                Some(r) => entry.matches_repo(r),
+                // Non-wire routes (REST API, static files): only a
+                // global `*` pattern grants access.
+                None => entry.pattern == "*",
+            };
+            let perm_ok = !needs_write || entry.write;
+            if token_ok && scope_ok && perm_ok {
+                allowed = true;
+            }
+        }
+        return allowed;
+    }
+
+    if let Some(ref token) = state.auth_token {
+        return check_auth(req, token);
+    }
+
+    true
+}
+
+/// True iff this route mutates server-side state. Writes need `rw`
+/// permission under the ACL; reads can satisfy with `ro`.
+const fn route_needs_write(route: &router::RouteMatch) -> bool {
+    matches!(route.handler, Handler::ObjectsHave | Handler::RefsUpdate)
+}
+
+/// Extract the wire repo name from a route's params, if any. Wire
+/// routes carry a single `repo` segment; REST/static routes don't, so
+/// they can't be scoped per-repo.
+fn wire_repo_name(route: &router::RouteMatch) -> Option<&str> {
+    if !matches!(
+        route.handler,
+        Handler::InfoRefs
+            | Handler::ObjectsWant
+            | Handler::ObjectsHave
+            | Handler::RefsUpdate
+    ) {
+        return None;
+    }
+    router::get_param(&route.params, "repo")
 }
 
 /// Check the request's Authorization header against the expected bearer token.
@@ -394,9 +567,27 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_response_keepalive(w, status, reason, content_type, body, false)
+}
+
+/// Like `write_response` but lets the caller mark the connection as
+/// reusable. We always emit an explicit `Connection:` header so the
+/// client doesn't have to guess against HTTP/1.1 defaults.
+fn write_response_keepalive(
+    w: &mut impl Write,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    keep_alive: bool,
+) -> std::io::Result<()> {
     let mut out = Vec::with_capacity(256 + body.len());
     out.extend_from_slice(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes());
-    out.extend_from_slice(b"Connection: close\r\n");
+    if keep_alive {
+        out.extend_from_slice(b"Connection: keep-alive\r\n");
+    } else {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
     out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
@@ -445,19 +636,26 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
 
     let mut content_length: usize = 0;
     let mut auth_header: Option<String> = None;
+    let mut client_wants_close = false;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let k_trim = k.trim();
+        let v_trim = v.trim();
+        if k_trim.eq_ignore_ascii_case("content-length") {
+            content_length = v_trim.parse().unwrap_or(0);
+        } else if k_trim.eq_ignore_ascii_case("authorization") {
+            auth_header = Some(v_trim.to_string());
+        } else if k_trim.eq_ignore_ascii_case("connection")
+            && v_trim
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("close"))
         {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("authorization")
-        {
-            auth_header = Some(v.trim().to_string());
+            client_wants_close = true;
         }
     }
     if content_length > MAX_BODY_BYTES {
@@ -474,6 +672,7 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         target,
         body,
         auth_header,
+        client_wants_close,
     })
 }
 
@@ -1485,6 +1684,7 @@ mod tests {
             repos_root: repos_root.to_path_buf(),
             webroot: webroot.to_path_buf(),
             auth_token: None,
+            auth_acl: None,
             signers_file: None,
             policy_config: None,
             shutdown: Mutex::new(false),

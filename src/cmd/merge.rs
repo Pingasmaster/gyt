@@ -32,6 +32,13 @@ pub fn run(args: &[String]) -> Result<()> {
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
+    run_in_inner(repo, args)
+}
+
+/// Same as `run_in` but assumes the caller already holds the repo
+/// lock. Used by `pull` to span fetch+merge under a single acquired
+/// lock so a third process can't slip a push in the gap.
+pub fn run_in_inner(repo: &Repo, args: &[String]) -> Result<()> {
     let mut ff_only = false;
     let mut no_ff = false;
     let mut message: Option<String> = None;

@@ -75,11 +75,7 @@ pub struct FetchSummary {
     pub pruned_refs: usize,
 }
 
-pub fn fetch(repo: &Repo, remote: &str, insecure: bool, prune: bool) -> Result<FetchSummary> {
-    fetch_with_refspec(repo, remote, None, insecure, prune)
-}
-
-/// Like `fetch`, but if `refspec` is `Some(name)` only refs whose
+/// Fetch from `remote`. If `refspec` is `Some(name)` only refs whose
 /// short name (under `refs/heads/` or `refs/tags/`) equals that name are
 /// fetched and mirrored to `refs/remotes/<remote>/...`. Useful for CI
 /// fetching just a single branch without downloading every tag.
@@ -91,6 +87,19 @@ pub fn fetch_with_refspec(
     prune: bool,
 ) -> Result<FetchSummary> {
     let _lock = repo.lock()?;
+    fetch_with_refspec_inner(repo, remote, refspec, insecure, prune)
+}
+
+/// Same as `fetch_with_refspec` but assumes the caller already holds
+/// the repo lock. Used by `pull::run_in` to span fetch + merge under a
+/// single lock.
+pub fn fetch_with_refspec_inner(
+    repo: &Repo,
+    remote: &str,
+    refspec: Option<&str>,
+    insecure: bool,
+    prune: bool,
+) -> Result<FetchSummary> {
     let cfg = Config::load(repo)?;
     let url = cfg
         .remotes
@@ -118,7 +127,7 @@ pub fn fetch_with_refspec(
             "fetch: refspec {name:?} did not match any ref on {remote}"
         )));
     }
-    let n_objects = walk_and_fetch(&client, repo, &server_refs, true)?;
+    let n_objects = walk_and_fetch(&client, repo, &server_refs, true, None)?;
 
     // Update refs/remotes/<remote>/<name> for heads and tags.
     let mut updated = 0usize;
@@ -285,7 +294,7 @@ mod tests {
         }
 
         // Fetch.
-        let summary = fetch(&repo, "origin", true, false).unwrap();
+        let summary = fetch_with_refspec(&repo, "origin", None, true, false).unwrap();
         assert!(summary.new_objects >= 3, "got {}", summary.new_objects);
         assert!(summary.updated_refs >= 1, "got {}", summary.updated_refs);
 
