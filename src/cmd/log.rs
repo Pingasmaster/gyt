@@ -257,6 +257,19 @@ fn commit_touches_paths(repo: &Repo, n: &Node, paths: &[String]) -> bool {
     false
 }
 
+fn read_shallow_set(gyt_dir: &std::path::Path) -> std::collections::HashSet<ObjectId> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(text) = std::fs::read_to_string(gyt_dir.join("shallow")) else {
+        return out;
+    };
+    for line in text.lines() {
+        if let Ok(id) = ObjectId::from_hex(line.trim()) {
+            out.insert(id);
+        }
+    }
+    out
+}
+
 fn path_under(path: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
@@ -266,15 +279,41 @@ fn path_under(path: &str, prefix: &str) -> bool {
 }
 
 fn walk(gyt_dir: &std::path::Path, roots: &[ObjectId]) -> Result<HashMap<ObjectId, Node>> {
+    // Shallow clones leave parent commits absent on disk by design. We
+    // consult `.gyt/shallow` so we can distinguish "this commit is an
+    // intentional boundary" from "this commit is missing because the
+    // store is corrupt or a pack file is truncated" — silently swallowing
+    // the latter would let data loss go unnoticed.
+    let shallow = read_shallow_set(gyt_dir);
     let mut nodes: HashMap<ObjectId, Node> = HashMap::new();
     let mut stack: Vec<ObjectId> = roots.to_vec();
     while let Some(id) = stack.pop() {
         if nodes.contains_key(&id) {
             continue;
         }
-        // Shallow clones leave parent commits absent on disk by design.
-        // Silently stop walking at that boundary rather than erroring.
-        if !crate::object::store::exists(gyt_dir, &id) {
+        if shallow.contains(&id) {
+            // Intentional shallow boundary: stop walking past this
+            // commit. The boundary commit itself is still recorded.
+            // Read it so its metadata appears in the log output.
+            let c = match commit::read(gyt_dir, &id) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let (ts, tz) = parse_timestamp_tz(&c.committer);
+            let author = c.authors.first().cloned().unwrap_or_default();
+            nodes.insert(
+                id,
+                Node {
+                    id,
+                    parents: Vec::new(),
+                    timestamp: ts.unwrap_or(0),
+                    tz_offset: tz,
+                    author,
+                    signature_b64: c.signature.clone(),
+                    message: c.message,
+                    tree: c.tree,
+                },
+            );
             continue;
         }
         let c = commit::read(gyt_dir, &id)?;

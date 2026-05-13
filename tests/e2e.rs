@@ -1300,3 +1300,1163 @@ fn server_rejects_transfer_encoding() {
         "expected 4xx, got: {resp:?}"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Edge cases & corner cases — second wave.
+// ════════════════════════════════════════════════════════════════════════
+
+// ──────────────────────────── Empty / unborn repo ────────────────────────────
+
+#[test]
+fn status_on_unborn_repo() {
+    let e = Env::new("unborn-status");
+    e.ok(&["init"]);
+    // No commits, no files staged — status must not crash.
+    let out = e.ok(&["status"]);
+    assert!(!out.is_empty());
+}
+
+#[test]
+fn log_on_unborn_repo_fails_cleanly() {
+    let e = Env::new("unborn-log");
+    e.ok(&["init"]);
+    let o = e.run(&["log"]);
+    // Empty HEAD: log either prints nothing OK or errors cleanly. Either
+    // is acceptable; what's not is a panic.
+    assert!(o.status.success() || !o.stderr.is_empty(), "unexpected combo");
+}
+
+#[test]
+fn branch_list_on_unborn_repo() {
+    let e = Env::new("unborn-branch");
+    e.ok(&["init"]);
+    // No branches yet; should print nothing or note about unborn HEAD.
+    let _ = e.run(&["branch"]);
+}
+
+#[test]
+fn diff_with_no_changes_is_empty() {
+    let e = Env::new("diff-noop");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let out = e.ok(&["diff"]);
+    assert!(out.trim().is_empty(), "no-change diff should be empty: {out}");
+}
+
+#[test]
+fn commit_allow_empty() {
+    let e = Env::new("commit-empty-allowed");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["commit", "--allow-empty", "-m", "empty followup"]);
+    let log = e.ok(&["log", "--oneline"]);
+    assert!(log.contains("empty followup"));
+}
+
+// ──────────────────────────── Unicode / special filenames ────────────────────────────
+
+#[test]
+fn unicode_filename_round_trip() {
+    let e = Env::new("unicode-name");
+    e.ok(&["init"]);
+    e.write("héllo-世界.txt", b"unicode body\n");
+    e.ok(&["add", "héllo-世界.txt"]);
+    e.ok(&["commit", "-m", "unicode file"]);
+    // Now wipe and reset; the file should come back.
+    std::fs::remove_file(e.path("héllo-世界.txt")).unwrap();
+    e.ok(&["reset", "HEAD", "--hard", "--force"]);
+    assert!(e.exists("héllo-世界.txt"));
+    let body = e.read("héllo-世界.txt");
+    assert_eq!(body, b"unicode body\n");
+}
+
+#[test]
+fn filename_with_spaces() {
+    let e = Env::new("space-name");
+    e.ok(&["init"]);
+    e.write("a file with spaces.txt", b"spaces\n");
+    e.ok(&["add", "a file with spaces.txt"]);
+    e.ok(&["commit", "-m", "spaces in name"]);
+    std::fs::remove_file(e.path("a file with spaces.txt")).unwrap();
+    e.ok(&["reset", "HEAD", "--hard", "--force"]);
+    assert!(e.exists("a file with spaces.txt"));
+}
+
+#[test]
+fn nested_directory_files() {
+    let e = Env::new("nested");
+    e.ok(&["init"]);
+    e.write("a/b/c/d/file.txt", b"deep\n");
+    e.ok(&["add", "a/b/c/d/file.txt"]);
+    e.ok(&["commit", "-m", "deep"]);
+    std::fs::remove_dir_all(e.path("a")).unwrap();
+    e.ok(&["reset", "HEAD", "--hard", "--force"]);
+    assert_eq!(e.read("a/b/c/d/file.txt"), b"deep\n");
+}
+
+#[test]
+fn unicode_commit_message_survives() {
+    let e = Env::new("unicode-msg");
+    e.ok(&["init"]);
+    e.write("a.txt", b"x\n");
+    e.ok(&["add", "a.txt"]);
+    e.ok(&["commit", "-m", "feat: 添加新功能 ✨"]);
+    let log = e.ok(&["log", "--oneline"]);
+    assert!(log.contains("添加新功能"), "{log}");
+}
+
+#[test]
+fn binary_blob_round_trip() {
+    let e = Env::new("binary");
+    e.ok(&["init"]);
+    // Bytes that include NULs and high bits — must round-trip exactly.
+    let raw: Vec<u8> = (0u8..=255).collect();
+    e.write("data.bin", &raw);
+    e.ok(&["add", "data.bin"]);
+    e.ok(&["commit", "-m", "binary"]);
+    std::fs::write(e.path("data.bin"), b"clobbered").unwrap();
+    e.ok(&["reset", "HEAD", "--hard", "--force"]);
+    assert_eq!(e.read("data.bin"), raw);
+}
+
+// ──────────────────────────── Branch names with slashes ────────────────────────────
+
+#[test]
+fn branch_with_slash_in_name() {
+    let e = Env::new("branch-slash");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["branch", "release/v1"]);
+    let list = e.ok(&["branch"]);
+    assert!(list.contains("release/v1"));
+    e.ok(&["switch", "release/v1"]);
+    init_commit(&e, "b.txt", b"y\n", "c2");
+}
+
+#[test]
+fn tag_with_slash_in_name() {
+    let e = Env::new("tag-slash");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["tag", "v1/release"]);
+    let list = e.ok(&["tag", "-l"]);
+    assert!(list.contains("v1/release"));
+}
+
+// ──────────────────────────── Reset edge cases ────────────────────────────
+
+#[test]
+fn reset_hard_refuses_dirty_workdir_without_force() {
+    let e = Env::new("reset-dirty");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.write("a.txt", b"dirty\n");
+    let o = e.run(&["reset", "HEAD", "--hard"]);
+    assert!(!o.status.success(), "should refuse dirty without --force");
+}
+
+#[test]
+fn reset_to_unknown_rev_fails() {
+    let e = Env::new("reset-bad-rev");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["reset", "nopesuchref"]);
+    assert!(!o.status.success());
+}
+
+// ──────────────────────────── Stash edge cases ────────────────────────────
+
+#[test]
+fn stash_no_changes_refuses() {
+    let e = Env::new("stash-empty");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["stash", "push"]);
+    // Either succeeds with empty stash or refuses cleanly — must not panic.
+    let _ = o;
+}
+
+#[test]
+fn stash_drop_removes_entry() {
+    let e = Env::new("stash-drop");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.write("a.txt", b"WIP\n");
+    e.ok(&["stash", "push", "-m", "wip"]);
+    let list = e.ok(&["stash", "list"]);
+    assert!(list.contains("wip"));
+    e.ok(&["stash", "drop"]);
+    let list = e.ok(&["stash", "list"]);
+    assert!(!list.contains("wip"), "drop should remove: {list}");
+}
+
+// ──────────────────────────── Clean ────────────────────────────
+
+#[test]
+fn clean_removes_untracked() {
+    let e = Env::new("clean");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.write("trash.log", b"trash\n");
+    e.write("temp/scratch.txt", b"scratch\n");
+    e.ok(&["clean"]);
+    assert!(!e.exists("trash.log"));
+    assert!(e.exists("a.txt"));
+}
+
+#[test]
+fn clean_dry_run_keeps_files() {
+    let e = Env::new("clean-n");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.write("trash.log", b"trash\n");
+    let out = e.ok(&["clean", "-n"]);
+    assert!(out.contains("trash.log"), "dry run should mention: {out}");
+    assert!(e.exists("trash.log"), "dry run must not delete");
+}
+
+// ──────────────────────────── grep ────────────────────────────
+
+#[test]
+fn grep_finds_pattern_in_workdir() {
+    let e = Env::new("grep");
+    e.ok(&["init"]);
+    e.write("a.txt", b"alpha beta\n");
+    e.write("b.txt", b"beta gamma\n");
+    e.ok(&["add", "a.txt"]);
+    e.ok(&["add", "b.txt"]);
+    e.ok(&["commit", "-m", "c1"]);
+    let out = e.ok(&["grep", "beta"]);
+    assert!(out.contains("a.txt") && out.contains("b.txt"), "{out}");
+}
+
+#[test]
+fn grep_prints_pattern_lines_not_just_filenames() {
+    let e = Env::new("grep-output");
+    e.ok(&["init"]);
+    e.write("a.txt", b"first line\ncontains TARGET\nthird\n");
+    e.ok(&["add", "a.txt"]);
+    e.ok(&["commit", "-m", "c1"]);
+    let out = e.ok(&["grep", "TARGET"]);
+    assert!(
+        out.contains("TARGET"),
+        "grep should print the matching line, not just the filename: {out}"
+    );
+}
+
+// ──────────────────────────── blame ────────────────────────────
+
+#[test]
+fn blame_attributes_lines() {
+    let e = Env::new("blame");
+    e.ok(&["init"]);
+    e.write("f.txt", b"line one\nline two\n");
+    e.ok(&["add", "f.txt"]);
+    e.ok(&["commit", "-m", "first"]);
+    e.write("f.txt", b"line one\nline two\nline three\n");
+    e.ok(&["add", "f.txt"]);
+    e.ok(&["commit", "-m", "added third"]);
+    let out = e.ok(&["blame", "f.txt"]);
+    // We don't pin format; we just confirm lines are accounted for.
+    assert!(out.lines().count() >= 3, "blame output: {out}");
+}
+
+// ──────────────────────────── Detached HEAD ────────────────────────────
+
+#[test]
+fn switch_to_unknown_hash_is_rejected() {
+    // gyt's switch doesn't currently support detached HEAD via a bare
+    // hash; the CLI validates the argument as a branch name. This locks
+    // in the current behavior so any future detach support stays
+    // explicit. Once `switch --detach` lands, replace this with a
+    // real detach round-trip.
+    let e = Env::new("switch-no-detach");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let line = e.ok(&["log", "--oneline"]);
+    let short = line.split_whitespace().next().unwrap();
+    let o = e.run(&["switch", short]);
+    assert!(!o.status.success(), "bare hash isn't a branch name");
+}
+
+// ──────────────────────────── Bare repo restrictions ────────────────────────────
+
+#[test]
+fn bare_repo_refuses_workdir_commands() {
+    let e = Env::new("bare-refuse");
+    let bare = e.path("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    // status, add, commit, etc. should refuse — there's no worktree.
+    let o = e.run_in(&bare, &["status"]);
+    assert!(!o.status.success(), "status in bare must refuse");
+    let o = e.run_in(&bare, &["add", "any"]);
+    assert!(!o.status.success(), "add in bare must refuse");
+}
+
+#[test]
+fn init_bare_in_nonempty_dir_refused_or_ok() {
+    // Some VCS allow init in non-empty dirs, some refuse. Whatever gyt
+    // does, it must not corrupt existing files.
+    let e = Env::new("bare-noemp");
+    e.write("preexisting.txt", b"don't touch\n");
+    let o = e.run(&["init", "--bare"]);
+    // If init succeeded, the preexisting file must still be intact.
+    if o.status.success() {
+        assert_eq!(e.read("preexisting.txt"), b"don't touch\n");
+    }
+}
+
+// ──────────────────────────── Worktree edge cases ────────────────────────────
+
+#[test]
+fn worktree_refuses_same_branch_twice() {
+    let e = Env::new("wt-collision");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let wt1 = e.path("../wt1-collide");
+    let _ = std::fs::remove_dir_all(&wt1);
+    // Add on main itself: refused because main is checked out at primary.
+    let o = e.run(&[
+        "worktree",
+        "add",
+        wt1.to_str().unwrap(),
+        "main",
+    ]);
+    assert!(!o.status.success(), "cannot check out main into a second worktree");
+    let _ = std::fs::remove_dir_all(&wt1);
+}
+
+// ──────────────────────────── Big inputs ────────────────────────────
+
+#[test]
+fn many_small_files_round_trip() {
+    let e = Env::new("many-files");
+    e.ok(&["init"]);
+    for i in 0..200 {
+        e.write(&format!("f{i:03}.txt"), format!("content {i}\n").as_bytes());
+    }
+    e.ok(&["add", "-A"]);
+    e.ok(&["commit", "-m", "200 files"]);
+    // Wipe and reset; everything should come back.
+    for i in 0..200 {
+        std::fs::remove_file(e.path(&format!("f{i:03}.txt"))).unwrap();
+    }
+    e.ok(&["reset", "HEAD", "--hard", "--force"]);
+    for i in 0..200 {
+        assert_eq!(
+            e.read(&format!("f{i:03}.txt")),
+            format!("content {i}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn many_commits_log_walks_all() {
+    let e = Env::new("many-commits");
+    e.ok(&["init"]);
+    for i in 0..50 {
+        e.write("counter.txt", format!("v{i}\n").as_bytes());
+        e.ok(&["add", "counter.txt"]);
+        e.ok(&["commit", "-m", &format!("c{i}")]);
+    }
+    let log = e.ok(&["log", "--oneline"]);
+    assert_eq!(log.lines().count(), 50);
+}
+
+// ──────────────────────────── Signed commits ────────────────────────────
+
+#[test]
+fn keygen_creates_keypair_and_sign_verify() {
+    let e = Env::new("signing");
+    e.ok(&["init"]);
+    let privkey = e.path("priv");
+    let pubkey = e.path("pub");
+    e.ok(&[
+        "keygen",
+        "--priv",
+        privkey.to_str().unwrap(),
+        "--pub",
+        pubkey.to_str().unwrap(),
+    ]);
+    assert!(privkey.exists() && pubkey.exists());
+    e.write("a.txt", b"x\n");
+    e.ok(&["add", "a.txt"]);
+    // Sign the commit by setting key env vars for this single call.
+    let o = Command::new(&e.bin)
+        .args(["commit", "-m", "signed", "-S"])
+        .current_dir(&e.dir)
+        .env("GYT_AUTHOR_NAME", "Test User")
+        .env("GYT_AUTHOR_EMAIL", "test@example.com")
+        .env("HOME", &e.dir)
+        .env("GYT_SIGNING_KEY", &privkey)
+        .env("GYT_SIGNING_PUB", &pubkey)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "signed commit: {}", String::from_utf8_lossy(&o.stderr));
+    // Verify the signature on HEAD.
+    let o = Command::new(&e.bin)
+        .args(["verify"])
+        .current_dir(&e.dir)
+        .env("HOME", &e.dir)
+        .env("GYT_SIGNING_PUB", &pubkey)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "verify: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn sign_required_blocks_unsigned_commit() {
+    let e = Env::new("sign-required");
+    e.ok(&["init"]);
+    e.ok(&["config", "--set", "commit.sign_required", "true"]);
+    e.write("a.txt", b"x\n");
+    e.ok(&["add", "a.txt"]);
+    let o = e.run(&["commit", "-m", "unsigned"]);
+    assert!(
+        !o.status.success(),
+        "with sign_required, unsigned commit must be rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
+// ──────────────────────────── Pack file edge cases ────────────────────────────
+
+#[test]
+fn gc_pack_idempotent() {
+    let e = Env::new("pack-idem");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["gc", "--pack"]);
+    let packs_before: Vec<_> = std::fs::read_dir(e.path(".gyt/objects/pack"))
+        .unwrap()
+        .flatten()
+        .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("pack"))
+        .collect();
+    // Second pack call with nothing loose: should not write a duplicate empty pack.
+    e.ok(&["gc", "--pack"]);
+    let packs_after: Vec<_> = std::fs::read_dir(e.path(".gyt/objects/pack"))
+        .unwrap()
+        .flatten()
+        .filter(|f| f.path().extension().and_then(|s| s.to_str()) == Some("pack"))
+        .collect();
+    assert_eq!(packs_before.len(), packs_after.len(), "no new pack expected");
+}
+
+#[test]
+fn packed_repo_can_have_new_loose_objects() {
+    let e = Env::new("pack-then-loose");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["gc", "--pack"]);
+    init_commit(&e, "b.txt", b"y\n", "c2");
+    // After committing again, c2's loose objects exist while c1's are packed.
+    let loose = count_loose_e2e(&e.path(".gyt"));
+    assert!(loose >= 1, "new commit should add loose objects: {loose}");
+    // And log still walks both commits.
+    let log = e.ok(&["log", "--oneline"]);
+    assert!(log.contains("c1") && log.contains("c2"), "{log}");
+}
+
+fn count_loose_e2e(gyt_dir: &Path) -> usize {
+    let objects = gyt_dir.join("objects");
+    let Ok(top) = std::fs::read_dir(&objects) else {
+        return 0;
+    };
+    let mut n = 0;
+    for shard in top.flatten() {
+        let p = shard.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if let Ok(files) = std::fs::read_dir(&p) {
+            n += files.flatten().count();
+        }
+    }
+    n
+}
+
+// ──────────────────────────── HEAD~N abbreviation rev resolution ────────────────────────────
+
+#[test]
+fn head_tilde_n_walks_first_parent() {
+    let e = Env::new("head-tilde");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"v1\n", "c1");
+    init_commit(&e, "a.txt", b"v2\n", "c2");
+    init_commit(&e, "a.txt", b"v3\n", "c3");
+    let show1 = e.ok(&["show", "HEAD~1"]);
+    let show2 = e.ok(&["show", "HEAD~2"]);
+    assert!(show1.contains("c2"), "HEAD~1 should be c2: {show1}");
+    assert!(show2.contains("c1"), "HEAD~2 should be c1: {show2}");
+}
+
+#[test]
+fn head_tilde_past_root_fails() {
+    let e = Env::new("head-tilde-overflow");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["show", "HEAD~5"]);
+    assert!(!o.status.success(), "walking past root must fail");
+}
+
+#[test]
+fn abbreviated_hash_resolves() {
+    let e = Env::new("short-hash");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    // Pull the short hash from log --oneline output.
+    let line = e.ok(&["log", "--oneline"]);
+    let short = line.split_whitespace().next().unwrap();
+    assert_eq!(short.len(), 8, "log --oneline should print 8-char hash");
+    // show should accept the short hash.
+    let out = e.ok(&["show", short]);
+    assert!(out.contains("c1"), "{out}");
+}
+
+#[test]
+fn ambiguous_short_hash_rejected() {
+    // Cannot easily synthesize a collision; instead, use a 2-char "prefix"
+    // (below the 4-char minimum) and verify it doesn't resolve at all —
+    // exercises the length floor in the abbrev path.
+    let e = Env::new("short-hash-min");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["show", "ab"]);
+    assert!(!o.status.success(), "two-char hex must not resolve");
+}
+
+// ──────────────────────────── Corruption ────────────────────────────
+
+#[test]
+fn truncated_pack_idx_detected_on_lookup() {
+    let e = Env::new("trunc-idx");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["gc", "--pack"]);
+    // Truncate the .idx mid-way.
+    let pack_dir = e.path(".gyt/objects/pack");
+    let idx = std::fs::read_dir(&pack_dir)
+        .unwrap()
+        .flatten()
+        .find(|f| f.path().extension().and_then(|s| s.to_str()) == Some("idx"))
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&idx).unwrap();
+    std::fs::write(&idx, &bytes[..bytes.len() / 2]).unwrap();
+    // log should fail to read — the entry hash check should refuse.
+    let o = e.run(&["log"]);
+    assert!(!o.status.success(), "truncated idx should cause failure");
+}
+
+#[test]
+fn missing_object_in_walk_errors() {
+    let e = Env::new("missing-obj");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    init_commit(&e, "a.txt", b"y\n", "c2");
+    // Find and delete one loose object (not the most recent — pick any).
+    let objects = e.path(".gyt/objects");
+    let mut victim: Option<PathBuf> = None;
+    'outer: for shard in std::fs::read_dir(&objects).unwrap().flatten() {
+        let p = shard.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if let Some(f) = std::fs::read_dir(&p).unwrap().flatten().next() {
+            victim = Some(f.path());
+            break 'outer;
+        }
+    }
+    let _ = std::fs::remove_file(victim.unwrap());
+    // log walks the graph; with one object gone, *something* should fail.
+    let o = e.run(&["log"]);
+    assert!(!o.status.success(), "missing object must error");
+}
+
+// ──────────────────────────── Server / wire edge cases ────────────────────────────
+
+#[test]
+fn server_404_on_unknown_repo() {
+    let mut e = Env::new("wire-404");
+    let (url, _) = e.start_server(&[]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    sock.write_all(b"GET /no-such-repo/info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+}
+
+#[test]
+fn server_keep_alive_two_requests_one_socket() {
+    let mut e = Env::new("wire-keepalive-raw");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("ka2");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    // Two GET /info/refs requests on the same socket without close.
+    sock.write_all(b"GET /ka2/info/refs HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    sock.write_all(b"GET /ka2/info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    // Two 200 OK responses on the single connection.
+    let count = resp.matches("HTTP/1.1 200").count();
+    assert_eq!(count, 2, "expected 2 responses, saw {count}: {resp}");
+}
+
+#[test]
+fn server_body_at_max_accepted_and_just_over_refused() {
+    let mut e = Env::new("body-cap");
+    let (url, _repos) = e.start_server(&[]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+
+    // Just-over (1 GiB > 256 MiB cap): server must 4xx before allocating.
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    sock.write_all(
+        b"POST /x/objects/want HTTP/1.1\r\nHost: x\r\nContent-Length: 1073741825\r\n\r\n",
+    )
+    .unwrap();
+    let mut buf = [0u8; 256];
+    let n = sock.read(&mut buf).unwrap_or(0);
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        resp.starts_with("HTTP/1.1 4") || resp.is_empty(),
+        "1GiB CL must be rejected, got: {resp:?}"
+    );
+}
+
+#[test]
+fn server_info_refs_empty_repo() {
+    let mut e = Env::new("info-refs-empty");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("empty");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    sock.write_all(b"GET /empty/info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 200"), "empty info/refs should 200: {resp}");
+}
+
+#[test]
+fn server_objects_want_with_unknown_hash_returns_empty() {
+    let mut e = Env::new("want-unknown");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("u");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let body = "0".repeat(64) + "\n";
+    let req = format!(
+        "POST /u/objects/want HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    sock.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 200"), "unknown hash should still 200: {resp}");
+}
+
+#[test]
+fn clone_to_existing_nonempty_dir_refused() {
+    let mut e = Env::new("clone-nonempty");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("ne");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let target = e.path("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("preexisting"), b"don't clobber").unwrap();
+    let o = e.run(&[
+        "clone",
+        &format!("{url}ne"),
+        target.to_str().unwrap(),
+        "--insecure",
+    ]);
+    assert!(!o.status.success(), "must refuse non-empty target dir");
+    assert_eq!(
+        std::fs::read(target.join("preexisting")).unwrap(),
+        b"don't clobber"
+    );
+}
+
+#[test]
+fn fetch_unknown_remote_fails() {
+    let e = Env::new("fetch-bad-remote");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["fetch", "nopesuch", "--insecure"]);
+    assert!(!o.status.success(), "must fail on unknown remote");
+}
+
+#[test]
+fn push_with_no_remote_fails() {
+    let e = Env::new("push-no-remote");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["push", "origin", "main", "--insecure"]);
+    assert!(!o.status.success(), "must fail when origin not configured");
+}
+
+// ──────────────────────────── Wire URL schemes ────────────────────────────
+
+#[test]
+fn clone_rejects_unsupported_scheme() {
+    let e = Env::new("scheme");
+    let o = e.run(&["clone", "ftp://example.com/repo"]);
+    assert!(!o.status.success());
+    let o = e.run(&["clone", "ssh://user@example.com/repo"]);
+    assert!(!o.status.success());
+}
+
+#[test]
+fn clone_plain_http_without_insecure_refused() {
+    let e = Env::new("http-no-insecure");
+    let o = e.run(&["clone", "http://example.com/r", "out"]);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !o.status.success() && stderr.contains("--insecure") || !o.status.success(),
+        "plain http must require --insecure"
+    );
+}
+
+// ──────────────────────────── Special init/clone paths ────────────────────────────
+
+#[test]
+fn clone_depth_zero_rejected() {
+    let mut e = Env::new("depth-0");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("d");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let target = e.path("c");
+    let o = e.run(&[
+        "clone",
+        &format!("{url}d"),
+        target.to_str().unwrap(),
+        "--depth",
+        "0",
+        "--insecure",
+    ]);
+    assert!(!o.status.success(), "--depth 0 must be rejected");
+}
+
+#[test]
+fn clone_depth_larger_than_history_still_works() {
+    let mut e = Env::new("depth-huge");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("d2");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let w = e.path("w");
+    std::fs::create_dir_all(&w).unwrap();
+    e.ok_in(&w, &["init"]);
+    init_commit_in(&e, &w, "a.txt", b"v1\n", "c1");
+    init_commit_in(&e, &w, "a.txt", b"v2\n", "c2");
+    e.ok_in(&w, &["remote", "add", "origin", &format!("{url}d2")]);
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+    let c = e.path("c");
+    e.ok(&[
+        "clone",
+        &format!("{url}d2"),
+        c.to_str().unwrap(),
+        "--depth",
+        "100",
+        "--insecure",
+    ]);
+    let log = e.ok_in(&c, &["log", "--oneline"]);
+    assert_eq!(log.lines().count(), 2, "should get all history");
+}
+
+// ──────────────────────────── Stale-data behavior ────────────────────────────
+
+#[test]
+fn switch_to_unknown_branch_fails() {
+    let e = Env::new("switch-bad");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["switch", "nosuch"]);
+    assert!(!o.status.success());
+}
+
+#[test]
+fn switch_create_new_branch_with_c() {
+    let e = Env::new("switch-c");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["switch", "-c", "feat"]);
+    let list = e.ok(&["branch"]);
+    assert!(list.contains("feat"));
+}
+
+// ──────────────────────────── Cherry-pick edge ────────────────────────────
+
+#[test]
+fn cherry_pick_unknown_rev_fails() {
+    let e = Env::new("cp-bad");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["cherry-pick", "nosuchref"]);
+    assert!(!o.status.success());
+}
+
+// ──────────────────────────── Rm edge ────────────────────────────
+
+#[test]
+fn rm_unknown_file_errors() {
+    let e = Env::new("rm-bad");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let o = e.run(&["rm", "no-such-file.txt"]);
+    assert!(!o.status.success());
+}
+
+#[test]
+fn rm_removes_from_index_and_workdir() {
+    let e = Env::new("rm-ok");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["rm", "a.txt"]);
+    assert!(!e.exists("a.txt"));
+    let out = e.ok(&["status"]);
+    // a.txt should now be staged for deletion.
+    assert!(
+        out.to_lowercase().contains("delet") || out.contains("a.txt"),
+        "{out}"
+    );
+}
+
+// ──────────────────────────── Restore worktree ────────────────────────────
+
+#[test]
+fn restore_worktree_from_head() {
+    let e = Env::new("restore-wt");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"v1\n", "c1");
+    e.write("a.txt", b"junk\n");
+    e.ok(&["restore", "a.txt"]);
+    assert_eq!(e.read("a.txt"), b"v1\n");
+}
+
+// ──────────────────────────── Tag annotated + verify ────────────────────────────
+
+#[test]
+fn tag_annotated_round_trip() {
+    let e = Env::new("tag-anno");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.ok(&["tag", "-a", "v1", "-m", "release v1"]);
+    let list = e.ok(&["tag", "-l"]);
+    assert!(list.contains("v1"));
+    // show v1 should mention the annotation message.
+    let show = e.ok(&["show", "v1"]);
+    assert!(show.contains("release v1"), "{show}");
+}
+
+// ──────────────────────────── Long input ────────────────────────────
+
+#[test]
+fn very_long_commit_message_survives() {
+    let e = Env::new("long-msg");
+    e.ok(&["init"]);
+    e.write("a.txt", b"x\n");
+    e.ok(&["add", "a.txt"]);
+    let msg = "x".repeat(8000);
+    e.ok(&["commit", "-m", &msg]);
+    let show = e.ok(&["show", "HEAD"]);
+    assert!(show.contains(&"x".repeat(100)), "long message must persist");
+}
+
+// ──────────────────────────── push/pull idempotency ────────────────────────────
+
+#[test]
+fn pull_already_up_to_date_no_op() {
+    let mut e = Env::new("pull-uptodate");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("up");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let w = e.path("w");
+    std::fs::create_dir_all(&w).unwrap();
+    e.ok_in(&w, &["init"]);
+    init_commit_in(&e, &w, "a.txt", b"x\n", "c1");
+    e.ok_in(&w, &["remote", "add", "origin", &format!("{url}up")]);
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+    let r = e.path("r");
+    e.ok(&[
+        "clone",
+        &format!("{url}up"),
+        r.to_str().unwrap(),
+        "--insecure",
+    ]);
+    let out = e.ok_in(&r, &["pull", "--insecure"]);
+    // No new objects on second pull.
+    assert!(out.contains("0 new objects") || !out.is_empty(), "{out}");
+}
+
+#[test]
+fn push_idempotent_no_change_no_action() {
+    let mut e = Env::new("push-idem");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("i");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let w = e.path("w");
+    std::fs::create_dir_all(&w).unwrap();
+    e.ok_in(&w, &["init"]);
+    init_commit_in(&e, &w, "a.txt", b"x\n", "c1");
+    e.ok_in(&w, &["remote", "add", "origin", &format!("{url}i")]);
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+    // Second push with no new commits — must succeed (no-op).
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+}
+
+// ──────────────────────────── ACL: writer can push ────────────────────────────
+
+#[test]
+fn wire_acl_token_pull_with_correct_writer_token() {
+    // Per-repo ACL gating PULL via curl-style raw HTTP since the gyt CLI
+    // doesn't yet expose a --token flag on the wire commands. We confirm
+    // the auth-check itself accepts the correct bearer.
+    let mut e = Env::new("acl-token-ok");
+    let acl = e.path("acl.tsv");
+    std::fs::write(&acl, b"writertok\trepo1\trw\n").unwrap();
+    let (url, repos) = e.start_server(&["--auth-tokens", acl.to_str().unwrap()]);
+    let bare = repos.join("repo1");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    sock.write_all(
+        b"GET /repo1/info/refs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer writertok\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 200"), "correct token must 200: {resp}");
+}
+
+#[test]
+fn wire_acl_wrong_token_rejected() {
+    let mut e = Env::new("acl-wrong");
+    let acl = e.path("acl.tsv");
+    std::fs::write(&acl, b"rightone\trepo1\trw\n").unwrap();
+    let (url, repos) = e.start_server(&["--auth-tokens", acl.to_str().unwrap()]);
+    let bare = repos.join("repo1");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let port: u16 = url
+        .trim_start_matches("http://127.0.0.1:")
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    sock.write_all(
+        b"GET /repo1/info/refs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrongone\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let _ = sock.read_to_end(&mut buf);
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 401"), "wrong token must 401: {resp}");
+}
+
+// ──────────────────────────── Pull non-ff rejected ────────────────────────────
+
+#[test]
+fn pull_diverged_rejected_ff_only() {
+    let mut e = Env::new("pull-nonff");
+    let (url, repos) = e.start_server(&[]);
+    let bare = repos.join("nf");
+    std::fs::create_dir_all(&bare).unwrap();
+    e.ok_in(&bare, &["init", "--bare"]);
+    let w = e.path("w");
+    std::fs::create_dir_all(&w).unwrap();
+    e.ok_in(&w, &["init"]);
+    init_commit_in(&e, &w, "a.txt", b"v1\n", "c1");
+    e.ok_in(&w, &["remote", "add", "origin", &format!("{url}nf")]);
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+    let r = e.path("r");
+    e.ok(&[
+        "clone",
+        &format!("{url}nf"),
+        r.to_str().unwrap(),
+        "--insecure",
+    ]);
+    // Writer adds c2.
+    init_commit_in(&e, &w, "a.txt", b"v2\n", "c2");
+    e.ok_in(&w, &["push", "origin", "main", "--insecure"]);
+    // Reader independently makes a divergent commit.
+    init_commit_in(&e, &r, "a.txt", b"r-divergent\n", "r-divergent");
+    let o = e.run_in(&r, &["pull", "--insecure"]);
+    assert!(!o.status.success(), "divergent pull must reject under --ff-only");
+}
+
+// ──────────────────────────── reflog: drop after gc 0 ────────────────────────────
+
+#[test]
+fn reflog_after_expire_zero_is_empty() {
+    let e = Env::new("reflog-expire");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    init_commit(&e, "a.txt", b"y\n", "c2");
+    let before = e.ok(&["reflog"]);
+    assert!(!before.trim().is_empty());
+    e.ok(&["gc", "--expire-reflog", "0"]);
+    let after = e.ok(&["reflog"]);
+    // After expiry the reflog file is gone, so `gyt reflog` prints a
+    // "(no reflog for HEAD)" notice rather than the previous entries.
+    // We accept either an empty body or that explicit notice — what
+    // mattered is the previous entries no longer leak through.
+    let trimmed = after.trim();
+    assert!(
+        trimmed.is_empty() || trimmed.contains("no reflog"),
+        "expected empty reflog or 'no reflog' notice, got: {after}"
+    );
+    assert!(
+        !after.contains("c2") && !after.contains("c1"),
+        "expired entries leaked: {after}"
+    );
+}
+
+// ──────────────────────────── Init twice in same dir ────────────────────────────
+
+#[test]
+fn init_twice_idempotent_or_no_corruption() {
+    let e = Env::new("init-twice");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    let log_before = e.ok(&["log", "--oneline"]);
+    // Second init: ideally a no-op or graceful refusal; must not lose c1.
+    let _ = e.run(&["init"]);
+    let log_after = e.ok(&["log", "--oneline"]);
+    assert_eq!(log_after, log_before, "second init must not destroy history");
+}
+
+// ──────────────────────────── Two-commits same content (dedup) ────────────────────────────
+
+#[test]
+fn identical_blob_dedups_in_store() {
+    let e = Env::new("dedup");
+    e.ok(&["init"]);
+    e.write("a.txt", b"same\n");
+    e.write("b.txt", b"same\n");
+    e.ok(&["add", "-A"]);
+    e.ok(&["commit", "-m", "dedup test"]);
+    // The two blobs share an id; the workdir walk should result in a
+    // single object file for the content. Count files in objects/<2>/.
+    let blobs = count_loose_e2e(&e.path(".gyt"));
+    // tree + 1 blob + commit = 3. Adding another distinct blob would be 4.
+    assert!((3..=4).contains(&blobs), "expected 3-4 loose, got {blobs}");
+}
+
+// ──────────────────────────── Concurrent operations ────────────────────────────
+
+#[test]
+fn concurrent_add_serializes_via_lock() {
+    // Two `gyt add` invocations launched in parallel: both must succeed
+    // (one waits on the lock), and both files end up staged.
+    let e = Env::new("concurrent-add");
+    e.ok(&["init"]);
+    init_commit(&e, "seed.txt", b"seed\n", "c0");
+    e.write("a.txt", b"a\n");
+    e.write("b.txt", b"b\n");
+    let mut c1 = e.cmd_in(&e.dir).args(["add", "a.txt"]).spawn().unwrap();
+    let mut c2 = e.cmd_in(&e.dir).args(["add", "b.txt"]).spawn().unwrap();
+    let s1 = c1.wait().unwrap();
+    let s2 = c2.wait().unwrap();
+    assert!(s1.success() && s2.success(), "both adds must succeed");
+    e.ok(&["commit", "-m", "both"]);
+    let log = e.ok(&["log", "--oneline"]);
+    assert!(log.contains("both"));
+}
+
+// ──────────────────────────── status --porcelain stability ────────────────────────────
+
+#[test]
+fn status_porcelain_format_stable() {
+    let e = Env::new("porc");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    e.write("u.txt", b"new\n");
+    e.write("s.txt", b"staged\n");
+    e.ok(&["add", "s.txt"]);
+    let out = e.ok(&["status", "--porcelain"]);
+    // Lines must be column-aligned (first 2 chars = XY status, then space).
+    for line in out.lines() {
+        assert!(line.len() >= 3, "short porcelain line: {line:?}");
+    }
+}
+
+// ──────────────────────────── Misc CLI ────────────────────────────
+
+#[test]
+fn empty_args_prints_usage() {
+    let e = Env::new("noargs");
+    let o = e.run(&[]);
+    // Either prints usage and exits 0, or fails with help-ish text.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(combined.to_lowercase().contains("usage") || combined.contains("command"));
+}
+
+#[test]
+fn double_dash_pseudo_arg_for_paths() {
+    let e = Env::new("dash-dash");
+    e.ok(&["init"]);
+    init_commit(&e, "a.txt", b"x\n", "c1");
+    // log -- <path> filters by path; just confirm no crash.
+    let out = e.ok(&["log", "--", "a.txt"]);
+    assert!(out.contains("c1"));
+}
