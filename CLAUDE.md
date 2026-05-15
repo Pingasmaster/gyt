@@ -116,6 +116,23 @@ into an `Authorization: Bearer <token>` header by `src/net/http.rs`.
 The previous test surface relied on tokenless requests being rejected;
 this enables real ACL flows on the wire.
 
+### Single-host serving only
+
+`gyt serve` is a single-host service. On startup it acquires
+`<repos_root>/serve.lock` and refuses to start if another `gyt serve`
+already holds it. This guards against two server processes on the
+same host fighting over the per-process caches (audit-log rotation
+Mutex, rate-limit map, response cache, pack cache) that all the
+per-repo file locks do *not* coordinate.
+
+It does NOT guard against two `gyt serve` processes on *different
+hosts* sharing a network FS (NFS, GlusterFS, ceph-fuse). The stale-
+reclamation in `FileLock` reads `/proc/<pid>` to decide whether a
+crashed holder's lock is reclaimable, and `/proc` is per-host —
+host B can't see host A's pids and may incorrectly conclude that
+A's still-live lock is stale. Multi-host serving of one repo is
+out of scope; shard repos across hosts and route at the LB.
+
 ## Other operational notes
 
 - See `AGENTS.md` for full contributor conventions (clippy policy, branch strategy, CI secrets, no push webhooks).
