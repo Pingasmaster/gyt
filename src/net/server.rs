@@ -27,18 +27,41 @@ use crate::refs;
 use std::io::{BufRead, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 /// Hard cap on request body size. Anything over this is refused before
 /// the server tries to allocate a buffer for it.
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Maximum number of concurrent connection workers. 256 is sized for
-/// a single multi-tenant host serving CI runners + clones; raise via
-/// recompile if a deployment justifies more. Each worker is a real
-/// OS thread; values past ~1000 start to lose to scheduler overhead.
-const MAX_WORKERS: usize = 256;
+/// Default size of the connection worker pool. The OS-thread-per-
+/// connection cost is paid up front (pool is pre-spawned, threads
+/// idle on a channel) instead of per accepted connection. Override
+/// via the `GYT_SERVE_WORKERS` env var; values up to a few thousand
+/// are reasonable on modern kernels — past ~10k you want an async
+/// runtime, which is a different change.
+const DEFAULT_WORKERS: usize = 256;
+
+/// Per-worker thread stack size. The Rust default of 8 MiB × N
+/// threads dominates memory at large pool sizes; 512 KiB is plenty
+/// for our handlers (Myers diff is the only deep recursion candidate
+/// and it's iteratively bounded by MAX_DIFF_BYTES).
+const WORKER_STACK_BYTES: usize = 512 * 1024;
+
+/// Queue capacity in front of the pool. Sized at 2× the worker count
+/// so a brief burst doesn't immediately overflow into 503s — clients
+/// see queuing latency first, refusal only when the burst sustains.
+const fn queue_capacity(workers: usize) -> usize {
+    workers.saturating_mul(2)
+}
+
+fn configured_worker_count() -> usize {
+    std::env::var("GYT_SERVE_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_WORKERS)
+}
 
 /// Body the server writes when it refuses a connection due to pool
 /// exhaustion. Sent before the socket is dropped so clients see a
@@ -169,7 +192,13 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
             st.rate_limiter.gc_idle(std::time::Duration::from_mins(5));
         });
     }
-    let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
+    let pool_size = configured_worker_count();
+    let pool = WorkerPool::spawn(
+        pool_size,
+        queue_capacity(pool_size),
+        &state,
+        tls_config.as_ref(),
+    );
 
     // Install signal handlers. SIGTERM / SIGINT flip the shutdown flag
     // and then poke our own listen socket once so the blocking accept
@@ -179,75 +208,164 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     install_shutdown_signals(state.clone(), addr);
 
     for stream in listener.incoming() {
-        let st = state.clone();
-        let tls = tls_config.clone();
         if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
         match stream {
-            Ok(mut s) => {
+            Ok(s) => {
                 state.metrics.accepts_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let peer_ip = s.peer_addr().ok().map(|sa| sa.ip());
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                 let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-                // Non-blocking permit: if the worker pool is full,
-                // send a 503 with Retry-After and drop the
-                // connection rather than wedging the accept loop on
-                // a Condvar. Stalling the accept thread is what
-                // turns a transient spike into a multi-minute
-                // outage: the kernel backlog fills, new SYNs are
-                // dropped by the listener, and every load balancer
-                // marks us dead before our existing workers finish.
-                let permit = match workers.clone().try_acquire() {
-                    Some(p) => p,
-                    None => {
-                        // Best-effort 503 — failures (peer reset,
-                        // timeout) just close the socket.
-                        use std::io::Write as _;
-                        state
-                            .metrics
-                            .pool_exhausted_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = s.write_all(POOL_FULL_RESPONSE);
-                        let _ = s.shutdown(std::net::Shutdown::Both);
-                        continue;
-                    }
-                };
-                thread::spawn(move || {
-                    let _hold = permit;
-                    // Catch any panic that escapes a handler. A bug
-                    // in handler code that unwinds the worker thread
-                    // could otherwise leave a Mutex on `state.shutdown`
-                    // poisoned, degrading every subsequent connection.
-                    // `AssertUnwindSafe` is appropriate here because
-                    // `s` is local to this thread and `st` (Arc) is
-                    // immutable from a panic-safety standpoint —
-                    // panicked code can't observe a partial mutation
-                    // through a shared reference because there is none.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if let Some(cfg) = &tls {
-                            match crate::net::tls::accept_tls(s, cfg) {
-                                Ok(tls_stream) => {
-                                    let _ = handle_tls_conn(tls_stream, &st, peer_ip);
-                                }
-                                Err(e) => {
-                                    eprintln!("gyt serve: tls accept error: {e}");
-                                }
-                            }
-                        } else {
-                            let _ = handle_conn(s, &st, peer_ip);
-                        }
-                    }));
-                    if let Err(payload) = result {
-                        let msg = downcast_panic_payload(&payload);
-                        eprintln!("gyt serve: worker panic (request dropped): {msg}");
-                    }
-                });
+                if let Err(mut returned) = pool.try_submit(Job {
+                    stream: s,
+                    peer_ip,
+                }) {
+                    use std::io::Write as _;
+                    state
+                        .metrics
+                        .pool_exhausted_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = returned.stream.write_all(POOL_FULL_RESPONSE);
+                    let _ = returned.stream.shutdown(std::net::Shutdown::Both);
+                }
             }
             Err(_) => break,
         }
     }
+    // Drop the pool: closing the channel signals every worker to exit
+    // after finishing its current job. We block until they all join so
+    // the process actually drains before main() returns.
+    drop(pool);
     Ok(())
+}
+
+/// One unit of work handed off from the accept loop to a worker thread.
+struct Job {
+    stream: std::net::TcpStream,
+    peer_ip: Option<std::net::IpAddr>,
+}
+
+/// Fixed-size worker pool. Threads block on `rx.recv()` until a Job
+/// arrives or the channel closes (pool dropped). TLS handshakes
+/// happen *inside* the worker, not on the accept thread, so a slow
+/// TLS handshake from one peer can't stall accept for everyone else.
+struct WorkerPool {
+    /// Bounded sender. `try_send` lets us refuse a job when the pool
+    /// is saturated without blocking the accept loop.
+    tx: Option<sync_channel::Sender>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl WorkerPool {
+    fn spawn(
+        n: usize,
+        queue: usize,
+        state: &Arc<ServerState>,
+        tls: Option<&Arc<rustls::ServerConfig>>,
+    ) -> Self {
+        let (tx, rx) = sync_channel::bounded(queue);
+        let rx = Arc::new(rx);
+        let mut workers = Vec::with_capacity(n);
+        for i in 0..n {
+            let rx = rx.clone();
+            let st = state.clone();
+            let tls = tls.cloned();
+            let builder = thread::Builder::new()
+                .name(format!("gyt-worker-{i}"))
+                .stack_size(WORKER_STACK_BYTES);
+            let handle = builder
+                .spawn(move || worker_loop(&rx, &st, tls.as_ref()))
+                .expect("spawn worker thread");
+            workers.push(handle);
+        }
+        Self {
+            tx: Some(tx),
+            workers,
+        }
+    }
+
+    fn try_submit(&self, job: Job) -> std::result::Result<(), Job> {
+        // tx is Some until Drop runs. Outside Drop it's safe to unwrap.
+        self.tx
+            .as_ref()
+            .expect("pool sender still open")
+            .try_send(job)
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // Close the channel so every worker's recv() returns Err and
+        // the loop exits.
+        self.tx = None;
+        for h in self.workers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+fn worker_loop(
+    rx: &sync_channel::Receiver,
+    state: &ServerState,
+    tls: Option<&Arc<rustls::ServerConfig>>,
+) {
+    while let Ok(job) = rx.recv() {
+        // catch_unwind so a handler panic doesn't kill the worker
+        // thread — we want the thread to come back for the next job.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(cfg) = tls {
+                match crate::net::tls::accept_tls(job.stream, cfg) {
+                    Ok(tls_stream) => {
+                        let _ = handle_tls_conn(tls_stream, state, job.peer_ip);
+                    }
+                    Err(e) => {
+                        eprintln!("gyt serve: tls accept error: {e}");
+                    }
+                }
+            } else {
+                let _ = handle_conn(job.stream, state, job.peer_ip);
+            }
+        }));
+        if let Err(payload) = result {
+            let msg = downcast_panic_payload(&payload);
+            eprintln!("gyt serve: worker panic (request dropped): {msg}");
+        }
+    }
+}
+
+/// Small synchronous bounded-channel wrapper. std's mpsc Receiver is
+/// `!Sync`, so we wrap it in a Mutex to let N workers fan out from
+/// one queue. The Mutex is only held during the recv() handoff, not
+/// for the duration of request handling, so it isn't on the request
+/// path's hot loop.
+mod sync_channel {
+    use super::Job;
+    use std::sync::mpsc::{self, SyncSender, TrySendError};
+    use std::sync::Mutex;
+
+    pub struct Sender(SyncSender<Job>);
+    pub struct Receiver(Mutex<mpsc::Receiver<Job>>);
+
+    pub fn bounded(cap: usize) -> (Sender, Receiver) {
+        let (tx, rx) = mpsc::sync_channel(cap);
+        (Sender(tx), Receiver(Mutex::new(rx)))
+    }
+
+    impl Sender {
+        pub fn try_send(&self, job: Job) -> std::result::Result<(), Job> {
+            match self.0.try_send(job) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(j) | TrySendError::Disconnected(j)) => Err(j),
+            }
+        }
+    }
+    impl Receiver {
+        pub fn recv(&self) -> std::result::Result<Job, mpsc::RecvError> {
+            let g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.recv()
+        }
+    }
 }
 
 /// Spawn a thread that watches for SIGTERM / SIGINT / SIGQUIT, flips
@@ -391,68 +509,6 @@ fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
         });
     }
     Ok(out)
-}
-
-/// Bounded-concurrency limiter. Each accepted connection acquires a permit
-/// that is released when its handler thread exits. Connections beyond the
-/// cap block in `accept` until a permit frees up.
-struct WorkerLimiter {
-    inner: Mutex<usize>,
-    cv: Condvar,
-    cap: usize,
-}
-
-impl WorkerLimiter {
-    const fn new(cap: usize) -> Self {
-        Self {
-            inner: Mutex::new(0),
-            cv: Condvar::new(),
-            cap,
-        }
-    }
-
-    fn acquire(self: Arc<Self>) -> WorkerPermit {
-        let mut n = self.inner.lock().unwrap();
-        while *n >= self.cap {
-            n = self.cv.wait(n).unwrap();
-        }
-        *n += 1;
-        drop(n);
-        WorkerPermit {
-            limiter: self.clone(),
-        }
-    }
-
-    /// Non-blocking variant: returns None when at capacity instead of
-    /// stalling the accept thread on a Condvar. Used to bound the
-    /// accept loop's latency under load — if every worker is busy we
-    /// send a 503 immediately rather than letting connections pile
-    /// up in the kernel backlog.
-    fn try_acquire(self: Arc<Self>) -> Option<WorkerPermit> {
-        let mut n = self.inner.lock().unwrap();
-        if *n >= self.cap {
-            return None;
-        }
-        *n += 1;
-        drop(n);
-        Some(WorkerPermit {
-            limiter: self.clone(),
-        })
-    }
-}
-
-struct WorkerPermit {
-    limiter: Arc<WorkerLimiter>,
-}
-
-impl Drop for WorkerPermit {
-    fn drop(&mut self) {
-        {
-            let mut n = self.limiter.inner.lock().unwrap();
-            *n = n.saturating_sub(1);
-        }
-        self.limiter.cv.notify_one();
-    }
 }
 
 /// Best-effort string for a panic payload that came back from
