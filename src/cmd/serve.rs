@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut listen = "127.0.0.1:8080".to_string();
+    let mut h2_listen: Option<String> = None;
+    let mut h3_listen: Option<String> = None;
     let mut repos_root = PathBuf::from(".");
     let mut webroot = PathBuf::from("site");
     let mut tls_cert: Option<PathBuf> = None;
@@ -36,8 +38,16 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 println!(
                     "  --policy-config <f>   Server-side TOML overriding per-repo [commit].sign_required"
                 );
+                println!(
+                    "  --listen-h2 <addr>    Optional HTTP/2 listen address (requires --cert/--key)"
+                );
+                println!(
+                    "  --listen-h3 <addr>    Optional HTTP/3 (UDP/QUIC) listen address (requires --cert/--key)"
+                );
                 return Ok(ServeConfig {
                     listen_addr: listen,
+                    h2_listen_addr: h2_listen,
+                    h3_listen_addr: h3_listen,
                     repos_root,
                     webroot,
                     tls_cert,
@@ -120,6 +130,24 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 policy_config = Some(PathBuf::from(s));
             }
+            "--listen-h2" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--listen-h2 requires an address".into(),
+                    )
+                })?;
+                h2_listen = Some(s);
+            }
+            "--listen-h3" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--listen-h3 requires an address".into(),
+                    )
+                })?;
+                h3_listen = Some(s);
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -141,8 +169,16 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         ));
     }
 
+    if (h2_listen.is_some() || h3_listen.is_some()) && tls_cert.is_none() {
+        return Err(crate::errors::GytError::InvalidArgument(
+            "--listen-h2 / --listen-h3 require --cert and --key".into(),
+        ));
+    }
+
     Ok(ServeConfig {
         listen_addr: listen,
+        h2_listen_addr: h2_listen,
+        h3_listen_addr: h3_listen,
         repos_root,
         webroot,
         tls_cert,

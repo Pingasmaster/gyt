@@ -3,6 +3,8 @@
 
 pub mod api;
 pub mod cache;
+pub mod h2_server;
+pub mod h3_server;
 pub mod http;
 pub mod metrics;
 pub mod protocol;
