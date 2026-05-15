@@ -41,9 +41,12 @@ use crate::errors::{GytError, Result};
 use crate::fs_util;
 use crate::hash::{self, ObjectId};
 use crate::object::{Object, ObjectKind, store};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PACK_MAGIC: &[u8; 4] = b"GYTP";
 const IDX_MAGIC: &[u8; 4] = b"GYPI";
@@ -173,10 +176,68 @@ pub fn id_in_packs(gyt_dir: &Path, id: &ObjectId) -> bool {
     false
 }
 
+/// Process-wide cache of parsed .idx files. The key is the idx's
+/// canonical path; the value is the file bytes plus the mtime we
+/// observed when we cached them. A stale entry (mtime moved forward)
+/// is dropped on the next access.
+///
+/// Why cache at all: with N packs per repo and frequent reads, the
+/// pre-cache `lookup_in_idx` re-read every .idx from disk on every
+/// `store::read` call. For a clone walking 100k objects across 250
+/// packs that's 250 × 100k = 25M file opens. The cache turns the
+/// hot read path into one mmap-equivalent per pack per process.
+///
+/// Packs are immutable — once written, neither the .pack nor the
+/// .idx changes. The mtime check is only a defense against operator
+/// surprise (e.g. someone restoring a backup file on top of a live
+/// pack). Hit rate is effectively 100%.
+struct IdxCacheEntry {
+    bytes: Vec<u8>,
+    mtime: SystemTime,
+}
+
+static IDX_CACHE: OnceLock<Mutex<HashMap<PathBuf, IdxCacheEntry>>> = OnceLock::new();
+
+fn idx_cache() -> &'static Mutex<HashMap<PathBuf, IdxCacheEntry>> {
+    IDX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get the idx file bytes, hitting the cache when possible. The
+/// returned Vec is cloned out of the cache so callers don't hold the
+/// Mutex while binary-searching.
+fn idx_bytes(idx_path: &Path) -> Result<Vec<u8>> {
+    let canon = idx_path.canonicalize().unwrap_or_else(|_| idx_path.to_path_buf());
+    // Probe mtime first so a stale entry can be dropped before we
+    // copy bytes out.
+    let mtime = std::fs::metadata(idx_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(UNIX_EPOCH);
+    {
+        let g = idx_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = g.get(&canon)
+            && entry.mtime == mtime
+        {
+            return Ok(entry.bytes.clone());
+        }
+    }
+    let bytes = fs_util::read_all(idx_path)?;
+    idx_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            canon,
+            IdxCacheEntry {
+                bytes: bytes.clone(),
+                mtime,
+            },
+        );
+    Ok(bytes)
+}
+
 /// Binary-search `idx_path` for `id`, returning its offset in the
 /// matching .pack file if present.
 fn lookup_in_idx(idx_path: &Path, id: &ObjectId) -> Result<Option<u64>> {
-    let bytes = fs_util::read_all(idx_path)?;
+    let bytes = idx_bytes(idx_path)?;
     if bytes.len() < IDX_HEADER_LEN + TRAILER_LEN {
         return Err(GytError::Object(format!(
             "pack idx {}: too short",

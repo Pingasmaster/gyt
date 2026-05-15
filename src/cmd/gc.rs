@@ -120,12 +120,35 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Collect every loose object under `<gyt>/objects/<2>/<62>`, write
-/// them into a single new pack file, then delete the loose files.
-/// Returns the number of objects packed. Errors during deletion are
-/// swallowed (the pack is what readers will look at next; a leftover
-/// loose copy is harmless duplication, not corruption).
+/// Collect every loose object under `<gyt>/objects/<2>/<62>`, group
+/// them into target-sized packs (default 4 MiB, override via
+/// `GYT_PACK_TARGET_BYTES`), write each pack, then delete the loose
+/// files for objects that successfully landed in a pack. Returns the
+/// total number of objects packed.
+///
+/// Why multiple packs instead of one huge pack:
+///
+/// - At 1M objects per repo a single pack would be hundreds of MiB,
+///   forcing readers to keep an O(1M) idx in memory and making
+///   incremental pack rotation impossible (you'd have to rewrite the
+///   whole pack every time you wanted to evict).
+/// - Filesystem-level optimisations (ZFS recordsize, page-cache
+///   prefetch, archival snapshots) favour packs sized to one
+///   filesystem record. 4 MiB matches the recommended `recordsize=4M`
+///   for ZFS-on-spinners with large-blob workloads.
+/// - Inode pressure is what we're solving: N loose → N/(target_avg)
+///   packs. For target=4 MiB and ~4 KiB average compressed object
+///   that's a ~1000× inode reduction, which is the bottleneck the
+///   1M-user audit identified.
+///
+/// `GYT_PACK_TARGET_BYTES=0` falls back to "one giant pack" — useful
+/// for batch initial-import workflows where the operator wants the
+/// fewest files possible.
 fn pack_loose_objects(gyt_dir: &Path) -> Result<usize> {
+    pack_loose_objects_at_target(gyt_dir, pack_target_bytes())
+}
+
+fn pack_loose_objects_at_target(gyt_dir: &Path, target: usize) -> Result<usize> {
     use crate::object::pack::{PackEntry, write_pack};
     let objects_dir = gyt_dir.join("objects");
     let Ok(top) = std::fs::read_dir(&objects_dir) else {
@@ -138,7 +161,6 @@ fn pack_loose_objects(gyt_dir: &Path) -> Result<usize> {
         if !dir_path.is_dir() {
             continue;
         }
-        // Skip the pack subdirectory itself.
         if dir_path.file_name().and_then(|s| s.to_str()) == Some("pack") {
             continue;
         }
@@ -168,7 +190,6 @@ fn pack_loose_objects(gyt_dir: &Path) -> Result<usize> {
             let Ok(on_disk) = std::fs::read(&fp) else {
                 continue;
             };
-            // We need the kind for the entry; decode just enough.
             let raw = match crate::compress::decode(&on_disk) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -187,14 +208,62 @@ fn pack_loose_objects(gyt_dir: &Path) -> Result<usize> {
     if entries.is_empty() {
         return Ok(0);
     }
-    let packed = entries.len();
-    write_pack(gyt_dir, entries)?;
-    // Only after the pack is durably on disk do we delete the loose
-    // copies; if the rename fails, the loose objects stay readable.
-    for p in &loose_paths {
-        let _ = std::fs::remove_file(p);
+
+    // Sort by id so the grouping is deterministic. Two `gyt gc --pack`
+    // runs on the same object set produce identical packs (mod the
+    // pack-content-hash filename, which is itself derived from those
+    // bytes — so even the filenames match).
+    let mut pairs: Vec<(PackEntry, std::path::PathBuf)> =
+        entries.into_iter().zip(loose_paths).collect();
+    pairs.sort_by_key(|(e, _)| e.id);
+
+    let total_objects = pairs.len();
+
+    // Group entries into batches summing to ≤ target compressed bytes.
+    // target == 0 → one giant batch (legacy behaviour).
+    let mut batches: Vec<Vec<(PackEntry, std::path::PathBuf)>> = Vec::new();
+    let mut current: Vec<(PackEntry, std::path::PathBuf)> = Vec::new();
+    let mut current_bytes: usize = 0;
+    for pair in pairs {
+        let sz = pair.0.on_disk.len();
+        if target > 0 && !current.is_empty() && current_bytes + sz > target {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current.push(pair);
+        current_bytes += sz;
     }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    let mut packed = 0usize;
+    for batch in batches {
+        let (batch_entries, batch_paths): (Vec<PackEntry>, Vec<std::path::PathBuf>) =
+            batch.into_iter().unzip();
+        let n = batch_entries.len();
+        // Best-effort: if a single batch fails, abort the run but
+        // leave already-packed loose copies alone. Their bytes are
+        // safely duplicated in the corresponding new pack.
+        write_pack(gyt_dir, batch_entries)?;
+        for p in &batch_paths {
+            let _ = std::fs::remove_file(p);
+        }
+        packed += n;
+    }
+    debug_assert_eq!(packed, total_objects);
     Ok(packed)
+}
+
+/// Read the operator-configured target pack size from
+/// `GYT_PACK_TARGET_BYTES`. 0 disables splitting (single giant pack
+/// — the pre-multi-pack behaviour). Default 4 MiB matches a typical
+/// ZFS `recordsize=4M` deployment.
+fn pack_target_bytes() -> usize {
+    std::env::var("GYT_PACK_TARGET_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4 * 1024 * 1024)
 }
 
 /// Drop every reflog entry whose timestamp is older than `days` days.
@@ -511,4 +580,88 @@ fn read_shallow(gyt_dir: &Path) -> HashSet<ObjectId> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{ObjectKind, store};
+
+    fn tmp_gyt(prefix: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let p = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::create_dir_all(p.join("objects")).unwrap();
+        p
+    }
+
+    #[test]
+    fn pack_target_size_produces_multiple_packs() {
+        let gyt = tmp_gyt("gyt-pack-target");
+        // Write 12 loose objects with varied payloads so the
+        // compressed sizes aren't all identical.
+        let mut ids = Vec::new();
+        for i in 0..12usize {
+            let payload = vec![b'a' + (i as u8 % 26); 256 + i * 100];
+            let id = store::write_bytes(&gyt, ObjectKind::Blob, &payload).unwrap();
+            ids.push(id);
+        }
+        // Target 512 bytes per pack ⇒ several packs.
+        let n_packed = pack_loose_objects_at_target(&gyt, 512).unwrap();
+        assert_eq!(n_packed, 12);
+
+        // Multiple packs expected.
+        let pack_count = std::fs::read_dir(gyt.join("objects").join("pack"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some("pack")
+            })
+            .count();
+        assert!(
+            pack_count >= 2,
+            "expected >=2 packs at 512-byte target, got {pack_count}"
+        );
+
+        // Every object still readable via store::read (which falls
+        // through to the pack reader after a loose miss).
+        for id in &ids {
+            let obj = store::read(&gyt, id).expect("read after pack");
+            assert_eq!(obj.id, *id);
+        }
+
+        // Loose copies removed.
+        for id in &ids {
+            let hex = id.to_hex();
+            let p = gyt
+                .join("objects")
+                .join(&hex[..2])
+                .join(&hex[2..]);
+            assert!(!p.exists(), "loose copy not deleted: {}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    #[test]
+    fn pack_target_zero_yields_single_pack() {
+        let gyt = tmp_gyt("gyt-pack-zero");
+        for i in 0..8usize {
+            let payload = format!("blob-{i}");
+            let _ = store::write_bytes(&gyt, ObjectKind::Blob, payload.as_bytes()).unwrap();
+        }
+        let n = pack_loose_objects_at_target(&gyt, 0).unwrap();
+        assert_eq!(n, 8);
+        let pack_count = std::fs::read_dir(gyt.join("objects").join("pack"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some("pack")
+            })
+            .count();
+        assert_eq!(pack_count, 1, "target=0 should produce one pack");
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
 }
