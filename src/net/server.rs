@@ -17,6 +17,7 @@ use crate::net::api::{
     self, BlobInfo, CommitInfo, DiffFileInfo, DiffHunkInfo, DiffLine, RefInfo, RepoInfo,
     TreeEntryInfo,
 };
+use crate::net::cache::ResponseCache;
 use crate::net::metrics::Metrics;
 use crate::net::rate_limit::{LimitConfig, RateLimiter};
 use crate::net::refs_policy;
@@ -151,6 +152,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         metrics: Metrics::default(),
         listen_addr: addr,
         rate_limiter: RateLimiter::new(LimitConfig::DEFAULT_IP, LimitConfig::DEFAULT_ACTOR),
+        response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 10_000),
     });
 
     // Background GC for idle rate-limit buckets. Without this the
@@ -300,6 +302,10 @@ struct ServerState {
     /// same trick.
     listen_addr: std::net::SocketAddr,
     rate_limiter: RateLimiter,
+    /// Short-TTL cache for cheap read endpoints. Sized for ~10k
+    /// distinct keys; entries expire in 2 s by default and are
+    /// invalidated explicitly on refs/update.
+    response_cache: ResponseCache,
 }
 
 /// One row in the `--auth-tokens` TSV. A token may appear in multiple
@@ -1083,6 +1089,10 @@ fn error_response(status: u16, msg: &str) -> (u16, String, Vec<u8>, String) {
 fn repo_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, Vec<u8>, String) {
     let page = api::parse_page(params, 1);
     let per_page = api::parse_per_page(params, 30, 100);
+    let cache_key = format!("repo_list:p={page}:pp={per_page}");
+    if let Some((body, ctype)) = state.response_cache.get(&cache_key) {
+        return (200, "OK".into(), body, ctype);
+    }
 
     let mut repos: Vec<(String, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&state.repos_root) {
@@ -1125,7 +1135,13 @@ fn repo_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         per_page,
         total,
     );
-    json_response(&body)
+    let body_bytes = body.into_bytes();
+    state.response_cache.insert(
+        cache_key,
+        body_bytes.clone(),
+        "application/json".into(),
+    );
+    (200, "OK".into(), body_bytes, "application/json".into())
 }
 
 fn repo_info_from(state: &ServerState, owner: &str, name: &str) -> RepoInfo {
@@ -1433,6 +1449,11 @@ fn refs_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
     let owner = router::get_param(params, "owner").unwrap_or("");
     let name = router::get_param(params, "name").unwrap_or("");
 
+    let cache_key = format!("api_refs:{owner}/{name}");
+    if let Some((body, ctype)) = state.response_cache.get(&cache_key) {
+        return (200, "OK".into(), body, ctype);
+    }
+
     let Some(repo) = open_repo(state, owner, name) else {
         return error_response(404, &format!("repo {owner}/{name} not found"));
     };
@@ -1468,7 +1489,13 @@ fn refs_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
 
     let items: Vec<String> = all_refs.iter().map(super::api::RefInfo::to_json).collect();
     let body = format!("[{}]", items.join(","));
-    json_response(&body)
+    let body_bytes = body.into_bytes();
+    state.response_cache.insert(
+        cache_key,
+        body_bytes.clone(),
+        "application/json".into(),
+    );
+    (200, "OK".into(), body_bytes, "application/json".into())
 }
 
 // ---------- Handler: diff two revs ----------
@@ -1904,6 +1931,12 @@ fn wire_info_refs(
     state: &ServerState,
     params: &[(String, String)],
 ) -> (u16, String, Vec<u8>, String) {
+    let repo = router::get_param(params, "repo").unwrap_or("");
+    let cache_key = format!("wire_info_refs:{repo}");
+    if let Some((body, ctype)) = state.response_cache.get(&cache_key) {
+        return (200, "OK".into(), body, ctype);
+    }
+
     let dir = match wire_repo_dir(state, params) {
         Some(d) => d,
         None => {
@@ -1927,6 +1960,9 @@ fn wire_info_refs(
     for (name, oid) in &refs {
         writeln!(body, "{oid}\t{name}").ok();
     }
+    state
+        .response_cache
+        .insert(cache_key, body.clone(), "text/plain".into());
     (200, "OK".into(), body, "text/plain".into())
 }
 
@@ -2187,6 +2223,23 @@ fn wire_refs_update(
             Err(_) => n_failed += 1,
         }
     }
+    // Invalidate every cached response that depended on this repo's
+    // refs — wire info/refs, the REST refs list, and the per-page
+    // repo listings (which include each repo's head commit).
+    if n_updated > 0 {
+        let repo = router::get_param(params, "repo").unwrap_or("");
+        state.response_cache.invalidate_prefix(&format!("wire_info_refs:{repo}"));
+        // We don't know which owner/name the REST API mapped this
+        // repo to, so flush the whole api_refs/repo_list family.
+        state.response_cache.invalidate_prefix("api_refs:");
+        state.response_cache.invalidate_prefix("repo_list:");
+    }
+
+    state
+        .metrics
+        .refs_updated_total
+        .fetch_add(u64::from(n_updated), std::sync::atomic::Ordering::Relaxed);
+
     let body = format!("updated={n_updated} failed={n_failed}");
     (200, "OK".into(), body.into_bytes(), "text/plain".into())
 }
@@ -2263,6 +2316,7 @@ mod tests {
                 LimitConfig::DEFAULT_IP,
                 LimitConfig::DEFAULT_ACTOR,
             ),
+            response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 1000),
         })
     }
 
