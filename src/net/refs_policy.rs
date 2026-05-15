@@ -511,9 +511,15 @@ fn audit_warn_once(msg: &str) {
 /// rotation; the next call will retry. We never panic and never block
 /// on disk I/O for long.
 ///
-/// Concurrency: serialized via `AUDIT_ROTATE_LOCK`. Two threads passing
-/// the threshold simultaneously would otherwise interleave the
-/// descending-rename loop, losing one generation per race.
+/// Concurrency: serialized via TWO locks. AUDIT_ROTATE_LOCK is the
+/// in-process mutex that's been here since the audit-log was added.
+/// `audit-rotate.lock` (a `FileLock`) is the cross-process guard
+/// needed once multiple `gyt serve` processes can share a repos_root
+/// (SO_REUSEPORT + `--allow-multiprocess`). Without the file lock,
+/// two processes passing the threshold simultaneously would
+/// interleave the descending-rename loop and lose one generation per
+/// race; worse, with the same generation under two names you could
+/// duplicate audit content across rotated files.
 ///
 /// Symlink safety: `symlink_metadata` does *not* follow symlinks, so a
 /// local attacker who has replaced `audit.log` with a symlink can't
@@ -523,6 +529,16 @@ fn rotate_audit_if_needed(gyt_dir: &Path, path: &Path) {
     let _guard = AUDIT_ROTATE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Cross-process: take the file lock for the rotation. Tight
+    // timeout because rotation is fast; if another process is mid-
+    // rotate we just bail and let the next append retry.
+    let _file_lock = match crate::fs_util::FileLock::acquire(
+        &gyt_dir.join("audit-rotate.lock"),
+        std::time::Duration::from_millis(500),
+    ) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };

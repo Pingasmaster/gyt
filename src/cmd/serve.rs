@@ -15,6 +15,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut auth_tokens_file: Option<PathBuf> = None;
     let mut signers_file: Option<PathBuf> = None;
     let mut policy_config: Option<PathBuf> = None;
+    let mut allow_multiprocess = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -50,6 +51,13 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                      \x20                      Line 1 = current key (32-byte hex), optional line 2 = previous key.\n\
                      \x20                      Use the same file on every replica for cross-replica resumption."
                 );
+                println!(
+                    "  --allow-multiprocess  Skip the single-instance serve.lock so multiple\n\
+                     \x20                      gyt serve processes can share the same repos_root\n\
+                     \x20                      and the same --listen port (SO_REUSEPORT distributes\n\
+                     \x20                      accepts). On-disk locks keep data correct; per-process\n\
+                     \x20                      caches and rate-limit buckets diverge per replica."
+                );
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     h2_listen_addr: h2_listen,
@@ -63,6 +71,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     auth_tokens_file,
                     signers_file,
                     policy_config,
+                    allow_multiprocess,
                 });
             }
             "--listen" => {
@@ -164,6 +173,9 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 tls_ticket_key = Some(PathBuf::from(s));
             }
+            "--allow-multiprocess" => {
+                allow_multiprocess = true;
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -210,6 +222,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         auth_tokens_file,
         signers_file,
         policy_config,
+        allow_multiprocess,
     })
 }
 

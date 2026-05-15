@@ -173,6 +173,14 @@ pub struct ServeConfig {
     /// access to `.gyt/config.toml` could otherwise flip the flag off
     /// for their own next push.
     pub policy_config: Option<PathBuf>,
+    /// When true, skip the `repos_root/serve.lock` single-instance
+    /// guard so multiple `gyt serve` processes can run against the
+    /// same repos_root. Pair with SO_REUSEPORT (always enabled) to
+    /// get operator-level horizontal scaling on one host. Per-process
+    /// state (caches, rate-limit map, metrics) is then independent
+    /// per replica — the file-level locks (refs.lock, objects.lock,
+    /// audit-rotate.lock) keep the on-disk data correct.
+    pub allow_multiprocess: bool,
 }
 
 pub fn serve(config: &ServeConfig) -> Result<()> {
@@ -219,21 +227,43 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     // stale-reclamation in FileLock relies on /proc, which is per-
     // host. Multi-host serving of one repo is out of scope today;
     // shard your repos across hosts and route at the LB.
-    let serve_lock = crate::fs_util::FileLock::acquire(
-        &config.repos_root.join("serve.lock"),
-        std::time::Duration::from_secs(2),
-    )
-    .map_err(|e| crate::errors::GytError::Repo(format!(
-        "another gyt serve appears to be running on {} ({e}); refusing to start. If the previous process crashed, remove {}/serve.lock manually after confirming no gyt process holds it.",
-        config.repos_root.display(),
-        config.repos_root.display(),
-    )))?;
+    let serve_lock = if config.allow_multiprocess {
+        // Multi-process mode: skip the single-instance lock. Caller
+        // is opting into running N gyt serve processes on the same
+        // repos_root, with SO_REUSEPORT distributing accepts.
+        None
+    } else {
+        Some(crate::fs_util::FileLock::acquire(
+            &config.repos_root.join("serve.lock"),
+            std::time::Duration::from_secs(2),
+        )
+        .map_err(|e| crate::errors::GytError::Repo(format!(
+            "another gyt serve appears to be running on {} ({e}); refusing to start. \
+             Pass --allow-multiprocess to run multiple processes (kernel SO_REUSEPORT \
+             will distribute accepts) or remove {}/serve.lock after confirming no \
+             gyt process holds it.",
+            config.repos_root.display(),
+            config.repos_root.display(),
+        )))?)
+    };
 
-    // Bind synchronously so we can fail fast with a clean error. We
-    // then hand the listener to the tokio runtime via from_std after
-    // marking it nonblocking — tokio needs that to drive accept() on
-    // its reactor.
-    let listener_std = TcpListener::bind(&config.listen_addr)?;
+    // Bind synchronously via std so we can fail fast with a clean
+    // error. SO_REUSEPORT (Linux/BSD) is set so multiple `gyt serve`
+    // processes can share the same port — the kernel hashes incoming
+    // connections across the bound sockets, giving operator-level
+    // horizontal scaling on one host. SO_REUSEPORT is a no-op when
+    // only one process binds, so we always set it.
+    //
+    // We construct via std socket → set option → bind → listen so we
+    // don't need a separate dep (tokio::net::TcpSocket would also
+    // work but adds an async step before the runtime is built).
+    let parsed: std::net::SocketAddr = config
+        .listen_addr
+        .parse()
+        .map_err(|e| crate::errors::GytError::InvalidArgument(format!(
+            "--listen {}: {e}", config.listen_addr,
+        )))?;
+    let listener_std = bind_with_reuseport(parsed)?;
     let addr = listener_std.local_addr()?;
     listener_std.set_nonblocking(true)?;
 
@@ -629,6 +659,43 @@ Content-Length: 24\r\n\
 Content-Type: text/plain\r\n\
 \r\n\
 server pool exhausted\r\n";
+
+/// Bind a TCP listener with SO_REUSEADDR + SO_REUSEPORT. Listen
+/// backlog is sized generously (1024) so the kernel can absorb a
+/// burst of SYNs while the async accept loop is busy.
+///
+/// SO_REUSEADDR alone lets you re-bind after a fast restart (skip the
+/// TIME_WAIT window). SO_REUSEPORT additionally lets multiple
+/// processes bind the same port simultaneously — the kernel
+/// distributes incoming connections across them by a 4-tuple hash.
+/// That's the horizontal-scale story for a single host: run N
+/// `gyt serve` processes on the same `--listen` and the kernel
+/// load-balances. Pre-this, all accept traffic funnelled through
+/// one socket and one accept loop.
+fn bind_with_reuseport(addr: std::net::SocketAddr) -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| crate::errors::GytError::Net(format!("socket(): {e}")))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| crate::errors::GytError::Net(format!("SO_REUSEADDR: {e}")))?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .map_err(|e| crate::errors::GytError::Net(format!("SO_REUSEPORT: {e}")))?;
+    socket
+        .bind(&SockAddr::from(addr))
+        .map_err(|e| crate::errors::GytError::Net(format!("bind {addr}: {e}")))?;
+    socket
+        .listen(1024)
+        .map_err(|e| crate::errors::GytError::Net(format!("listen(): {e}")))?;
+    Ok(socket.into())
+}
 
 /// Spawn a thread that watches for SIGTERM / SIGINT / SIGQUIT, flips
 /// `state.shutdown`, then opens a single self-connection so the
