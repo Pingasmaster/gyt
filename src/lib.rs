@@ -16,9 +16,18 @@
 // level to keep clippy --all-targets clean. The original behind-the-
 // scenes module structure was `mod x;` from main.rs and these never
 // fired. Tracked for cleanup if/when we publish the crate.
-#![allow(clippy::too_long_first_doc_paragraph)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::return_self_not_must_use)]
+#![expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "crate docs above are a single discussion paragraph; splitting it harms readability"
+)]
+#![expect(
+    clippy::must_use_candidate,
+    reason = "pedantic noise on small helpers whose return is conventionally inspected at the call site"
+)]
+#![expect(
+    clippy::return_self_not_must_use,
+    reason = "builder methods returning Self are the standard pattern; #[must_use] adds noise without protecting anything"
+)]
 
 pub mod ci_wasm;
 pub mod cli;

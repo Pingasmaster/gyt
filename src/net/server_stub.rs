@@ -13,6 +13,14 @@
 //
 // For tests only — never used in production.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::unwrap_in_result,
+    clippy::string_slice,
+    clippy::integer_division,
+    reason = "this module is the test-only HTTP/1.1 stub server (the file header says `For tests only — never used in production`); panicking on unexpected input is the test-server idiom"
+)]
+
 use crate::compress;
 use crate::errors::Result;
 use crate::hash::{self, ObjectId};
@@ -103,7 +111,7 @@ struct Request {
 // Reason: each thread spawned to handle a connection takes owned `Arc`s
 // rather than references because the spawn outlives the calling stack
 // frame. Clippy can't see across the spawn boundary.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value, reason = "the value is consumed downstream; passing by value matches ownership semantics")]
 fn handle_conn(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
@@ -156,7 +164,7 @@ fn handle_conn(
 // codec calls and `Vec` builds for code clarity; the alternative (fine-
 // grained scopes around every helper) hurts readability without buying
 // throughput because the test stub is single-threaded per request.
-#[allow(clippy::significant_drop_tightening)]
+#[expect(clippy::significant_drop_tightening, reason = "lock scope intentionally spans the whole critical section")]
 fn route(
     method: &str,
     path: &str,

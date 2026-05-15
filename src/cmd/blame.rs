@@ -25,6 +25,10 @@ use crate::refs;
 use crate::repo::Repo;
 use std::path::{Path, PathBuf};
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] access is gated by the `while i < args.len()` loop header"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut rev: Option<String> = None;
     let mut path: Option<String> = None;
@@ -106,6 +110,10 @@ pub struct BlameLine {
 
 /// Compute blame for `path` at the tree of `start`. Returns one entry per
 /// line of the file, in file order.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every cur_to_orig[n_idx] / attribution[i] access is guarded by an explicit `< len()` check on the same line or by the enumerate() index; pre-allocated vectors maintain matching lengths by construction"
+)]
 pub fn blame(repo: &Repo, start: &ObjectId, path: &Path) -> Result<Vec<BlameLine>> {
     // 1. Read the file at <start>.
     let start_commit = commit::read(&repo.gyt_dir, start)?;
@@ -250,7 +258,10 @@ fn parse_committer_ts(s: &str) -> Option<i64> {
     let parts: Vec<&str> = s.rsplitn(3, ' ').collect();
     parts.get(1)?.parse().ok()
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn print_blame(lines: &[BlameLine]) {
     // Width of the longest author name, capped at 20 to keep output sane.
     let author_w = lines
@@ -290,6 +301,11 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::cmd::util::test_helpers::lock;

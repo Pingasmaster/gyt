@@ -183,7 +183,11 @@ pub struct ServeConfig {
     /// audit-rotate.lock) keep the on-disk data correct.
     pub allow_multiprocess: bool,
 }
-
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_in_result,
+    reason = "the invariant guarded by this expect cannot fail (verified at the call site); the invariant guarded by this unwrap cannot fail (verified at the call site)"
+)]
 pub fn serve(config: &ServeConfig) -> Result<()> {
     // Fail fast: if the operator passed `--signers <file>` but the file
     // doesn't exist, the previous behavior was to silently fall back to
@@ -937,6 +941,10 @@ impl AclEntry {
 /// are ignored. Other lines must have exactly three TAB-separated
 /// fields: `token`, `pattern`, `rw|ro`. Anything else is a hard error
 /// because silently dropping a malformed line could downgrade trust.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         crate::errors::GytError::InvalidArgument(format!("read {}: {e}", path.display()))
@@ -996,6 +1004,10 @@ fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
 /// the `rate_limited` flag lets the caller know whether to keep the
 /// connection alive (we deliberately keep it alive for 429 so a
 /// reasonable client can retry on the same connection).
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 pub(crate) fn dispatch_request(
     state: &ServerState,
     method: &str,
@@ -2624,6 +2636,10 @@ fn wire_refs_update(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::init;
     use crate::config::Config;

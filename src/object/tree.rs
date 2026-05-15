@@ -40,6 +40,10 @@ pub fn encode(entries: &[TreeEntry]) -> Vec<u8> {
     out
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "payload[i..] is gated by `while i < payload.len()`; payload[i..i+space] / [i..i+nul] / [i..i+HASH_LEN] are gated by `space`/`nul` coming from position() on payload[i..] (so they fit) and an explicit `i + HASH_LEN > payload.len()` early return"
+)]
 pub fn decode(payload: &[u8]) -> Result<Vec<TreeEntry>> {
     let mut entries = Vec::new();
     let mut i = 0;
@@ -87,6 +91,11 @@ pub fn read(repo: &Path, id: &ObjectId) -> Result<Vec<TreeEntry>> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash;
 

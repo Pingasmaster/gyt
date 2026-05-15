@@ -196,6 +196,12 @@ fn workdir_dirty_paths(repo: &Repo) -> Result<Vec<std::path::PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::hash::ObjectId;

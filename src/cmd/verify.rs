@@ -10,6 +10,10 @@ use crate::object::commit;
 use crate::refs;
 use crate::repo::Repo;
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;

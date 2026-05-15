@@ -4,6 +4,10 @@
 //! command logic can run end-to-end without invoking other commands.
 
 #![cfg(test)]
+#![expect(
+    clippy::unwrap_used,
+    reason = "test scaffolding module: panicking on unexpected input is how a test signals failure"
+)]
 
 use crate::hash::ObjectId;
 use crate::object::{commit, tree};

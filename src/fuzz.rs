@@ -2,8 +2,6 @@
 //
 // Provides `fuzz_object` which safely tries to interpret arbitrary byte
 // sequences as various gyt data formats, catching all panics.
-#![allow(dead_code)]
-
 use std::panic::catch_unwind;
 
 /// Outcome of fuzzing one byte slice against all decoders.
@@ -13,7 +11,7 @@ use std::panic::catch_unwind;
 // them into a single bool-per-kind struct is the cleanest representation;
 // flattening into an enum or bitset would obscure intent and make the
 // fuzz tooling harder to extend.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools, reason = "discrete capability flags read independently at use sites — collapsing into a state machine would obscure intent")]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FuzzOutcome {
     pub blob_ok: bool,
@@ -69,6 +67,10 @@ pub fn fuzz_object(b: &[u8]) -> FuzzOutcome {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     // ── helpers ──────────────────────────────────────────────────────────

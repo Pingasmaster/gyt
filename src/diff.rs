@@ -23,6 +23,10 @@ pub enum DiffOp<'a> {
 
 /// Split a buffer on `\n`. A trailing line without a newline is included.
 /// An empty input yields an empty Vec (no spurious empty line).
+#[expect(
+    clippy::indexing_slicing,
+    reason = "buf[start..i] and buf[start..] use indices that are themselves yielded by enumerate() over buf — they are by construction valid offsets into buf"
+)]
 pub fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
     if buf.is_empty() {
         return Vec::new();
@@ -42,7 +46,11 @@ pub fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Myers' diff between two slices of lines. Returns a flat ordered op list.
-#[allow(clippy::many_single_char_names)]
+#[expect(clippy::many_single_char_names, reason = "single-letter names are conventional shorthand in this algorithm")]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "all v[idx(k)], a[x], b[y], trace[d] indexing is bounded: x∈[0,n_i] and y∈[0,m_i] are checked by `x < n_i && y < m_i`; idx(k) returns k+offset which stays inside v_size=2*max+1 by Myers algorithm invariants"
+)]
 pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
     let n = a.len();
     let m = b.len();
@@ -84,7 +92,7 @@ pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
             // Follow the diagonal (snake). The cast indices are non-negative
             // by construction (we just initialized x ≥ 0 and y = x − k where
             // both bounds are checked above), so a usize cast is safe.
-            #[allow(clippy::suspicious_operation_groupings)] // Reason: Myers' algorithm checks (x < n) && (y < m) with x = a-index, y = b-index — they are independent dimensions, not interchangeable.
+            #[expect(clippy::suspicious_operation_groupings, reason = "Myers' algorithm uses two independent dimension indices; not interchangeable")] // Reason: Myers' algorithm checks (x < n) && (y < m) with x = a-index, y = b-index — they are independent dimensions, not interchangeable.
             while x < n_i && y < m_i && a[x as usize] == b[y as usize] {
                 x += 1;
                 y += 1;
@@ -157,6 +165,10 @@ struct Hunk<'a> {
     ops: Vec<DiffOp<'a>>,
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every ops[N] / ops[hunk_op_start..trail_end] is gated by an explicit length check (i < n, run_end < n, trail_end < n) on the same line"
+)]
 fn group_hunks<'a>(ops: &[DiffOp<'a>], context: usize) -> Vec<Hunk<'a>> {
     // Walk ops once, tracking 0-based positions in a/b. Emit hunks
     // around runs of non-equal ops with up to `context` Equal lines on
@@ -363,6 +375,10 @@ pub fn count_changes(a: &[u8], b: &[u8]) -> (usize, usize) {
 
 /// Render a `--stat` line for one file:  `filename | N +++++---`
 /// Bar width max 20 chars. Shows inserts as `+`, deletes as `-`.
+#[expect(
+    clippy::integer_division,
+    reason = "intentional truncating integer division"
+)]
 pub fn render_stat(filename: &str, ins: usize, del: usize) -> String {
     let total = ins + del;
     if total == 0 {
@@ -389,6 +405,10 @@ pub fn render_stat(filename: &str, ins: usize, del: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

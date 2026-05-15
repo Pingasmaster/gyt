@@ -1,3 +1,10 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::modulo_arithmetic,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Regression tests for the server-hardening branch:
 //   - audit-log write failures surface on stderr (A8)
 //   - commit_list capped at 10 000 ancestors (A16)
@@ -9,11 +16,7 @@
 // indirectly by spamming malformed requests (each one hits a parse
 // path) and confirming the server is still serving afterwards.
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::zombie_processes)]
+#![expect(clippy::zombie_processes, reason = "test harness deliberately leaves the child process to clean up at drop time")]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

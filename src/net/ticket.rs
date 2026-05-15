@@ -70,6 +70,10 @@ impl SharedTicketer {
     /// lines are ignored. The first non-blank line is the current key;
     /// the second is the optional previous key. Each key is exactly
     /// 64 hex characters (32 bytes).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "lines[0] is gated by `lines.is_empty()` early return; lines[1] is gated by `lines.len() == 2` check"
+    )]
     pub fn from_file(path: &Path) -> Result<Self> {
         enforce_private_mode(path)?;
         let body = std::fs::read_to_string(path).map_err(|e| {
@@ -106,6 +110,11 @@ impl SharedTicketer {
     }
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "hex[i*2..i*2+2] for i in 0..32 fits because hex.len() == 64 is checked at function entry; hex is ASCII so byte ranges are char-boundary safe; bytes[i] is in-range because 0..32 matches the [u8; 32] size"
+)]
 fn parse_key(hex: &str) -> Result<Key<Aes256Gcm>> {
     if hex.len() != 64 {
         return Err(GytError::Net(format!(
@@ -142,6 +151,10 @@ impl ProducesTickets for SharedTicketer {
         Some(out)
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "cipher[..NONCE_LEN] / cipher[NONCE_LEN..] is gated by the `cipher.len() < NONCE_LEN` early return"
+    )]
     fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
         if cipher.len() < NONCE_LEN {
             return None;
@@ -184,6 +197,11 @@ fn enforce_private_mode(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use std::io::Write as _;
 

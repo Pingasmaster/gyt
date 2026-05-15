@@ -154,7 +154,7 @@ pub fn list_refs(repo_gyt_dir: &Path, prefix: &str) -> Result<Vec<(String, Objec
     Ok(out)
 }
 
-#[allow(clippy::only_used_in_recursion)]
+#[expect(clippy::only_used_in_recursion, reason = "parameter threads recursion state, used to keep the signature stable")]
 fn walk(
     dir: &Path,
     prefix: &str,
@@ -225,6 +225,11 @@ pub fn resolve(repo_gyt_dir: &Path, head: &Head) -> Result<Option<ObjectId>> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash::HASH_LEN;
 

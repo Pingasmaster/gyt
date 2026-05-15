@@ -1,6 +1,4 @@
 // Networking modules are scaffolded for future CLI wiring.
-#![allow(dead_code)]
-
 pub mod api;
 pub mod cache;
 pub mod h2_server;

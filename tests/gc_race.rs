@@ -1,3 +1,11 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Regression tests for the gc-vs-objects/have race (closed by
 // commit "gc: objects.lock + grace + issue/PR ref seeding").
 //
@@ -12,12 +20,9 @@
 //      server repo; every pushed commit is observable on a final
 //      clone. This is the end-to-end shape of the race.
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::zombie_processes)]
-#![allow(clippy::duration_suboptimal_units)]
+#![expect(clippy::redundant_closure_for_method_calls, reason = "explicit closure makes captured environment visible at the call site")]
+#![expect(clippy::zombie_processes, reason = "test harness deliberately leaves the child process to clean up at drop time")]
+#![expect(clippy::duration_suboptimal_units, reason = "intentional in test scaffolding")]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -141,7 +146,7 @@ fn start_server(env: &Env, repos_root: &Path) -> (Child, u16) {
     panic!("server didn't start");
 }
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "intentional in test scaffolding")]
 fn count_loose_objects(repo: &Path) -> usize {
     let objects = repo.join(".gyt").join("objects");
     let mut n = 0;

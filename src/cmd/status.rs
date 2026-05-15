@@ -229,6 +229,10 @@ fn detect_renames(
 /// that has a tracking ref for X. Quietly skips both lines if there's no
 /// HEAD branch or no matching remote-tracking ref — we never invent
 /// information.
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn print_branch_status(repo: &Repo) {
     let Ok(head) = refs::read_head(&repo.gyt_dir) else {
         return;
@@ -418,6 +422,10 @@ fn print_short_status(staged: &[(PathBuf, String)], untracked: &[PathBuf]) {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use std::fs;

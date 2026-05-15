@@ -21,6 +21,10 @@ pub struct Tag {
     pub message: String,
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "writeln! to String never fails; the Result is only present for io::Write compatibility"
+)]
 pub fn encode(t: &Tag) -> Vec<u8> {
     let mut s = String::new();
     writeln!(s, "object {}", t.target).unwrap();
@@ -115,8 +119,6 @@ pub fn decode(payload: &[u8]) -> Result<Tag> {
 pub fn write(repo: &Path, t: &Tag) -> Result<ObjectId> {
     store::write_bytes(repo, ObjectKind::Tag, &encode(t))
 }
-
-#[allow(dead_code)]
 pub fn read(repo: &Path, id: &ObjectId) -> Result<Tag> {
     let obj = store::read(repo, id)?;
     if obj.kind != ObjectKind::Tag {
@@ -130,6 +132,10 @@ pub fn read(repo: &Path, id: &ObjectId) -> Result<Tag> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash;
 

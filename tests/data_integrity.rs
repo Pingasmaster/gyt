@@ -1,3 +1,13 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::integer_division,
+    clippy::modulo_arithmetic,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Data-integrity / corruption test suite for `gyt`.
 //
 // These tests drive the real `gyt` binary as a subprocess and intentionally
@@ -23,17 +33,10 @@
 //   9. Signing / policy enforcement
 //  10. Soak (#[ignore] by default)
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::manual_assert)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::many_single_char_names)]
-#![allow(clippy::zombie_processes)]
-#![allow(clippy::missing_const_for_fn)]
+#![expect(clippy::manual_assert, reason = "intentional in test scaffolding")]
+#![expect(clippy::single_char_pattern, reason = "single-char-in-string is occasionally clearer than the char form in test fixtures")]
+#![expect(clippy::many_single_char_names, reason = "intentional in test scaffolding")]
+#![expect(clippy::zombie_processes, reason = "test harness deliberately leaves the child process to clean up at drop time")]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -268,7 +271,7 @@ fn list_loose_objects(gyt_dir: &Path) -> Vec<PathBuf> {
 /// Return the BLAKE3-suffix on-disk hex form of an object file path (the
 /// 2-char dir + the rest of the filename joined). Used to identify
 /// objects by id without needing the gyt library.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "intentional in test scaffolding")]
 fn id_from_path(p: &Path) -> String {
     let stem = p.file_name().unwrap().to_string_lossy().into_owned();
     let prefix = p.parent().unwrap().file_name().unwrap().to_string_lossy();
@@ -2207,7 +2210,7 @@ fn server_returns_500_under_corrupt_repo_no_panic() {
     assert_eq!(status, 200, "info/refs should not be 500 on corrupt obj");
 }
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "intentional in test scaffolding")]
 fn init_commit_in(e: &Env, dir: &Path, file: &str, body: &[u8], msg: &str) {
     let p = dir.join(file);
     if let Some(parent) = p.parent() {

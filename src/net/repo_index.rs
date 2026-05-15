@@ -65,6 +65,10 @@ impl RepoIndex {
     /// Both args are 1-based for `page`, and `per_page` is the slice
     /// length. Out-of-range pages return an empty slice with the
     /// correct total — matching the existing /api/repos contract.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    )]
     pub fn list(&self, page: usize, per_page: usize) -> (Vec<RepoIndexEntry>, usize) {
         let g = self
             .entries
@@ -80,6 +84,10 @@ impl RepoIndex {
     }
 
     /// Look up a single entry. None if not in the index.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    )]
     pub fn get(&self, owner: &str, name: &str) -> Option<RepoIndexEntry> {
         let g = self
             .entries
@@ -106,6 +114,10 @@ impl RepoIndex {
     /// is O(N) on the shift, but updates are dominated by the disk
     /// I/O that produced the entry; in-place shift of 1M Vec entries
     /// is ~5 ms.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    )]
     pub fn upsert(&self, entry: RepoIndexEntry) {
         let mut g = self
             .entries
@@ -120,7 +132,6 @@ impl RepoIndex {
 
     /// Drop an entry (e.g., operator removed a repo). Best-effort —
     /// missing keys are silently ignored.
-    #[allow(dead_code)]
     pub fn remove(&self, owner: &str, name: &str) {
         let mut g = self
             .entries
@@ -220,6 +231,10 @@ fn read_metadata(repo_path: &Path, owner: &str, name: &str) -> Option<RepoIndexE
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::init;
 

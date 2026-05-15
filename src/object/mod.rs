@@ -41,14 +41,12 @@ impl ObjectKind {
 
 #[derive(Debug, Clone)]
 pub struct Object {
-    #[allow(dead_code)]
     pub id: ObjectId,
     pub kind: ObjectKind,
     pub payload: Vec<u8>,
 }
 
 impl Object {
-    #[allow(dead_code)]
     pub fn new(kind: ObjectKind, payload: Vec<u8>) -> Self {
         let raw = store::build_raw(kind, &payload);
         let id = crate::hash::hash_bytes(&raw);

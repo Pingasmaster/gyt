@@ -1,3 +1,10 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // End-to-end tests for the `gyt issue` / `gyt discussion` subcommands.
 //
 // Drives the real `gyt` binary to confirm:
@@ -10,11 +17,8 @@
 //
 // Each test creates a private tempdir and cleans up on Drop.
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::zombie_processes)]
+#![expect(clippy::single_char_pattern, reason = "single-char-in-string is occasionally clearer than the char form in test fixtures")]
+#![expect(clippy::zombie_processes, reason = "test harness deliberately leaves the child process to clean up at drop time")]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

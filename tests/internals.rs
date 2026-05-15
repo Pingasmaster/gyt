@@ -1,3 +1,11 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::integer_division,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // White-box data-integrity tests against the gyt library.
 //
 // These call into the gyt crate directly so we can drive corruption,
@@ -14,17 +22,9 @@
 // numbers (#1..#78) cross-referenced in comments where they come
 // from the plan.
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::manual_assert)]
-#![allow(clippy::needless_range_loop)]
-#![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::many_single_char_names)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::assertions_on_constants)]
-#![allow(clippy::single_match)]
+#![expect(clippy::cast_possible_truncation, reason = "intentional in test scaffolding")]
+#![expect(clippy::assertions_on_constants, reason = "intentional in test scaffolding")]
+#![expect(clippy::single_match, reason = "intentional in test scaffolding")]
 
 use gyt::compress;
 use gyt::hash::{self, ObjectId};

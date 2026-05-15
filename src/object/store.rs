@@ -17,6 +17,10 @@ pub fn build_raw(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "raw[..nul] / raw[nul+1..] is gated by nul being a valid index from raw.iter().position(...) — so nul is in 0..raw.len() and nul+1 ≤ raw.len() (a valid empty-slice index)"
+)]
 pub fn parse_raw(raw: &[u8]) -> Result<(ObjectKind, Vec<u8>)> {
     let nul = raw
         .iter()
@@ -40,7 +44,10 @@ pub fn parse_raw(raw: &[u8]) -> Result<(ObjectKind, Vec<u8>)> {
     }
     Ok((kind, payload.to_vec()))
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 pub fn path_for(repo: &Path, id: &ObjectId) -> PathBuf {
     let hex = id.to_hex();
     repo.join("objects").join(&hex[..2]).join(&hex[2..])
@@ -57,8 +64,6 @@ pub fn write_bytes(repo: &Path, kind: ObjectKind, payload: &[u8]) -> Result<Obje
     fs_util::atomic_write(&path, &stored)?;
     Ok(id)
 }
-
-#[allow(dead_code)]
 pub fn write(repo: &Path, obj: &Object) -> Result<ObjectId> {
     let id = write_bytes(repo, obj.kind, &obj.payload)?;
     debug_assert_eq!(id, obj.id);
@@ -95,6 +100,11 @@ pub fn exists(repo: &Path, id: &ObjectId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use std::fs;
 
@@ -160,6 +170,10 @@ mod tests {
 
 #[cfg(test)]
 mod tempdir {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: tmp_dir creation failure in a test means the test cannot run, which is a fatal-loud signal"
+    )]
     use std::path::{Path, PathBuf};
 
     pub struct Dir(PathBuf);

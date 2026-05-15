@@ -11,11 +11,8 @@ pub const BOLD: &str = "\x1b[1m";
 pub const RED: &str = "\x1b[31m";
 pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
-#[allow(dead_code)]
 pub const BLUE: &str = "\x1b[34m";
 pub const CYAN: &str = "\x1b[36m";
-
-#[allow(dead_code)]
 pub fn paint(color: &str, s: &str) -> String {
     if use_color() {
         format!("{color}{s}{RESET}")

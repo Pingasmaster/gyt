@@ -12,6 +12,14 @@ use crate::cmd::{ci_env, ci_secret};
 use crate::errors::{GytError, Result};
 use std::path::PathBuf;
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every args[0] / args[1..] / args[i] access is gated by an explicit args.is_empty() / i < args.len() check"
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "wasm.file_name() on a PathBuf that came from a successful read_dir entry is always Some; the iteration source guarantees there's a final component"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let gyt_dir = cwd.join(".gyt");
@@ -188,6 +196,10 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::integer_division,
+    reason = "human-readable MiB conversion: truncating integer division of memory_max to MiB is the intended output"
+)]
 fn print_policy_summary(p: &CiPolicy) {
     eprintln!(
         "  sandbox: repo_read={}, repo_write={}, output_write={}, extra_read={}, extra_write={}, network={}",
@@ -273,6 +285,10 @@ fn stray_shell_scripts(ci_dir: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0] / args[1..] access is gated by args.is_empty() check on the same line"
+)]
 fn run_secret(args: &[String], gyt_dir: &std::path::Path) -> Result<()> {
     if args.is_empty() || args[0] == "--help" {
         eprintln!("Usage: gyt ci secret <subcommand> [args]");
@@ -295,6 +311,10 @@ fn run_secret(args: &[String], gyt_dir: &std::path::Path) -> Result<()> {
     }
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0] / args[1..] access is gated by args.is_empty() check on the same line"
+)]
 fn run_env(args: &[String], gyt_dir: &std::path::Path) -> Result<()> {
     if args.is_empty() || args[0] == "--help" {
         eprintln!("Usage: gyt ci env <subcommand> [args]");

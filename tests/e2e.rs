@@ -1,3 +1,13 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::integer_division,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Comprehensive end-to-end tests for the gyt binary.
 //
 // Each test drives the real `gyt` binary as a subprocess in an isolated
@@ -17,14 +27,13 @@
 // Test-code clippy allowances: these lints make production code clearer
 // but pile up noise in long, sequential, intentionally-redundant test
 // harnesses where the alternative is harder to read than the warning.
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::map_unwrap_or)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::single_char_pattern)]
-#![allow(clippy::manual_assert)]
-#![allow(clippy::let_and_return)]
-#![allow(clippy::zombie_processes)]
+#![expect(clippy::uninlined_format_args, reason = "stylistic; kept inline-arg form for tests where it's clearer in context")]
+#![expect(clippy::map_unwrap_or, reason = "intentional in test scaffolding")]
+#![expect(clippy::redundant_closure_for_method_calls, reason = "explicit closure makes captured environment visible at the call site")]
+#![expect(clippy::single_char_pattern, reason = "single-char-in-string is occasionally clearer than the char form in test fixtures")]
+#![expect(clippy::manual_assert, reason = "intentional in test scaffolding")]
+#![expect(clippy::let_and_return, reason = "intentional in test scaffolding")]
+#![expect(clippy::zombie_processes, reason = "test harness deliberately leaves the child process to clean up at drop time")]
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

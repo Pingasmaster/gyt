@@ -108,6 +108,10 @@ fn parse_n(args: &[String], sub: &str) -> Result<u64> {
     })
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "parse_n returns Err if args is empty, so the &args[1..] here is on a non-empty slice — guaranteed in-bounds"
+)]
 fn take_n<'a>(args: &'a [String], sub: &str) -> Result<(u64, &'a [String])> {
     let n = parse_n(args, sub)?;
     Ok((n, &args[1..]))
@@ -121,6 +125,11 @@ fn read_stdin() -> Result<String> {
 
 // ─── new ───────────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "args[i] is gated by the `while i < args.len()` loop header; ObjectId::to_hex returns ASCII hex so [..12] is a char-boundary slice"
+)]
 fn cmd_new(args: &[String]) -> Result<()> {
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
@@ -239,6 +248,10 @@ fn normalise_branch(name: &str) -> String {
 
 // ─── list / show ──────────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 fn cmd_list(args: &[String]) -> Result<()> {
     let mut state_filter: Option<PrState> = Some(PrState::Open);
     let mut i = 0;
@@ -373,6 +386,11 @@ fn cmd_show(args: &[String]) -> Result<()> {
 
 // ─── comment / close / reopen ────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "rest[i] is gated by the `while i < rest.len()` loop header; ObjectId::to_hex returns ASCII hex so [..12] is a char-boundary slice"
+)]
 fn cmd_comment(args: &[String]) -> Result<()> {
     let (n, rest) = take_n(args, "comment")?;
     let mut body: Option<String> = None;
@@ -426,6 +444,10 @@ fn cmd_comment(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "rest[i] is gated by the `while i < rest.len()` loop header"
+)]
 fn cmd_close(args: &[String]) -> Result<()> {
     let (n, rest) = take_n(args, "close")?;
     let mut reason = String::new();
@@ -506,6 +528,10 @@ fn cmd_reopen(args: &[String]) -> Result<()> {
 
 // ─── merge ─────────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "rest[i] is gated by the `while i < rest.len()` loop header"
+)]
 fn cmd_merge(args: &[String]) -> Result<()> {
     let (n, rest) = take_n(args, "merge")?;
     let mut no_ff = false;
@@ -573,6 +599,10 @@ fn cmd_merge(args: &[String]) -> Result<()> {
 
 // ─── ci-run ────────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "PathBuf::file_name on a path produced by walk_dir over .gyt-ci/ is always Some (the path always has a final component)"
+)]
 fn cmd_ci_run(args: &[String]) -> Result<()> {
     let n = parse_n(args, "ci-run")?;
     let repo = open_repo()?;
@@ -708,6 +738,10 @@ fn cmd_assign(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 fn parse_add_remove(args: &[String], sub: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut add: Vec<String> = Vec::new();
     let mut remove: Vec<String> = Vec::new();

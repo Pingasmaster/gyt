@@ -1,3 +1,9 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Hardening tests for the WASM CI sandbox.
 //
 // Every test here loads a hand-written WAT module (wasmtime auto-detects

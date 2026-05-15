@@ -178,6 +178,11 @@ fn parse_line(line: &str) -> Option<Entry> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     fn tmpdir(prefix: &str) -> PathBuf {

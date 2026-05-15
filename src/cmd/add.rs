@@ -333,6 +333,11 @@ fn write_default_gytignore(workdir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
 

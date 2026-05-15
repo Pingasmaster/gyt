@@ -1,3 +1,10 @@
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Wire protocol integration tests against the production `gyt serve` binary.
 //
 // These tests:
@@ -66,7 +73,7 @@ impl GytTest {
     // Test scaffolding: helpers below are used by some tests and not
     // others, but kept together for clarity. The unused-method lint is
     // suppressed for the whole struct rather than per-helper.
-    #[allow(dead_code)] // Reason: scaffolding may be used by future tests; deleting drops a load-bearing helper API.
+    #[expect(dead_code, reason = "intentional in test scaffolding")] // Reason: scaffolding may be used by future tests; deleting drops a load-bearing helper API.
     fn gyt_dir(&self) -> PathBuf {
         self.work.join(".gyt")
     }
@@ -75,7 +82,7 @@ impl GytTest {
         self.work.join("server_repos")
     }
 
-    #[allow(dead_code)] // Reason: per-repo path helper kept available for future per-server tests.
+    #[expect(dead_code, reason = "intentional in test scaffolding")] // Reason: per-repo path helper kept available for future per-server tests.
     fn server_repo(&self, name: &str) -> PathBuf {
         self.server_repos().join(name)
     }
@@ -85,7 +92,7 @@ impl GytTest {
     }
 
     /// Run `gyt <args...>` in the test work dir, returning stdout on success.
-    #[allow(dead_code)] // Reason: convenience wrapper for tests that don't override the cwd.
+    #[expect(dead_code, reason = "intentional in test scaffolding")] // Reason: convenience wrapper for tests that don't override the cwd.
     fn run(&self, args: &[&str]) -> String {
         let output = Command::new(&self.bin)
             .args(args)

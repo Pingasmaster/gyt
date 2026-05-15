@@ -56,11 +56,13 @@ With --stat: compact summary instead of full diff."
         return diff_index_vs_head(&repo, use_color, stat);
     }
 
-    match revs.len() {
-        0 => diff_workdir_vs_index(&repo, use_color, stat),
-        1 => diff_index_vs_tree(&repo, &revs[0], use_color, stat),
-        2 => diff_tree_vs_tree(&repo, &revs[0], &revs[1], use_color, stat),
-        _ => unreachable!(),
+    match revs.as_slice() {
+        [] => diff_workdir_vs_index(&repo, use_color, stat),
+        [r1] => diff_index_vs_tree(&repo, r1, use_color, stat),
+        [r1, r2] => diff_tree_vs_tree(&repo, r1, r2, use_color, stat),
+        _ => Err(GytError::InvalidArgument(
+            "diff: at most two rev arguments".into(),
+        )),
     }
 }
 
@@ -226,6 +228,10 @@ fn forward_slash(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use std::fs;

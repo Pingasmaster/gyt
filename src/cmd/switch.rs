@@ -14,7 +14,10 @@ pub fn run(args: &[String]) -> Result<()> {
     repo.require_worktree()?;
     run_in(&repo, args)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
     let mut create = false;
@@ -64,7 +67,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     switch_to(repo, &branch)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn switch_to(repo: &Repo, branch: &str) -> Result<()> {
     let ref_name = format!("refs/heads/{branch}");
     let target_id = refs::read_ref(&repo.gyt_dir, &ref_name)?;
@@ -295,6 +301,11 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, entry: &FlatEntry) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
 

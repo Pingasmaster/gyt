@@ -248,7 +248,10 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn short(id: ObjectId) -> String {
     let s = id.to_hex();
     s[..12].to_string()
@@ -262,6 +265,10 @@ fn short(id: ObjectId) -> String {
 /// from `stop` (transitively) as "on the server" and excluding them. For
 /// simplicity we compute the `stop` closure first, then the `from` closure,
 /// emitting only the difference.
+#[expect(
+    clippy::expect_used,
+    reason = "entries.last_mut() is called immediately after entries.push(...) — Vec::last_mut on a just-pushed Vec is always Some"
+)]
 fn collect_upload_pack(
     repo: &Repo,
     from: &ObjectId,
@@ -364,6 +371,11 @@ fn collect_closure(repo: &Repo, from: &ObjectId, out: &mut HashSet<ObjectId>) ->
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::init;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};

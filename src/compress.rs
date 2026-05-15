@@ -21,7 +21,10 @@ pub const SIZE_XZ_HIGH: usize = 10 * 1024 * 1024;
 /// 1 GiB ceiling here still rejects obvious bombs while leaving headroom
 /// for legitimate large packfiles.
 pub const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
-
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant guarded by this expect cannot fail (verified at the call site)"
+)]
 pub fn encode(payload: &[u8]) -> Vec<u8> {
     let body = xz_encode_raw(payload).expect("xz encoding failed");
     let mut out = Vec::with_capacity(5 + body.len());
@@ -31,6 +34,10 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "every index/slice below is gated by the `stored.len() >= 5` check at the top of the if"
+)]
 pub fn decode(stored: &[u8]) -> Result<Vec<u8>> {
     if stored.len() >= 5 && stored[..4] == MAGIC {
         let flags = stored[4];
@@ -42,7 +49,10 @@ pub fn decode(stored: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(stored.to_vec())
 }
-
+#[expect(
+    clippy::integer_division,
+    reason = "intentional truncating integer division"
+)]
 pub fn xz_encode_raw(payload: &[u8]) -> Result<Vec<u8>> {
     let level: u32 = if payload.len() < SIZE_XZ_HIGH { 9 } else { 6 };
     let mut opts = XzOptions::with_preset(level);
@@ -83,6 +93,11 @@ pub fn xz_decode_raw(body: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

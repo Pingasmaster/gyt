@@ -7,6 +7,10 @@ use crate::errors::{GytError, Result};
 use crate::reflog;
 use crate::repo::Repo;
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut refname: Option<String> = None;
     let mut all = false;
@@ -78,6 +82,10 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "ObjectId::to_hex returns ASCII hex; every byte boundary is a char boundary"
+)]
 fn print_entries(entries: &[reflog::Entry], max: Option<usize>) {
     let take = max.unwrap_or(entries.len());
     // Newest first.

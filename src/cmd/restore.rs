@@ -11,6 +11,10 @@ pub fn run(args: &[String]) -> Result<()> {
     run_in(&repo, args)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by `while i < args.len()`; path_args[0] is gated by the `path_args.len() == 1` check"
+)]
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     if args.is_empty() {
         return Err(GytError::InvalidArgument(
@@ -233,6 +237,11 @@ fn restore_one(repo: &Repo, entry: &IndexEntry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::index::Index;

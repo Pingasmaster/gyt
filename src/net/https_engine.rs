@@ -51,6 +51,10 @@ const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// because the CLI is fundamentally one request at a time — a
 /// multi-thread runtime would just add scheduler overhead for
 /// `block_on`. Built lazily on first use.
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant guarded by this expect cannot fail (verified at the call site)"
+)]
 fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -235,6 +239,10 @@ async fn collect_response(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]
