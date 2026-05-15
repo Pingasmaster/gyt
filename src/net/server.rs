@@ -140,6 +140,37 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         )));
     }
 
+    // Best-effort mkdir so the serve.lock acquire doesn't fail on a
+    // first run where the operator hasn't created repos_root yet.
+    // Errors here surface naturally when the lock acquire tries to
+    // open the path.
+    let _ = std::fs::create_dir_all(&config.repos_root);
+
+    // Single-instance guard: take an exclusive lock on
+    // <repos_root>/serve.lock so two `gyt serve` processes cannot
+    // race against each other on the same repository directory.
+    //
+    // Two server processes on the *same host* sharing repos_root is a
+    // genuine data-corruption risk: every per-repo refs.lock /
+    // objects.lock survives across the boundary, but the audit-log
+    // rotation Mutex, the rate-limiter map, the response cache, and
+    // the pack cache are all per-process and would silently diverge.
+    //
+    // Two server processes on *different hosts* sharing a network FS
+    // (NFS, GlusterFS, ceph-fuse) is NOT prevented by this lock — the
+    // stale-reclamation in FileLock relies on /proc, which is per-
+    // host. Multi-host serving of one repo is out of scope today;
+    // shard your repos across hosts and route at the LB.
+    let serve_lock = crate::fs_util::FileLock::acquire(
+        &config.repos_root.join("serve.lock"),
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|e| crate::errors::GytError::Repo(format!(
+        "another gyt serve appears to be running on {} ({e}); refusing to start. If the previous process crashed, remove {}/serve.lock manually after confirming no gyt process holds it.",
+        config.repos_root.display(),
+        config.repos_root.display(),
+    )))?;
+
     let listener = TcpListener::bind(&config.listen_addr)?;
     let addr = listener.local_addr()?;
 
@@ -237,6 +268,9 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     // after finishing its current job. We block until they all join so
     // the process actually drains before main() returns.
     drop(pool);
+    // Hold the serve lock until after the workers have drained so a
+    // restart can't race in mid-shutdown.
+    drop(serve_lock);
     Ok(())
 }
 
