@@ -801,6 +801,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "signal-hook",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "wasmtime",
