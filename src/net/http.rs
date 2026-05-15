@@ -113,6 +113,16 @@ impl HttpClient {
             return Err(GytError::Net(format!("missing host in url: {base_url:?}")));
         }
 
+        // `user@host` syntax: treat the user portion as a bearer token.
+        // This is the GitHub / GitLab idiom — `https://<token>@host/repo`.
+        // We do NOT support `user:password@host`; the colon would be
+        // parsed as token-with-colon, which is harmless but discouraged.
+        // The auth header is set after construction.
+        let (bearer_token, authority) = match authority.rsplit_once('@') {
+            Some((tok, host)) => (Some(tok.to_string()), host),
+            None => (None, authority),
+        };
+
         // Split path/query.
         let (path, query) = match path_and_query.find('?') {
             Some(i) => (
@@ -131,7 +141,7 @@ impl HttpClient {
             port,
             base_path: path,
             base_query: query,
-            auth: None,
+            auth: bearer_token.map(|t| format!("Bearer {t}")),
             pool: Mutex::new(None),
         })
     }

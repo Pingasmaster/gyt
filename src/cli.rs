@@ -48,6 +48,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "ci" => crate::cmd::ci::run(rest),
         "issue" => crate::cmd::issue::run_issue(rest),
         "discussion" => crate::cmd::issue::run_discussion(rest),
+        "pr" => crate::cmd::pr::run(rest),
         "serve" => crate::cmd::serve::run(rest),
         "getthefuckoutofmyrepo" | "filter" => crate::cmd::getthefuckoutofmyrepo::run(rest),
         other => Err(GytError::InvalidArgument(format!(
@@ -132,6 +133,18 @@ ISSUES & DISCUSSIONS
     issue label <N> [--add l1,l2] [--remove l3]
     issue assign <N> [--add \"Name <email>\"] [--remove ...]
     discussion <subcommand>      same surface as `issue` but kind=discussion
+
+PULL REQUESTS
+    pr new <title> --source <branch> --target <branch> [-m <body>]
+    pr list [--state open|closed|merged|all]
+    pr show <N>
+    pr comment <N> -m <body>
+    pr close <N> [--reason <text>] | pr reopen <N>
+    pr merge <N> [--no-ff]
+    pr ci-run <N>                run sandboxed .gyt-ci/*.wasm on the
+                                 source ref, record the result
+    pr label <N> [--add l1,l2] [--remove l3]
+    pr assign <N> [--add \"Name <email>\"] [--remove ...]
 
 UTILITIES
     grep <pattern> [<rev>]
