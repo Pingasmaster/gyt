@@ -1562,6 +1562,27 @@ fn wire_objects_have(
             n_skipped += 1;
             continue;
         }
+        // Canonical-encoding check for trees: the wire bytes must
+        // re-encode to themselves. Without this, a pusher could
+        // upload a tree with unsorted entries or duplicate names —
+        // the BLAKE3 still matches the stored bytes (which is what
+        // we hash), but every consumer that assumes sortedness
+        // (diff, status, walk) would misbehave. Mirrors the commit
+        // and tag gates above.
+        if kind == crate::object::ObjectKind::Tree {
+            match crate::object::tree::decode(&payload) {
+                Ok(entries) => {
+                    if crate::object::tree::encode(&entries) != payload {
+                        n_skipped += 1;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    n_skipped += 1;
+                    continue;
+                }
+            }
+        }
         match crate::object::store::write_bytes(&gyt_dir, kind, &payload) {
             Ok(_) => n_stored += 1,
             Err(_) => n_skipped += 1,

@@ -182,7 +182,28 @@ fn walk(
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            let id = read_ref(repo_gyt_dir, &name)?;
+            // Skip files whose name is not a valid ref name. The big
+            // case this catches: `atomic_write` writes a sibling tmp
+            // file like `refs/heads/main..tmp.<pid>.<tid>.<seq>` and
+            // briefly leaves it in the directory before renaming over
+            // the target. The double-dot would make the whole listing
+            // fail (`..` is rejected by `validate_ref_name`) and the
+            // server's /info/refs would 500 for the duration of every
+            // concurrent push. Filtering invalid names here keeps the
+            // listing well-formed and stops a phantom tmp ref from
+            // ever leaving the server.
+            if validate_ref_name(&name).is_err() {
+                continue;
+            }
+            // The same atomic_write rename window can also delete the
+            // sibling file between our `read_dir` snapshot and our
+            // `read_ref` open. Drop those rather than failing the
+            // entire listing.
+            let id = match read_ref(repo_gyt_dir, &name) {
+                Ok(id) => id,
+                Err(GytError::Refs(_)) => continue,
+                Err(e) => return Err(e),
+            };
             out.push((name, id));
         }
     }

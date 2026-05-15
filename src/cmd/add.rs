@@ -33,6 +33,12 @@ pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     repo.require_worktree()?;
+    // Hold the repo lock for the entire index read-modify-write so
+    // two parallel `gyt add` runs can't race and silently drop one
+    // another's entries. Without this, both adds read the same
+    // index, each appends its file, and the second writer's
+    // atomic_write rename wipes the first writer's change.
+    let _lock = repo.lock()?;
     let workdir = repo.workdir.clone();
     let ignore = IgnoreSet::load_from_root(&workdir)?;
     let mut index = Index::read(&repo.index_path())?;

@@ -97,7 +97,9 @@ gyt/
 │   └── term.rs              # Terminal color helpers
 ├── tests/
 │   ├── smoke_comprehensive.sh  # End-to-end smoke test
-│   └── wire_integration.rs     # Wire-protocol integration tests
+│   ├── e2e.rs                  # End-to-end CLI tests (200+ scenarios)
+│   ├── wire_integration.rs     # Wire-protocol integration tests
+│   └── data_integrity.rs       # Corruption / data-loss invariants (60 tests)
 ├── Cargo.toml               # Dependencies + clippy config
 ├── check.sh                 # Full CI pipeline
 └── rust-toolchain.toml      # Rust edition/year pinning
@@ -203,8 +205,20 @@ All functions return `Result<T, GytError>` where `GytError` is an enum with vari
 
 - **Unit tests**: Inline in every module via `#[cfg(test)]` modules
 - **Integration tests**: `net/transport_tests.rs` spins up a server stub, tests HTTP client against it
-- **Smoke tests**: `tests/smoke.sh` runs the full build and basic CLI commands
+- **Smoke tests**: `tests/smoke_comprehensive.sh` runs the full build and basic CLI commands
+- **End-to-end CLI**: `tests/e2e.rs` drives the real binary as a subprocess
+- **Data-integrity / corruption**: `tests/data_integrity.rs` — 60 subprocess-driven tests asserting no-loss/no-corruption invariants on bit flips, truncation, concurrent writes, smuggling attempts, lock semantics, push/clone round trips, packs, and signing. 2 soak tests run with `--ignored`.
 - **Test harness**: Shared `test_support` module provides `init::init_at(&dir)`, `test_repo()`, and a global file lock for parallel test safety
+
+## Canonical-encoding gate on the wire
+
+`POST /{repo}/objects/have` re-decodes every commit, tag, and tree it
+receives and re-encodes the decoded form; if it doesn't match the
+incoming bytes byte-for-byte, the object is skipped. Without this
+gate a pusher could craft an object whose BLAKE3 hash matches its
+stored bytes but whose internal structure (out-of-order commit
+headers, unsorted tree entries) breaks downstream readers that
+assume canonical layout.
 
 ## Dependencies
 

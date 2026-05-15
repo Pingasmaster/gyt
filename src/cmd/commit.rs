@@ -89,8 +89,20 @@ pub fn run(args: &[String]) -> Result<()> {
     let identity = cfg.identity()?;
 
     let index = Index::read(&repo.index_path())?;
-    if index.entries.is_empty() && !allow_empty {
-        return Err(GytError::Repo("nothing to commit".into()));
+    // Refuse to create an unchanged commit. An empty index is "nothing
+    // to commit" *only* when HEAD's tree is also empty (i.e. the initial
+    // commit case). If HEAD has a non-empty tree, an empty index
+    // legitimately represents "remove everything" — that's a real
+    // change and must be allowed through.
+    if !allow_empty && !amend && index.entries.is_empty() {
+        let head_tree_empty = match util::resolve_tree(&repo, "HEAD") {
+            Ok(id) => crate::object::tree::read(&repo.gyt_dir, &id)
+                .map_or(true, |e| e.is_empty()),
+            Err(_) => true,
+        };
+        if head_tree_empty {
+            return Err(GytError::Repo("nothing to commit".into()));
+        }
     }
 
     // Build tree.

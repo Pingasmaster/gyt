@@ -221,21 +221,41 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
             ))
         })?;
         let key = key.trim();
-        let raw_value = unquote(value.trim()).ok_or_else(|| {
+        let trimmed_value = value.trim();
+        // Boolean keys are written by Config::write as bare `true` /
+        // `false` literals. Accept those without requiring quoting so a
+        // CLI-written value round-trips through the parser.
+        if section.len() == 1
+            && ((section[0] == "init" && key == "create_default_gytignore")
+                || (section[0] == "commit" && key == "sign_required"))
+        {
+            let b = match trimmed_value {
+                "true" => true,
+                "false" => false,
+                other => match unquote(other) {
+                    Some(s) if s.eq_ignore_ascii_case("true") => true,
+                    Some(s) if s.eq_ignore_ascii_case("false") => false,
+                    _ => {
+                        return Err(GytError::Parse(format!(
+                            "config.toml line {}: expected boolean for {key}",
+                            lineno + 1
+                        )));
+                    }
+                },
+            };
+            if section[0] == "init" {
+                cfg.create_default_gytignore = b;
+            } else {
+                cfg.sign_required = b;
+            }
+            continue;
+        }
+        let raw_value = unquote(trimmed_value).ok_or_else(|| {
             GytError::Parse(format!(
                 "config.toml line {}: value must be a quoted string",
                 lineno + 1
             ))
         })?;
-        // Check [init] section first since it only needs a borrow.
-        if section.len() == 1 && section[0] == "init" && key == "create_default_gytignore" {
-            cfg.create_default_gytignore = raw_value == "true";
-            continue;
-        }
-        if section.len() == 1 && section[0] == "commit" && key == "sign_required" {
-            cfg.sign_required = raw_value == "true";
-            continue;
-        }
         match section.as_slice() {
             [s] if s == "user" => match key {
                 "name" => cfg.user_name = Some(raw_value),

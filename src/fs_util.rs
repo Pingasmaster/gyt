@@ -4,14 +4,23 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Per-(pid, thread, counter) tmp suffix. Two concurrent writers of the
+/// same target — same pid, different threads, or duplicate-pid across
+/// containers — must not collide on the tmp filename, or one would
+/// truncate the other's in-flight buffer and the resulting rename would
+/// produce a corrupt object.
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tid = std::thread::current().id();
     let tmp = path.with_extension(format!(
-        "{}.tmp.{}",
+        "{}.tmp.{}.{tid:?}.{seq}",
         path.extension().and_then(|s| s.to_str()).unwrap_or(""),
-        std::process::id()
+        std::process::id(),
     ));
     {
         let mut f = fs::File::create(&tmp)?;
@@ -19,6 +28,18 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    // fsync the parent directory so the rename is durable across power
+    // loss. Without this, ext4/xfs may lose the directory-entry update
+    // after a crash even though the data file's contents are on disk.
+    if let Some(parent) = path.parent() {
+        // Best-effort: opening a directory for sync is supported on
+        // Unix; on other platforms the open may fail and we silently
+        // skip — durability is improved where possible, never made
+        // worse.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
