@@ -162,6 +162,38 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         });
     }
 
+    // Push metadata refs (issues, discussions, PRs) on every push.
+    // They live in dedicated namespaces and travel with the repository.
+    // We never "force" updates on these — the server should already be
+    // applying the same fast-forward gate, and a force here would silently
+    // discard concurrent comments. If someone explicitly passes --force,
+    // it propagates to the wire (?force=1 below), which we accept.
+    for prefix in &["refs/issues", "refs/prs"] {
+        let local_aux = match refs::list_refs(&repo.gyt_dir, prefix) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for (name, local_tip) in local_aux {
+            let remote_tip: Option<ObjectId> = server_refs
+                .iter()
+                .find(|r: &&RefEntry| r.name == name)
+                .map(|r| r.id);
+            // Same closure walk as for branches; blob-only tips terminate
+            // at the blob, commit-headed metadata (future) walks normally.
+            let entries = collect_upload_pack(repo, &local_tip, remote_tip.as_ref())?;
+            for e in entries {
+                if seen_ids.insert(e.id) {
+                    all_entries.push(e);
+                }
+            }
+            updates.push(RefUpdate {
+                old: remote_tip,
+                new: local_tip,
+                name,
+            });
+        }
+    }
+
     // Send all objects.
     if !all_entries.is_empty() {
         let body = encode_packfile(&all_entries);

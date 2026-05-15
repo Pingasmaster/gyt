@@ -32,6 +32,7 @@ pub mod fuzz;
 pub mod hash;
 pub mod ignore;
 pub mod index;
+pub mod issues;
 pub mod merge3;
 pub mod net;
 pub mod object;

@@ -39,6 +39,23 @@ and its caps are part of the security contract:
 
 Tests pinning these in `tests/ci_wasm_sandbox.rs`.
 
+### Issues and discussions are in-repo refs
+
+Issues and discussions live at `refs/issues/<N>`, pointing to a blob
+whose payload is canonical TOML (`src/issues.rs::encode`). The same
+storage backs both — `gyt issue` and `gyt discussion` share the
+implementation and differ only in the `kind` field (`issue` vs
+`discussion`).
+
+- Number allocation: `<gyt>/meta/issues_next` under `repo.lock()`. The
+  counter is shared across issues and discussions, so each gets a
+  globally unique number in the repo.
+- Wire transport: `refs/issues/*` and `refs/prs/*` are whitelisted in
+  `cmd::clone::is_user_visible_ref` and pushed automatically by
+  `cmd::push::run`. Any other `refs/<prefix>/...` is dropped on clone
+  by design (don't replicate arbitrary server-controlled namespaces).
+- Tests: `tests/issues.rs` + unit tests in `src/issues.rs`.
+
 ## Other operational notes
 
 - See `AGENTS.md` for full contributor conventions (clippy policy, branch strategy, CI secrets, no push webhooks).

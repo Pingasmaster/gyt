@@ -46,6 +46,8 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "remote" => crate::cmd::remote::run(rest),
         "merge" => crate::cmd::merge::run(rest),
         "ci" => crate::cmd::ci::run(rest),
+        "issue" => crate::cmd::issue::run_issue(rest),
+        "discussion" => crate::cmd::issue::run_discussion(rest),
         "serve" => crate::cmd::serve::run(rest),
         "getthefuckoutofmyrepo" | "filter" => crate::cmd::getthefuckoutofmyrepo::run(rest),
         other => Err(GytError::InvalidArgument(format!(
@@ -120,6 +122,16 @@ SERVER & CI
                                  run sandboxed .wasm CI scripts from .gyt-ci/
     ci secret {{init | set <name> | list | remove <name>}}
     ci env    {{set <name> <val> | list | remove <name>}}
+
+ISSUES & DISCUSSIONS
+    issue new <title> [-m <body>]
+    issue list [--state open|closed|all]
+    issue show <N>
+    issue comment <N> -m <body>
+    issue close <N> [--reason <text>] | issue reopen <N>
+    issue label <N> [--add l1,l2] [--remove l3]
+    issue assign <N> [--add \"Name <email>\"] [--remove ...]
+    discussion <subcommand>      same surface as `issue` but kind=discussion
 
 UTILITIES
     grep <pattern> [<rev>]
