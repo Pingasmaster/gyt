@@ -18,6 +18,7 @@ use crate::net::api::{
     TreeEntryInfo,
 };
 use crate::net::metrics::Metrics;
+use crate::net::rate_limit::{LimitConfig, RateLimiter};
 use crate::net::refs_policy;
 use crate::net::router::{self, Handler};
 use crate::object::{commit, tree};
@@ -149,7 +150,22 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         shutdown: Mutex::new(false),
         metrics: Metrics::default(),
         listen_addr: addr,
+        rate_limiter: RateLimiter::new(LimitConfig::DEFAULT_IP, LimitConfig::DEFAULT_ACTOR),
     });
+
+    // Background GC for idle rate-limit buckets. Without this the
+    // server leaks one bucket per (unique IP × token) seen over its
+    // lifetime — at 1M users that's a meaningful resident set.
+    {
+        let st = state.clone();
+        thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_mins(1));
+            if *st.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                break;
+            }
+            st.rate_limiter.gc_idle(std::time::Duration::from_mins(5));
+        });
+    }
     let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
 
     // Install signal handlers. SIGTERM / SIGINT flip the shutdown flag
@@ -168,6 +184,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         match stream {
             Ok(mut s) => {
                 state.metrics.accepts_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let peer_ip = s.peer_addr().ok().map(|sa| sa.ip());
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                 let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 // Non-blocking permit: if the worker pool is full,
@@ -208,14 +225,14 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
                         if let Some(cfg) = &tls {
                             match crate::net::tls::accept_tls(s, cfg) {
                                 Ok(tls_stream) => {
-                                    let _ = handle_tls_conn(tls_stream, &st);
+                                    let _ = handle_tls_conn(tls_stream, &st, peer_ip);
                                 }
                                 Err(e) => {
                                     eprintln!("gyt serve: tls accept error: {e}");
                                 }
                             }
                         } else {
-                            let _ = handle_conn(s, &st);
+                            let _ = handle_conn(s, &st, peer_ip);
                         }
                     }));
                     if let Err(payload) = result {
@@ -282,6 +299,7 @@ struct ServerState {
     /// self-connect to unblock accept() — the signal handler does the
     /// same trick.
     listen_addr: std::net::SocketAddr,
+    rate_limiter: RateLimiter,
 }
 
 /// One row in the `--auth-tokens` TSV. A token may appear in multiple
@@ -438,7 +456,11 @@ fn downcast_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Result<()> {
+fn handle_conn(
+    stream: std::net::TcpStream,
+    state: &ServerState,
+    peer_ip: Option<std::net::IpAddr>,
+) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     for _ in 0..MAX_REQUESTS_PER_CONN {
@@ -450,7 +472,7 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
         if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
-        if !serve_one(&mut reader, &mut writer, state)? {
+        if !serve_one(&mut reader, &mut writer, state, peer_ip)? {
             break;
         }
     }
@@ -465,6 +487,7 @@ fn serve_one<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     state: &ServerState,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<bool> {
     let req = match read_request(reader) {
         Ok(r) => r,
@@ -490,12 +513,34 @@ fn serve_one<R: BufRead, W: Write>(
         .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
     state.metrics.record_handler(route.handler);
 
+    let actor = actor_for(&req);
+
+    // Rate limit *before* dispatch, but *after* parsing — so we still
+    // charge a misbehaving client and so we know whether to exempt
+    // probes. Probes have no auth and we don't want a noisy probe
+    // setup to throttle real traffic; they bypass the limiter too.
+    if !route_is_unauth_probe(&route)
+        && !state.rate_limiter.allow(peer_ip, actor.as_deref())
+    {
+        state
+            .metrics
+            .requests_rate_limited_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        write_response(
+            writer,
+            429,
+            "Too Many Requests",
+            "text/plain",
+            b"rate limited\n",
+        )?;
+        return Ok(true);
+    }
+
     if !authorize_with_metric(state, &req, &route) {
         write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
         return Ok(false);
     }
 
-    let actor = actor_for(&req);
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
@@ -546,13 +591,14 @@ fn actor_for(req: &Request) -> Option<String> {
 fn handle_tls_conn(
     stream: crate::net::tls::ServerTlsStream,
     state: &ServerState,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream);
     for _ in 0..MAX_REQUESTS_PER_CONN {
         if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
-        if !serve_one_tls(&mut reader, state)? {
+        if !serve_one_tls(&mut reader, state, peer_ip)? {
             break;
         }
     }
@@ -562,6 +608,7 @@ fn handle_tls_conn(
 fn serve_one_tls(
     reader: &mut std::io::BufReader<crate::net::tls::ServerTlsStream>,
     state: &ServerState,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> std::io::Result<bool> {
     let req = match read_request(reader) {
         Ok(r) => r,
@@ -583,13 +630,31 @@ fn serve_one_tls(
         .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
     state.metrics.record_handler(route.handler);
 
+    let actor = actor_for(&req);
+    if !route_is_unauth_probe(&route)
+        && !state.rate_limiter.allow(peer_ip, actor.as_deref())
+    {
+        state
+            .metrics
+            .requests_rate_limited_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let writer = reader.get_mut();
+        write_response(
+            writer,
+            429,
+            "Too Many Requests",
+            "text/plain",
+            b"rate limited\n",
+        )?;
+        return Ok(true);
+    }
+
     if !authorize_with_metric(state, &req, &route) {
         let writer = reader.get_mut();
         write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
         return Ok(false);
     }
 
-    let actor = actor_for(&req);
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
@@ -2194,6 +2259,10 @@ mod tests {
             shutdown: Mutex::new(false),
             metrics: Metrics::default(),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            rate_limiter: RateLimiter::new(
+                LimitConfig::DEFAULT_IP,
+                LimitConfig::DEFAULT_ACTOR,
+            ),
         })
     }
 
