@@ -6,6 +6,7 @@ pub mod cache;
 pub mod h2_server;
 pub mod h3_server;
 pub mod http;
+pub mod https_engine;
 pub mod metrics;
 pub mod protocol;
 pub mod rate_limit;
