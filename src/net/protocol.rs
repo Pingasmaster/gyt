@@ -108,7 +108,10 @@ pub fn parse_wants(body: &[u8]) -> Result<Vec<ObjectId>> {
 }
 
 // ---------- pack ----------
-
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant guarded by this expect cannot fail (verified at the call site)"
+)]
 pub fn encode_pack(entries: &[PackEntry]) -> Vec<u8> {
     let mut total = 0usize;
     for e in entries {
@@ -124,6 +127,12 @@ pub fn encode_pack(entries: &[PackEntry]) -> Vec<u8> {
     out
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    clippy::unwrap_in_result,
+    reason = "body[pos..pos+4] / body[pos..pos+len] slices are gated by explicit `body.len() - pos < 4 / < len` early returns; try_into onto [u8;4] from a verified 4-byte slice cannot fail"
+)]
 pub fn parse_pack(body: &[u8]) -> Result<Vec<PackEntry>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -226,7 +235,10 @@ pub fn parse_ref_updates(body: &[u8]) -> Result<Vec<RefUpdate>> {
 
 const PACKFILE_VERSION_RAW: u8 = 0x01;
 const PACKFILE_VERSION_XZ: u8 = 0x02;
-
+#[expect(
+    clippy::expect_used,
+    reason = "the invariant guarded by this expect cannot fail (verified at the call site)"
+)]
 pub fn encode_packfile(entries: &[PackEntry]) -> Vec<u8> {
     let inner = encode_pack(entries);
     let compressed = crate::compress::xz_encode_raw(&inner).expect("xz compression should not fail");
@@ -236,6 +248,10 @@ pub fn encode_packfile(entries: &[PackEntry]) -> Vec<u8> {
     out
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "body[0] / body[1..] is gated by the `body.is_empty()` early return"
+)]
 pub fn parse_packfile(body: &[u8]) -> Result<Vec<PackEntry>> {
     if body.is_empty() {
         return Err(GytError::Parse("packfile: empty body".into()));
@@ -263,6 +279,11 @@ pub const fn pack_entry_from_bytes(bytes: Vec<u8>) -> PackEntry {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash::hash_bytes;
 

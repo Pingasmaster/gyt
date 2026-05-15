@@ -1,7 +1,10 @@
 use crate::errors::Result;
 use crate::net::server::{ServeConfig, serve};
 use std::path::PathBuf;
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut listen = "127.0.0.1:8080".to_string();
     let mut h2_listen: Option<String> = None;
@@ -233,6 +236,11 @@ pub fn run(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use crate::errors::GytError;

@@ -95,6 +95,11 @@ fn read_stdin_to_string() -> Result<String> {
 
 // ─── new ───────────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "args[i] is gated by the `while i < args.len()` loop header; ObjectId::to_hex returns ASCII hex so [..12] is a char-boundary slice"
+)]
 fn cmd_new(args: &[String], kind: IssueKind) -> Result<()> {
     let mut title: Option<String> = None;
     let mut body: Option<String> = None;
@@ -182,6 +187,10 @@ fn cmd_new(args: &[String], kind: IssueKind) -> Result<()> {
 
 // ─── list ──────────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 fn cmd_list(args: &[String], kind: IssueKind) -> Result<()> {
     let mut state_filter: Option<IssueState> = Some(IssueState::Open);
     let mut i = 0;
@@ -313,6 +322,10 @@ fn cmd_show(args: &[String], _kind: IssueKind) -> Result<()> {
 
 // ─── comment ──────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::string_slice,
+    reason = "ObjectId::to_hex returns ASCII hex so [..12] is a char-boundary slice"
+)]
 fn cmd_comment(args: &[String], _kind: IssueKind) -> Result<()> {
     let (n, rest) = take_n(args, "comment")?;
     let body = parse_message(rest, "comment")?;
@@ -344,6 +357,10 @@ fn cmd_comment(args: &[String], _kind: IssueKind) -> Result<()> {
 
 // ─── close / reopen ───────────────────────────────────────────────────
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "rest[i] is gated by the `while i < rest.len()` loop header"
+)]
 fn cmd_close(args: &[String], _kind: IssueKind) -> Result<()> {
     let (n, rest) = take_n(args, "close")?;
     let mut reason = String::new();
@@ -499,6 +516,10 @@ fn parse_n(args: &[String], sub: &str) -> Result<u64> {
     parse_number(raw, sub)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "parse_n returns Err on empty args, so args is guaranteed non-empty when we slice [1..]"
+)]
 fn take_n<'a>(args: &'a [String], sub: &str) -> Result<(u64, &'a [String])> {
     let n = parse_n(args, sub)?;
     Ok((n, &args[1..]))
@@ -511,6 +532,10 @@ fn parse_number(raw: &str, sub: &str) -> Result<u64> {
     })
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 fn parse_message(args: &[String], sub: &str) -> Result<String> {
     let mut body: Option<String> = None;
     let mut i = 0;
@@ -540,6 +565,10 @@ fn parse_message(args: &[String], sub: &str) -> Result<String> {
     body.ok_or_else(|| GytError::InvalidArgument(format!("{sub}: -m <body> required")))
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 fn parse_add_remove(args: &[String], sub: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut add: Vec<String> = Vec::new();
     let mut remove: Vec<String> = Vec::new();

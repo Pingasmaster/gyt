@@ -193,6 +193,11 @@ pub fn fetch_with_refspec_inner(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::clone;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};

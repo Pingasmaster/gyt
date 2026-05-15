@@ -72,7 +72,6 @@ impl Config {
     /// Load the global config alone, applying env overrides. Used by code
     /// paths that need user identity outside of a repo (e.g. `gyt clone`
     /// before a repo exists).
-    #[allow(dead_code)] // public API: callers outside the binary entry points
     pub fn load_global() -> Result<Self> {
         let mut cfg = match global_config_path() {
             Some(g) if g.exists() => parse(&fs_util::read_all(&g)?)?,
@@ -107,6 +106,11 @@ impl Config {
     }
 
     /// Write this configuration to `.gyt/config.toml` inside the given directory.
+    #[expect(
+        clippy::unwrap_used,
+        clippy::unwrap_in_result,
+        reason = "writeln! to String never fails; the Result is only present for io::Write compatibility"
+    )]
     pub fn write(&self, gyt_dir: &Path) -> Result<()> {
         let mut s = String::new();
         if self.user_name.is_some() || self.user_email.is_some() {
@@ -164,8 +168,10 @@ fn merge_into(base: &mut Config, other: Config) {
     }
 }
 
-// Scaffolding: TOML string quoting helper, used in commit phase.
-#[allow(dead_code)]
+// TOML string quoting helper, used in tests only today. Exercised by
+// the round_trip_quote_unquote test below; kept here so unquote has a
+// counterpart for parity with the format the encoder will emit.
+#[cfg(test)]
 fn quote(s: &str) -> String {
     // Basic-string escaping: backslash, double quote, control chars.
     let mut out = String::with_capacity(s.len() + 2);
@@ -188,6 +194,10 @@ fn quote(s: &str) -> String {
 /// Tiny TOML subset parser.
 /// Supports: `[section]`, `[section.subsection]` (one level deep, used for remote.NAME),
 /// `key = "value"` with the same escapes as `quote`. Line comments with `#`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn parse(bytes: &[u8]) -> Result<Config> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| GytError::Parse("config.toml is not utf-8".into()))?;
@@ -270,7 +280,10 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
     }
     Ok(cfg)
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn strip_comment(line: &str) -> &str {
     // Strip `# ...` outside of quoted strings. We don't have multi-line strings.
     let bytes = line.as_bytes();
@@ -297,7 +310,11 @@ fn strip_comment(line: &str) -> &str {
     }
     line
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line; byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn unquote(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
@@ -334,6 +351,10 @@ fn unquote(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

@@ -51,6 +51,10 @@ pub struct LineMerge {
 }
 
 /// Three-way merge at the line level.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "base_lines[i] / base_lines[i..i+del] are gated by `while i < base_lines.len()`; del = max(ours_del, theirs_del) is bounded by edit-map invariant that no edit goes past base_lines.len()"
+)]
 pub fn merge_lines(base: &[u8], ours: &[u8], theirs: &[u8]) -> LineMerge {
     // Fast paths.
     if ours == theirs {
@@ -202,6 +206,10 @@ type EditMap = BTreeMap<usize, (usize, Vec<Vec<u8>>)>;
 /// Walk a (base → side) Myers op list and produce an EditMap keyed by base
 /// line position. Equal ops advance the cursor without recording anything;
 /// runs of Delete/Insert at the same base position get bundled.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "ops[i] is gated by the `while i < ops.len()` loop header and the nested inner while-loop"
+)]
 fn walk_edits(ops: &[diff::DiffOp<'_>]) -> EditMap {
     let mut out: EditMap = BTreeMap::new();
     let mut base_pos = 0usize;
@@ -313,11 +321,8 @@ pub struct TreeConflict {
     // tools that render conflict UIs (TUI, web). They're read in the wire
     // protocol body of a future "conflict report" endpoint; today's
     // callers only branch on `kind`, so the lint complains.
-    #[allow(dead_code)]
     pub base: Option<(u32, BlobHash)>,
-    #[allow(dead_code)]
     pub ours: Option<(u32, BlobHash)>,
-    #[allow(dead_code)]
     pub theirs: Option<(u32, BlobHash)>,
 }
 
@@ -467,6 +472,11 @@ pub enum ContentResult {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     fn lines_of(s: &str) -> Vec<Vec<u8>> {

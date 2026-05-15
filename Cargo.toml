@@ -8,8 +8,8 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 blake3 = "=1.8.5"
-wasmtime = "=28.0.1"
-ed25519-dalek = { version = "=2.1.1", features = ["fast", "rand_core"] }
+wasmtime = "=44.0.1"
+ed25519-dalek = { version = "=2.2.0", features = ["fast", "rand_core"] }
 rand = "=0.8.5"
 rustls = { version = "=0.23.40", default-features = false, features = ["std", "logging", "ring"] }
 rustls-pki-types = "=1.14.1"
@@ -56,6 +56,35 @@ style = { level = "deny", priority = -10 }
 pedantic = { level = "deny", priority = -10 }
 nursery = { level = "deny", priority = -10 }
 cargo = { level = "deny", priority = -10 }
+
+# ── Anti-crash lints (restriction group) ─────────────────────────────
+# Each of these flags a pattern that can panic, exit, or otherwise crash
+# the process at runtime. They are denied so any new use must opt in with
+# an `#[allow(clippy::X, reason = "...")]` annotation at the call site.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+integer_division = "deny"
+modulo_arithmetic = "deny"
+get_unwrap = "deny"
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
+exit = "deny"
+mem_forget = "deny"
+lossy_float_literal = "deny"
+fn_to_numeric_cast_any = "deny"
+dbg_macro = "deny"
+
+# ── Attribute hygiene ────────────────────────────────────────────────
+# Every silenced lint must carry a `reason = "..."` so the next reader
+# can see why. Forces honesty: no naked `#[allow(...)]`.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
 
 # ── Honest allowlist ───────────────────────────────────────────────
 # Each line below is a clippy lint we deliberately don't enforce, with a

@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 /// Abbreviated hex resolves only when it uniquely matches one object
 /// in the local store (loose or packed); ambiguous prefixes error.
 /// Returns an error if not found.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "matches[0] is gated by the `matches.len() == 1` match arm above"
+)]
 pub fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
     // `HEAD~N` — walk N first-parent commits back from HEAD.
     if let Some(rest) = rev.strip_prefix("HEAD~") {
@@ -78,6 +82,12 @@ pub fn resolve_rev(repo: &Repo, rev: &str) -> Result<ObjectId> {
 
 /// Find all object ids in the store whose hex form starts with `prefix`.
 /// Scans loose `<2>/<62>` shards and the entries in every `.idx`.
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::expect_used,
+    reason = "prefix_lower[..2] is gated by prefix_lower.len() >= 2 check; bytes[..4]/bytes[8..12]/bytes[off..off+32] are gated by explicit length checks (`bytes.len() >= 12`, `off + 32 > bytes.len()`); try_into expect on a 4-byte slice cannot fire; prefix is ASCII hex so [..2] is at a char boundary"
+)]
 fn find_objects_with_prefix(gyt_dir: &std::path::Path, prefix: &str) -> Vec<ObjectId> {
     let prefix_lower = prefix.to_ascii_lowercase();
     let mut out: Vec<ObjectId> = Vec::new();
@@ -235,6 +245,11 @@ struct DirNode {
     subdirs: BTreeMap<String, Self>,
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::expect_used,
+    reason = "comps[..len-1] is bounded by the `comps.is_empty()` early-return (len ≥ 1); comps.last().expect cannot fire for the same reason"
+)]
 fn insert_entry(root: &mut DirNode, entry: &IndexEntry) {
     let comps: Vec<String> = entry
         .path
@@ -289,6 +304,10 @@ pub fn current_branch_and_head(repo: &Repo) -> Result<(Option<String>, Option<Ob
 /// lock for their entire critical section to avoid clobbering each other.
 #[cfg(test)]
 pub mod test_helpers {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: tmp_dir creation failure in a test means the test cannot run, which is a fatal-loud signal"
+    )]
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard};
 
@@ -301,7 +320,6 @@ pub mod test_helpers {
     }
 
     pub fn tmp_dir(prefix: &str) -> PathBuf {
-        #[allow(clippy::items_after_statements)]
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()

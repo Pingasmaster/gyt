@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unwrap_used,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+)]
+
 // Tests for the operator-controlled CiPolicy permission model.
 //
 // What we verify:
@@ -14,9 +19,7 @@
 // We drive each test by constructing a CiPolicy directly and calling
 // `run_ci_wasm_with_policy`. WAT modules are inlined for readability.
 
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::items_after_statements)]
+#![expect(clippy::items_after_statements, reason = "intentional in test scaffolding")]
 
 use gyt::ci_wasm::{run_ci_wasm_with_policy, CiPolicy};
 use std::path::{Path, PathBuf};

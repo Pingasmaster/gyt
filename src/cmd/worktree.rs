@@ -47,7 +47,10 @@ fn cmd_add(args: &[String]) -> Result<()> {
     let repo = Repo::open(&cwd)?;
     do_add(&repo, args)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     // Parse: [-b <branch>] <path> [<base-rev>]
     let mut new_branch: Option<String> = None;
@@ -476,6 +479,10 @@ fn locate_repo(start: &Path) -> Result<(PathBuf, PathBuf)> {
 /// Return the main repo's `.gyt` directory given a `gyt_dir` that may be a
 /// per-worktree directory (`.../.gyt/worktrees/<name>`) or the main `.gyt`
 /// itself.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn main_gyt_dir(gyt_dir: &Path) -> PathBuf {
     let comps: Vec<_> = gyt_dir.components().collect();
     // If the path ends with ".gyt/worktrees/<name>", main is gyt_dir/../..
@@ -643,6 +650,10 @@ fn build_index_from_tree(gyt_dir: &Path, tree_id: &ObjectId, workdir: &Path) -> 
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::config::Config;
     use crate::object::ObjectKind;

@@ -140,6 +140,10 @@ pub fn run_init(_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0] access is gated by args.is_empty() check"
+)]
 pub fn run_set(args: &[String], gyt_dir: &Path) -> Result<()> {
     if args.is_empty() || args[0] == "--help" {
         eprintln!("Usage: gyt ci secret set <name>");
@@ -197,6 +201,10 @@ pub fn run_list(_args: &[String], gyt_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0] access is gated by args.is_empty() check"
+)]
 pub fn run_remove(args: &[String], gyt_dir: &Path) -> Result<()> {
     if args.is_empty() || args[0] == "--help" {
         eprintln!("Usage: gyt ci secret remove <name>");

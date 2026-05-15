@@ -280,6 +280,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 /// ids, one per line). Treats the current index as the conflict resolution
 /// for the *first* todo: commits it as the next replayed commit, then
 /// replays the rest using the same three-way engine.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn run_continue(repo: &Repo) -> Result<()> {
     let onto_path = repo.gyt_dir.join("REBASE_ONTO");
     let head_path = repo.gyt_dir.join("REBASE_HEAD");
@@ -514,7 +518,10 @@ fn identity_for(repo: &Repo) -> String {
         .and_then(|c| c.identity().ok())
         .unwrap_or_else(|| "-".to_string())
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn short(id: &ObjectId) -> String {
     let s = id.to_hex();
     s[..s.len().min(12)].to_string()
@@ -669,6 +676,11 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, mode: u32, hash: &ObjectId) -
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
 

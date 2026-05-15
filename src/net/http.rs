@@ -87,7 +87,10 @@ impl HttpClient {
     pub fn new_plain(base_url: &str) -> Result<Self> {
         Self::new_inner(base_url, true)
     }
-
+    #[expect(
+        clippy::string_slice,
+        reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+    )]
     fn new_inner(base_url: &str, allow_plain: bool) -> Result<Self> {
         let (scheme, rest) = if let Some(rest) = base_url.strip_prefix("https://") {
             (Scheme::Https, rest)
@@ -166,6 +169,11 @@ impl HttpClient {
         self.request("POST", path_suffix, Some(body), extra_headers)
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        clippy::unwrap_in_result,
+        reason = "self.pool is a Mutex<Option<PooledConn>>; lock poisoning here would indicate a process-wide invariant violation worth crashing for"
+    )]
     fn request(
         &self,
         method: &str,
@@ -263,7 +271,10 @@ impl HttpClient {
             }
         }
     }
-
+    #[expect(
+        clippy::string_slice,
+        reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+    )]
     fn build_target(&self, path_suffix: &str) -> String {
         // Concatenate base_path with suffix. base_path already starts with `/`.
         // Suffix is treated relative; do not double up the slash.
@@ -537,7 +548,10 @@ fn chunked_decode<R: BufRead>(reader: &mut R) -> Result<Vec<u8>> {
 //
 // We don't have a base64 dep; basic-auth credentials are short, so a tiny
 // encoder is fine. Standard alphabet, with padding.
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn base64_encode(input: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -575,6 +589,10 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

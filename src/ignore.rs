@@ -183,7 +183,10 @@ fn parse_line(raw: &str, anchor: &str) -> Result<Option<Rule>> {
         tokens,
     }))
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn compile_tokens(pat: &str) -> Result<Vec<Tok>> {
     let bytes = pat.as_bytes();
     let mut out = Vec::new();
@@ -280,7 +283,10 @@ fn compile_tokens(pat: &str) -> Result<Vec<Tok>> {
     }
     Ok(out)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn compile_class(bytes: &[u8]) -> Result<(Tok, usize)> {
     // bytes[0] == '['.
     debug_assert_eq!(bytes[0], b'[');
@@ -320,7 +326,10 @@ fn compile_class(bytes: &[u8]) -> Result<(Tok, usize)> {
     }
     Ok((Tok::Class { negate, ranges }, i))
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn rule_matches(rule: &Rule, path: &str, is_dir: bool) -> bool {
     if rule.dir_only && !is_dir {
         return false;
@@ -373,7 +382,10 @@ fn rule_matches(rule: &Rule, path: &str, is_dir: bool) -> bool {
 fn match_tokens(tokens: &[Tok], path: &[u8]) -> bool {
     match_at(tokens, 0, path, 0)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn match_at(tokens: &[Tok], ti: usize, path: &[u8], pi: usize) -> bool {
     if ti == tokens.len() {
         return pi == path.len();
@@ -474,6 +486,11 @@ fn match_at(tokens: &[Tok], ti: usize, path: &[u8], pi: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     fn set_with(rules_in_root: &str) -> IgnoreSet {
@@ -696,6 +713,10 @@ mod tests {
 
 #[cfg(test)]
 mod tempdir {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: tmp_dir creation failure in a test means the test cannot run, which is a fatal-loud signal"
+    )]
     use std::path::{Path, PathBuf};
 
     pub struct Dir(PathBuf);

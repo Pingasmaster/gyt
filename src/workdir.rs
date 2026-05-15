@@ -21,7 +21,6 @@ pub struct WorkdirEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum FileState {
     Untracked,
     /// Workdir differs from index.
@@ -36,7 +35,6 @@ pub enum FileState {
 }
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct StatusReport {
     pub entries: Vec<(PathBuf, FileState)>,
 }
@@ -166,6 +164,10 @@ pub fn hash_blob(path: &Path) -> Result<ObjectId> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::object::blob;
     use std::fs;

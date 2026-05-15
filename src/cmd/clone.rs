@@ -27,7 +27,10 @@ use crate::refs::{self, Head};
 use crate::repo::Repo;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut url: Option<String> = None;
     let mut dir: Option<String> = None;
@@ -326,7 +329,7 @@ pub fn walk_and_fetch(
     Ok(new_objects)
 }
 
-#[allow(clippy::too_many_arguments)] // Reason: the shallow walker threads a handful of parallel maps; bundling into a struct would just rename them.
+#[expect(clippy::too_many_arguments, reason = "signature passes a fixed bundle of orthogonal params; a struct would just rename them")] // Reason: the shallow walker threads a handful of parallel maps; bundling into a struct would just rename them.
 fn walk_one(
     repo: &Repo,
     id: &ObjectId,
@@ -443,6 +446,12 @@ fn write_shallow(repo: &Repo, boundary: &HashSet<ObjectId>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use crate::net::server_stub::{self, ServerState};

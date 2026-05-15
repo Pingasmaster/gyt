@@ -8,6 +8,10 @@
 use crate::errors::{GytError, Result};
 use std::fmt::Write;
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut priv_path: Option<std::path::PathBuf> = None;
     let mut pub_path: Option<std::path::PathBuf> = None;
@@ -72,7 +76,14 @@ pub fn run(args: &[String]) -> Result<()> {
     // Show public key in hex for easy copying
     let mut hex = String::with_capacity(pub_bytes.len() * 2);
     for b in &pub_bytes {
-        write!(hex, "{b:02x}").unwrap();
+        #[expect(
+            clippy::unwrap_used,
+            clippy::unwrap_in_result,
+            reason = "write! to String never fails; the Result is only present for io::Write compatibility"
+        )]
+        {
+            write!(hex, "{b:02x}").unwrap();
+        }
     }
     println!("  public hex:  {hex}");
 

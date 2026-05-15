@@ -236,6 +236,12 @@ fn idx_bytes(idx_path: &Path) -> Result<Vec<u8>> {
 
 /// Binary-search `idx_path` for `id`, returning its offset in the
 /// matching .pack file if present.
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unwrap_in_result,
+    reason = "every bytes[..4]/[4]/[8..12]/[off..off+HASH_LEN]/[off+HASH_LEN..off+IDX_ENTRY_LEN] is gated by the `bytes.len() != expected` precondition checks above; try_into expects on 4-/8-byte slices cannot fail because the slice length matches the target array length exactly"
+)]
 fn lookup_in_idx(idx_path: &Path, id: &ObjectId) -> Result<Option<u64>> {
     let bytes = idx_bytes(idx_path)?;
     if bytes.len() < IDX_HEADER_LEN + TRAILER_LEN {
@@ -290,6 +296,11 @@ fn lookup_in_idx(idx_path: &Path, id: &ObjectId) -> Result<Option<u64>> {
     Ok(None)
 }
 
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_in_result,
+    reason = "the expect on try_into to [u8; 4] cannot fail because the slice is exactly 4 bytes by const-size construction of `header` ([u8; 1 + HASH_LEN + 4])"
+)]
 fn read_entry_at(pack_path: &Path, offset: u64, expected_id: &ObjectId) -> Result<Object> {
     let mut f = File::open(pack_path)
         .map_err(|e| GytError::Io(std::io::Error::other(format!("pack open: {e}"))))?;
@@ -373,6 +384,11 @@ fn decode_kind(b: u8) -> Result<ObjectKind> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::object::ObjectKind;
 

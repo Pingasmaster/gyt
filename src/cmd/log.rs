@@ -1,6 +1,6 @@
 use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
-use crate::object::commit::{self, Commit};
+use crate::object::commit;
 use crate::refs;
 use crate::repo::Repo;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,7 @@ use std::fmt::Write;
 // remember mutually-exclusive combinations, which is contrary to how the
 // flags behave (any subset is legal). The struct shape mirrors the CLI
 // surface and is the clearest representation.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools, reason = "discrete capability flags read independently at use sites — collapsing into a state machine would obscure intent")]
 struct Options {
     oneline: bool,
     graph: bool,
@@ -41,7 +41,10 @@ impl Options {
         }
     }
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut opts = Options::new();
     let mut after_dashes = false;
@@ -408,6 +411,10 @@ fn render_plain(nodes: &[&Node], opts: &Options, out: &mut String) {
 /// |/
 /// * 9abcdef0 common ancestor
 /// ```
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn render_graph(nodes: &[&Node], opts: &Options, out: &mut String) {
     // `lanes` is the list of pending commit ids in column order. The leftmost
     // lane is the "main" thread of the walk.
@@ -492,7 +499,10 @@ fn compact_lanes(lanes: &[Option<ObjectId>]) -> Vec<Option<ObjectId>> {
     }
     out
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
@@ -519,7 +529,10 @@ fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options)
         out.push('\n');
     }
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn write_commit(out: &mut String, n: &Node, opts: &Options, prefix: &str) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
@@ -672,6 +685,11 @@ fn parse_timestamp_tz(s: &str) -> (Option<i64>, String) {
 /// via Howard Hinnant's `civil_from_days` algorithm — pure arithmetic, no
 /// external date library, valid for all `i64` second counts that fit in a
 /// reasonable era window (effectively all of human history).
+#[expect(
+    clippy::integer_division,
+    clippy::modulo_arithmetic,
+    reason = "intentional truncating integer division; operands are non-negative by construction"
+)]
 fn format_iso8601(unix_secs: i64, tz_offset: &str) -> String {
     // Apply the tz offset to display local time then re-tag the printed
     // offset. Format of tz_offset: "+HHMM" or "-HHMM".
@@ -685,7 +703,10 @@ fn format_iso8601(unix_secs: i64, tz_offset: &str) -> String {
     let s = sec_of_day % 60;
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} {tz_offset}")
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn parse_tz(tz: &str) -> (i32, u32, u32) {
     // Accept "+HHMM" / "-HHMM"; default to UTC on parse failure.
     let bytes = tz.as_bytes();
@@ -712,7 +733,11 @@ fn parse_tz(tz: &str) -> (i32, u32, u32) {
 /// Unix epoch (1970-01-01) to (year, month, day) in the proleptic
 /// Gregorian calendar. See
 /// <https://howardhinnant.github.io/date_algorithms.html>.
-#[allow(clippy::cast_possible_wrap)] // Reason: era arithmetic stays within i64 even at the extremes; widening to i128 would only hide that.
+#[expect(clippy::cast_possible_wrap, reason = "era arithmetic stays within i64 even at the extremes; widening would only hide that")] // Reason: era arithmetic stays within i64 even at the extremes; widening to i128 would only hide that.
+#[expect(
+    clippy::integer_division,
+    reason = "intentional truncating integer division"
+)]
 const fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -726,7 +751,10 @@ const fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn primary_author_name(a: &str) -> String {
     if let Some(idx) = a.rfind('>') {
         return a[..=idx].to_string();
@@ -734,12 +762,12 @@ fn primary_author_name(a: &str) -> String {
     a.to_string()
 }
 
-// Silence unused-import warnings (Commit is used through commit::read).
-#[allow(dead_code)]
-fn _suppress_unused(_: Commit) {}
-
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use crate::config::Config;

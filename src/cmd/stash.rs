@@ -64,6 +64,10 @@ fn cmd_push(args: &[String]) -> Result<()> {
     do_push(&repo, args)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] is gated by the `while i < args.len()` loop header (and an explicit `i >= args.len()` check after the i += 1 step)"
+)]
 fn do_push(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
     // Parse `-m <msg>` (only flag we support).
@@ -223,6 +227,10 @@ fn cmd_pop(args: &[String]) -> Result<()> {
     do_pop(&repo, args)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "stash_commit.parents[1] is gated by `stash_commit.parents.len() < 2` early return"
+)]
 fn do_pop(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
     if !args.is_empty() {
@@ -281,6 +289,10 @@ fn cmd_apply(args: &[String]) -> Result<()> {
     do_apply(&repo, args)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "stash_commit.parents[1] is gated by `stash_commit.parents.len() < 2` early return"
+)]
 fn do_apply(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
     if !args.is_empty() {
@@ -357,6 +369,10 @@ fn do_drop(repo: &Repo, args: &[String]) -> Result<()> {
 // helpers
 // -----------------------------------------------------------------------------
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "parents[0] / parents[2] access is gated by `parents.len() >= 3` check in the same expression"
+)]
 fn drop_top(repo: &Repo, stash_commit: &Commit) -> Result<()> {
     // The "previous stash" lives in parents[0] iff it's a real previous
     // stash. If parents[0] == parents[2] (== original HEAD), there's no
@@ -371,6 +387,10 @@ fn drop_top(repo: &Repo, stash_commit: &Commit) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "c.parents[0] / c.parents[2] is gated by `c.parents.len() >= 3` check in the same expression"
+)]
 fn stash_chain(repo: &Repo) -> Result<Vec<ObjectId>> {
     let mut out = Vec::new();
     let mut cur = refs::read_ref(&repo.gyt_dir, STASH_REF).ok();
@@ -432,6 +452,10 @@ struct DirNode {
 }
 
 impl DirNode {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "caller in build_tree_from_index guarantees comps is non-empty; comps[0] is in-range and comps[1..] is empty-slice-safe"
+    )]
     fn insert_file(&mut self, comps: &[Vec<u8>], mode: u32, hash: ObjectId) {
         if comps.len() == 1 {
             self.files.insert(comps[0].clone(), (mode, hash));
@@ -684,6 +708,11 @@ fn detect_conflicts(repo: &Repo, target: &[FlatFile]) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use std::path::{Path, PathBuf};
 

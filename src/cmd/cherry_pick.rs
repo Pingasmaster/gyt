@@ -34,7 +34,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let _lock = repo.lock()?;
     let mut rev: Option<String> = None;
@@ -191,7 +194,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let new_id = make_commit(repo, merged_tree_id, parents, target_commit.message.clone())?;
     finish(repo, &head, head_id, new_id, &target_commit.message)
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn finish(
     repo: &Repo,
     head: &Head,
@@ -351,6 +357,10 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, mode: u32, hash: &ObjectId) -
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::config::Config;

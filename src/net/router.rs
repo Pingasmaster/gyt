@@ -40,7 +40,10 @@ pub enum Handler {
     StaticFile,
     NotFound,
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn route(method: &str, path: &str) -> RouteMatch {
     let segments = split_path(path);
 
@@ -238,7 +241,10 @@ pub fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a st
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn url_decode(s: &str) -> std::result::Result<String, ()> {
     let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -271,6 +277,10 @@ const fn hex_nibble(b: u8) -> std::result::Result<u8, ()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

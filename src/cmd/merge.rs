@@ -38,6 +38,11 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 /// Same as `run_in` but assumes the caller already holds the repo
 /// lock. Used by `pull` to span fetch+merge under a single acquired
 /// lock so a third process can't slip a push in the gap.
+#[expect(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "args[i] is gated by `while i < args.len()`; head_id.unwrap() is gated by the head_id.is_none() early-return check on the preceding lines"
+)]
 pub fn run_in_inner(repo: &Repo, args: &[String]) -> Result<()> {
     let mut ff_only = false;
     let mut no_ff = false;
@@ -432,7 +437,10 @@ fn append_side(repo: &Repo, out: &mut Vec<u8>, mode: u32, hash: &ObjectId) {
         out.extend_from_slice(format!("mode={mode:o} {} (blob unreadable)\n", hash.to_hex()).as_bytes());
     }
 }
-
+#[expect(
+    clippy::string_slice,
+    reason = "byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 fn short(id: &ObjectId) -> String {
     let s = id.to_hex();
     s[..s.len().min(12)].to_string()
@@ -670,6 +678,13 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, mode: u32, hash: &ObjectId) -
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::cmd::util::test_helpers::lock;

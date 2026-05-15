@@ -10,7 +10,10 @@ use crate::refs;
 use crate::repo::Repo;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     // Default: expire reflog entries older than 90 days (matches git's
     // gc.reflogExpire default). Without this, commits referenced *only*
@@ -584,6 +587,12 @@ fn read_shallow(gyt_dir: &Path) -> HashSet<ObjectId> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::string_slice,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::object::{ObjectKind, store};
 

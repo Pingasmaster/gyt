@@ -8,7 +8,10 @@ pub fn run(args: &[String]) -> Result<()> {
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     let mut pattern: Option<String> = None;
     let mut commit_arg: Option<String> = None;
@@ -167,6 +170,10 @@ fn walk_tree(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
     use crate::cmd::util::test_helpers::lock;

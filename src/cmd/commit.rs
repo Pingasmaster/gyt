@@ -6,7 +6,11 @@ use crate::object::commit::{self, Commit};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
 use std::time::{SystemTime, UNIX_EPOCH};
-
+#[expect(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line; byte offsets used are at ASCII / char-boundary positions by construction"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut message: Option<String> = None;
     let mut ai_assists: Vec<String> = Vec::new();
@@ -232,6 +236,10 @@ fn short_branch(refname: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use crate::config::Config;

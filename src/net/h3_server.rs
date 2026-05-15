@@ -261,6 +261,11 @@ async fn write_h3_simple(
 /// Build a quinn ServerConfig with our cert+key and ALPN=h3. We
 /// share the rustls TLS material loader with the HTTP/1.1 server so
 /// `chmod 600` enforcement and TLS-1.3-only stay in one place.
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_in_result,
+    reason = "60s is a hard-coded constant well within the QUIC u62 idle-timeout range; the conversion cannot fail"
+)]
 fn build_quic_server_config(
     cert_path: &Path,
     key_path: &Path,

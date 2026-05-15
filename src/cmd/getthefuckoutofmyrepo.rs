@@ -21,6 +21,10 @@ fn is_null(oid: &ObjectId) -> bool {
 /// history of the repository. This is the nuclear option.
 ///
 /// The command requires double interactive confirmation before proceeding.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let mut paths: Vec<String> = Vec::new();
     for arg in args {
@@ -331,6 +335,10 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

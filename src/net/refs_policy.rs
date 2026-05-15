@@ -398,6 +398,10 @@ fn load_allowed_signers_at(path: &Path) -> Result<Vec<VerifyingKey>> {
     parse_allowed_signers(&text)
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "hex_part.as_bytes()[j*2] / [j*2+1] is gated by the `hex_part.len() != 64` early return (so for j in 0..32, j*2+1 < 64)"
+)]
 fn parse_allowed_signers(text: &str) -> Result<Vec<VerifyingKey>> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -572,10 +576,14 @@ fn rotate_audit_if_needed(gyt_dir: &Path, path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
-    use crate::cmd::init;
     use crate::cmd::test_support::TestRepo;
-    use crate::hash;
     use crate::object::commit;
     use crate::object::tree;
 
@@ -615,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::many_single_char_names)] // Reason: a/b/c/m are the conventional letters for a merge DAG (parent, sibling, sibling, merge); renaming would obscure the test's intent.
+    #[expect(clippy::many_single_char_names, reason = "single-letter names are conventional shorthand in this algorithm")] // Reason: a/b/c/m are the conventional letters for a merge DAG (parent, sibling, sibling, merge); renaming would obscure the test's intent.
     fn is_ancestor_handles_merge_parents() {
         let r = TestRepo::new("gyt-policy-merge-anc");
         let repo = r.open();
@@ -756,10 +764,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Silence unused-import warnings in this test module if a test is removed.
-    #[allow(dead_code)]
-    fn _suppress_unused() {
-        let _ = init::init_at;
-        let _ = hash::hash_bytes;
-    }
 }

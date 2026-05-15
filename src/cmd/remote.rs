@@ -3,7 +3,10 @@
 use crate::config::Config;
 use crate::errors::{GytError, Result};
 use crate::repo::Repo;
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run(args: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
@@ -49,6 +52,10 @@ pub fn run(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::cmd::util::test_helpers::{lock, tmp_dir};
     use crate::config::Config;

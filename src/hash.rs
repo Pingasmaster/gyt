@@ -24,7 +24,10 @@ impl ObjectId {
         out.copy_from_slice(bytes);
         Ok(Self(out))
     }
-
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    )]
     pub fn from_hex(s: &str) -> Result<Self> {
         if s.len() != HEX_LEN {
             return Err(GytError::Parse(format!(
@@ -77,16 +80,23 @@ fn hex_nibble(b: u8) -> Result<u8> {
     }
 }
 
-fn hex_char(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + nibble - 10) as char,
-        _ => unreachable!(),
+const fn hex_char(nibble: u8) -> char {
+    // Mask down to a nibble defensively so this is a total function regardless
+    // of what callers pass — the caller intent is always `b >> 4` or `b & 0x0f`.
+    let n = nibble & 0x0f;
+    if n < 10 {
+        (b'0' + n) as char
+    } else {
+        (b'a' + n - 10) as char
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     #[test]

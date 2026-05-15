@@ -38,7 +38,6 @@ pub fn resolve_key_path(config: Option<&str>) -> PathBuf {
 }
 
 /// Resolve the public key path: check config, fall back to default.
-#[allow(dead_code)] // public API for future key resolution
 pub fn resolve_pub_path(config: Option<&str>) -> PathBuf {
     match config {
         Some(p) => PathBuf::from(p),
@@ -256,6 +255,10 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "chunk[0] is in-range because data.chunks(3) yields non-empty slices; B64_CHARS[idx] is gated by `idx & 0x3F` masking to 0..=63 (B64_CHARS is 64 bytes)"
+)]
 fn base64_encode(data: &[u8]) -> String {
     let mut out = String::new();
     for chunk in data.chunks(3) {
@@ -287,6 +290,14 @@ fn base64_encode(data: &[u8]) -> String {
 ///
 /// Exposed so other modules (notably `net::refs_policy`) reuse a single,
 /// audited decoder.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "bytes[bytes.len()-1-pad] is gated by the `pad < 2 && bytes.len() > pad` while-loop condition; bytes[..body_end] is bounded because body_end = bytes.len() - pad ≤ bytes.len()"
+)]
+#[expect(
+    clippy::integer_division,
+    reason = "intentional truncating integer division: every 4 base64 chars decode to exactly 3 bytes; `bytes.len() / 4 * 3` is the precise output capacity"
+)]
 pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let input = input.trim();
     let bytes = input.as_bytes();

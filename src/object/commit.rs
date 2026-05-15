@@ -34,12 +34,15 @@ pub struct Commit {
 }
 
 impl Commit {
-    #[allow(dead_code)] // scaffolding for future log --format features
     pub fn primary_author(&self) -> &str {
         self.authors.first().map_or("", String::as_str)
     }
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "writeln! to String never fails; the Result is only present for io::Write compatibility"
+)]
 pub fn encode(c: &Commit) -> Vec<u8> {
     let mut s = String::new();
     writeln!(s, "tree {}", c.tree).unwrap();
@@ -183,6 +186,10 @@ pub fn read(repo: &Path, id: &ObjectId) -> Result<Commit> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash;
 

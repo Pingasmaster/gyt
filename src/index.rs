@@ -157,6 +157,12 @@ impl Index {
         Ok(())
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::expect_used,
+        clippy::unwrap_in_result,
+        reason = "every slice and try_into is bounded by an explicit data.len() check immediately above; expect()s on try_into can never fire because the slice length is exactly the array length"
+    )]
     pub(crate) fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_LEN {
             return Err(GytError::Index(format!(
@@ -234,6 +240,12 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
     use crate::hash::{HASH_LEN, ObjectId};
 

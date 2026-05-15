@@ -89,7 +89,7 @@
 // Any module importing anything outside `gyt_ci` fails to instantiate
 // with a clean error, on purpose — that's the misconfiguration tell.
 
-#![allow(clippy::manual_let_else, clippy::redundant_closure_for_method_calls)]
+#![expect(clippy::manual_let_else, clippy::redundant_closure_for_method_calls, reason = "intentional `match` form is clearer than `let-else` in this control-flow shape")]
 
 use crate::errors::{GytError, Result};
 use std::fs;
@@ -117,7 +117,7 @@ pub const CI_MAX_WASM_STACK: usize = 8 * 1024 * 1024;
 // The 4 bools represent orthogonal capabilities (read, write,
 // output-write, network) and reading them as discrete flags at each
 // hostcall site is clearer than collapsing them into a state machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools, reason = "discrete capability flags read independently at use sites — collapsing into a state machine would obscure intent")]
 #[derive(Debug, Clone)]
 pub struct CiPolicy {
     /// True if the wasm may read files under `repo_workdir`. `.gyt/`
@@ -165,7 +165,10 @@ impl Default for CiPolicy {
 pub fn run_ci_wasm(wasm_path: &Path, repo_dir: &Path, output_dir: &Path) -> Result<()> {
     run_ci_wasm_with_policy(wasm_path, repo_dir, output_dir, &CiPolicy::default())
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 pub fn run_ci_wasm_with_policy(
     wasm_path: &Path,
     repo_dir: &Path,
@@ -184,7 +187,12 @@ pub fn run_ci_wasm_with_policy(
         .wasm_multi_value(true)
         .wasm_multi_memory(false)
         .wasm_memory64(false)
-        .max_wasm_stack(CI_MAX_WASM_STACK);
+        .max_wasm_stack(CI_MAX_WASM_STACK)
+        // wasmtime ≥ 44 validates `max_wasm_stack ≤ async_stack_size` even when
+        // async isn't used; default async_stack_size (2 MiB) is below our 8 MiB
+        // cap. We don't run async, but the check fires unconditionally, so size
+        // the async stack to match.
+        .async_stack_size(CI_MAX_WASM_STACK + 256 * 1024);
 
     let engine = Engine::new(&cfg)
         .map_err(|e| GytError::Ci(format!("wasmtime engine config: {e}")))?;
@@ -458,7 +466,10 @@ fn canonicalize_or_self(p: &Path) -> PathBuf {
 fn get_caller_memory(caller: &mut Caller<'_, Sandbox>) -> Option<Memory> {
     caller.get_export("memory")?.into_memory()
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn read_caller_string(caller: &mut Caller<'_, Sandbox>, ptr: i32, len: i32) -> Option<String> {
     if !(0..=4096).contains(&len) {
         return None;
@@ -472,7 +483,10 @@ fn read_caller_string(caller: &mut Caller<'_, Sandbox>, ptr: i32, len: i32) -> O
     }
     String::from_utf8(data[start..end].to_vec()).ok()
 }
-
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
 fn read_bytes(slice: &[u8], ptr: i32, len: i32) -> Vec<u8> {
     let start = ptr.max(0) as usize;
     let end = (start as i64 + len as i64) as usize;
@@ -617,6 +631,10 @@ pub const CI_INITIAL_FUEL: u64 = CI_DEFAULT_FUEL;
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "test code: panicking on unexpected input is how a test signals failure"
+    )]
     use super::*;
 
     fn empty_sandbox(repo_dir: &Path) -> Sandbox {

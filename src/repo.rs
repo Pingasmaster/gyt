@@ -131,19 +131,16 @@ impl Repo {
     }
 
     /// Path to the `.gyt/objects` directory.
-    #[allow(dead_code)]
     pub fn objects_dir(&self) -> PathBuf {
         self.gyt_dir.join("objects")
     }
 
     /// Path to the `.gyt/refs` directory.
-    #[allow(dead_code)]
     pub fn refs_dir(&self) -> PathBuf {
         self.gyt_dir.join("refs")
     }
 
     /// Path to the `.gyt/HEAD` file.
-    #[allow(dead_code)]
     pub fn head_path(&self) -> PathBuf {
         self.gyt_dir.join("HEAD")
     }

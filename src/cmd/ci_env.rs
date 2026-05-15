@@ -94,6 +94,10 @@ pub fn mask_secrets(output: &str, secrets: &BTreeMap<String, String>) -> String 
     result
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0]/args[1] are gated by args.len() < 2 check; lines[i] is gated by the while i < lines.len() loop header"
+)]
 pub fn run_set(args: &[String], gyt_dir: &Path) -> Result<()> {
     if args.len() < 2 || args[0] == "--help" {
         eprintln!("Usage: gyt ci env set <name> <value>");
@@ -160,6 +164,10 @@ pub fn run_list(_args: &[String], gyt_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[0] is gated by args.is_empty() check; lines[i] is gated by the while i < lines.len() loop header"
+)]
 pub fn run_remove(args: &[String], gyt_dir: &Path) -> Result<()> {
     if args.is_empty() || args[0] == "--help" {
         eprintln!("Usage: gyt ci env remove <name>");

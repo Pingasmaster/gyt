@@ -1,6 +1,12 @@
 // Integration tests that exercise the HTTP client against the in-process
 // server stub. Plain HTTP (loopback only).
 
+#![expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test module: expect/unwrap on test scaffolding is how the test signals failure"
+)]
+
 use crate::compress;
 use crate::hash::{self, ObjectId};
 use crate::net::http::HttpClient;
