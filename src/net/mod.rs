@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod api;
+pub mod cache;
 pub mod http;
 pub mod metrics;
 pub mod protocol;
