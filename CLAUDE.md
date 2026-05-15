@@ -92,9 +92,15 @@ this enables real ACL flows on the wire.
 
 ## Known data-integrity gaps tracked but not yet fixed
 
-- **gc vs `objects/have` race.** `gc` holds `repo.lock()` while it walks reachability, but `wire_objects_have` writes loose objects WITHOUT taking the lock. A push uploading objects during a gc run can have those objects pruned before its ref-update lands. The plan calls for a separate `objects.lock` that both paths acquire; currently tracked in `tests/data_integrity.rs::gc_after_server_objects_have_without_ref_update_keeps_orphan_or_warns`.
+(none currently — the documented gc vs `objects/have` race is now closed; see below.)
 
 ## Recently fixed bugs (with regression tests)
+
+- **gc vs `objects/have` race + missing issue/PR reachability seeds.** Closed by:
+  - A new `<gyt>/objects.lock` taken by `wire_objects_have` for the duration of its loose-object writes, and by `gc`'s prune phase (acquired *after* the reachability walk so a long walk doesn't block uploads).
+  - A 60s mtime grace inside `gc` (`GC_GRACE_SECS`) so any loose object recently written — including by an older client that bypasses the new lock — survives the prune.
+  - `compute_reachable` now seeds `refs/issues/*` and `refs/prs/*`; without this, every issue / PR blob would be pruned immediately (a regression introduced by the issues feature).
+  Regression tests: `tests/gc_race.rs::{unreachable_young_loose_object_survives_gc, issue_blob_survives_gc, pr_blob_survives_gc, concurrent_push_while_gc_runs_no_data_loss}`.
 
 - **`refs::walk` exposed atomic-write tmp files** — `/info/refs` returned 500 to every concurrent reader during any push and could leak a phantom tmp ref name to clients (silent client-repo corruption). Fixed in `src/refs.rs::walk` by skipping files whose name fails `validate_ref_name` and tolerating `read_ref` errors. Regression test: `tests/data_integrity.rs::info_refs_never_leaks_atomic_write_tmp_files`.
 - **`gyt add` index race** — two concurrent `gyt add` invocations silently dropped one another's entries because `add` did not take the repo lock. Fixed in `src/cmd/add.rs::run` by acquiring `repo.lock()` before the index read-modify-write. Regression test: `tests/data_integrity.rs::parallel_add_no_index_corruption`.

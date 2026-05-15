@@ -1534,6 +1534,25 @@ fn wire_objects_have(
             );
         }
     };
+    // Hold the object-store lock for the duration of the upload so a
+    // concurrent gc cannot prune objects we've written but not yet
+    // referenced. The lock is short — every entry is a single
+    // decompress + canonicality check + write — so contention is
+    // negligible in practice.
+    let _objects_lock = match crate::fs_util::FileLock::acquire(
+        &gyt_dir.join("objects.lock"),
+        std::time::Duration::from_secs(30),
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                503,
+                "Service Unavailable".into(),
+                format!("objects.lock: {e}").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
     let mut n_stored = 0u32;
     let mut n_skipped = 0u32;
     for entry in &entries {
