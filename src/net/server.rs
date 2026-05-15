@@ -1112,6 +1112,37 @@ fn repo_info(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
 /// at an earlier `?ref=<sha>`.
 const MAX_ANCESTORS: usize = 10_000;
 
+/// Per-file size cap when a REST handler reads blob payloads into
+/// memory (tree_browse blob view, diff_revs Myers input). Anything
+/// over this is returned/diffed as a stub: the client can still see
+/// "this file is 250 MB" without the server allocating it.
+const MAX_INLINE_BLOB_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Total bytes a single `diff_revs` request is allowed to allocate
+/// across all changed files. We stop adding diffs once we cross
+/// this; the response carries a `truncated` flag so the client knows
+/// to ask for narrower base..head ranges.
+const MAX_DIFF_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum number of files diff_revs will produce. Beyond this we
+/// also truncate. Trees with millions of files would otherwise OOM
+/// the worker before Myers diff produces its first byte.
+const MAX_DIFF_FILES: usize = 5_000;
+
+/// Per-request file-walk cap shared by `search_code` and `diff_revs`.
+/// flatten_tree is recursive and unbounded in the on-disk schema; an
+/// adversarial repo can build a tree with millions of entries.
+const MAX_FLATTEN_ENTRIES: usize = 200_000;
+
+/// Cap on tree_browse children listed in a single response. Combined
+/// with the size lookup skipping large blobs (see MAX_INLINE_BLOB_BYTES)
+/// this keeps a directory listing O(MAX_TREE_LIST_ENTRIES).
+const MAX_TREE_LIST_ENTRIES: usize = 5_000;
+
+/// Byte budget for a single search_code request. Stops a never-matching
+/// query from rescanning a multi-GiB working tree.
+const SEARCH_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+
 fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, Vec<u8>, String) {
     let owner = router::get_param(params, "owner").unwrap_or("");
     let name = router::get_param(params, "name").unwrap_or("");
@@ -1261,8 +1292,15 @@ fn tree_browse(state: &ServerState, params: &[(String, String)]) -> (u16, String
                 Ok(p) => p,
                 Err(e) => return error_response(500, &format!("blob read error: {e}")),
             };
-            let content = String::from_utf8_lossy(&payload).into_owned();
             let size = payload.len() as u64;
+            // Refuse to materialize huge blobs into a JSON response —
+            // the client gets a placeholder so the UI can decide
+            // whether to ask for raw bytes via a different route.
+            let content = if size > MAX_INLINE_BLOB_BYTES {
+                format!("<blob too large to inline: {size} bytes>")
+            } else {
+                String::from_utf8_lossy(&payload).into_owned()
+            };
             let info = BlobInfo {
                 path: path.to_string(),
                 hash: entry.hash.to_hex(),
@@ -1284,9 +1322,16 @@ fn list_tree(repo: &crate::repo::Repo, tree_id: &ObjectId) -> (u16, String, Vec<
         Err(e) => return error_response(500, &format!("tree read error: {e}")),
     };
 
+    // Hard cap: never decompress more than MAX_TREE_LIST_ENTRIES blobs
+    // for a single directory listing. The pre-cap was unbounded — a
+    // directory with 10k children meant 10k xz decompressions per
+    // GET. Note that we still need a `size: None` placeholder for
+    // entries past the cap so the listing stays a complete tree
+    // snapshot (just without size info).
     let items: Vec<String> = entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(idx, e)| {
             let name = std::str::from_utf8(&e.name)
                 .unwrap_or("<invalid>")
                 .to_string();
@@ -1295,7 +1340,7 @@ fn list_tree(repo: &crate::repo::Repo, tree_id: &ObjectId) -> (u16, String, Vec<
             } else {
                 "blob"
             };
-            let size = if e.mode == tree::MODE_DIR {
+            let size = if e.mode == tree::MODE_DIR || idx >= MAX_TREE_LIST_ENTRIES {
                 None
             } else {
                 crate::object::blob::read(&repo.gyt_dir, &e.hash)
@@ -1391,7 +1436,19 @@ fn diff_revs(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         Err(e) => return error_response(500, &format!("head tree error: {e}")),
     };
 
+    // Combined-tree size cap: a repo with 10M paths on each side
+    // would build a 20M-entry HashSet before we even start reading
+    // blobs. Refuse early.
+    if base_files.len() + head_files.len() > MAX_FLATTEN_ENTRIES {
+        return error_response(
+            413,
+            "diff: trees too large to diff in one request; narrow the range",
+        );
+    }
+
     let mut files: Vec<DiffFileInfo> = Vec::new();
+    let mut total_diff_bytes: usize = 0;
+    let mut truncated = false;
     let mut all_paths: Vec<PathBuf> = base_files
         .keys()
         .chain(head_files.keys())
@@ -1402,13 +1459,50 @@ fn diff_revs(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
     all_paths.sort();
 
     for path in &all_paths {
+        if files.len() >= MAX_DIFF_FILES || total_diff_bytes >= MAX_DIFF_BYTES {
+            truncated = true;
+            break;
+        }
         let path_str = path.to_string_lossy().into_owned();
+
         let old_blob = base_files
             .get(path)
             .and_then(|(_, id)| crate::object::blob::read(&repo.gyt_dir, id).ok());
         let new_blob = head_files
             .get(path)
             .and_then(|(_, id)| crate::object::blob::read(&repo.gyt_dir, id).ok());
+
+        let old_size = old_blob.as_ref().map_or(0, Vec::len) as u64;
+        let new_size = new_blob.as_ref().map_or(0, Vec::len) as u64;
+
+        // Either side over the per-file cap: emit a stub instead of
+        // running Myers diff (which is O(N+M+D²) — pathological on
+        // large binaries). We still count the bytes we already
+        // decompressed against `total_diff_bytes` so a series of
+        // giant-files-each-just-under-the-cap can't burn unlimited
+        // memory across the request.
+        let pair_bytes = old_size.saturating_add(new_size) as usize;
+        total_diff_bytes = total_diff_bytes.saturating_add(pair_bytes);
+        if old_size > MAX_INLINE_BLOB_BYTES || new_size > MAX_INLINE_BLOB_BYTES {
+            files.push(DiffFileInfo {
+                path: path_str,
+                hunks: vec![DiffHunkInfo {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 0,
+                    new_count: 0,
+                    lines: vec![DiffLine {
+                        old_no: None,
+                        new_no: None,
+                        kind: "binary".to_string(),
+                        text: format!(
+                            "<file too large to diff: old={old_size} new={new_size}>"
+                        ),
+                    }],
+                }],
+            });
+            continue;
+        }
 
         let old_lines: Vec<&[u8]> = match &old_blob {
             Some(b) => diff::split_lines(b),
@@ -1435,7 +1529,11 @@ fn diff_revs(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
         .iter()
         .map(super::api::DiffFileInfo::to_json)
         .collect();
-    let body = format!("[{}]", items.join(","));
+    let body = format!(
+        r#"{{"files":[{}],"truncated":{}}}"#,
+        items.join(","),
+        truncated
+    );
     json_response(&body)
 }
 
@@ -1584,14 +1682,41 @@ fn search_code(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, 
         return json_response(r#"{"kind":"code","items":[]}"#);
     };
 
+    // Refuse to walk a million-file tree just because the operator
+    // typed a search query. The pre-cap was unbounded — every search
+    // request decompressed every blob on HEAD.
+    if files.len() > MAX_FLATTEN_ENTRIES {
+        return error_response(
+            413,
+            "search: repo too large to scan in one request; narrow with a smaller subtree query",
+        );
+    }
+
     let query_lower = query.to_ascii_lowercase();
     let mut results = Vec::new();
+    // Hard wall-budget on bytes scanned. 20 matches is the result cap;
+    // the byte cap is what stops a query that simply doesn't appear in
+    // any blob from re-scanning the whole repo. After hitting it we
+    // surface the partial result with `truncated:true`.
+    let mut bytes_scanned: usize = 0;
+    let mut truncated = false;
 
     for (path, (_, id)) in &files {
         if results.len() >= 20 {
             break;
         }
+        if bytes_scanned >= SEARCH_BYTE_BUDGET {
+            truncated = true;
+            break;
+        }
         if let Ok(blob) = crate::object::blob::read(&repo.gyt_dir, id) {
+            // Skip huge blobs — they're almost always binary anyway,
+            // and decompressing them just to grep is the dominant
+            // cost of an unfiltered query.
+            if blob.len() as u64 > MAX_INLINE_BLOB_BYTES {
+                continue;
+            }
+            bytes_scanned = bytes_scanned.saturating_add(blob.len());
             let content = String::from_utf8_lossy(&blob);
             if content.to_ascii_lowercase().contains(&query_lower) {
                 results.push(api::json_string(&path.to_string_lossy()));
@@ -1599,7 +1724,10 @@ fn search_code(repo: &crate::repo::Repo, query: &str) -> (u16, String, Vec<u8>, 
         }
     }
 
-    let body = format!(r#"{{"kind":"code","items":[{}]}}"#, results.join(","));
+    let body = format!(
+        r#"{{"kind":"code","items":[{}],"truncated":{truncated}}}"#,
+        results.join(","),
+    );
     json_response(&body)
 }
 
