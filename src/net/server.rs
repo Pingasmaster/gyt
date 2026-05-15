@@ -17,6 +17,7 @@ use crate::net::api::{
     self, BlobInfo, CommitInfo, DiffFileInfo, DiffHunkInfo, DiffLine, RefInfo, RepoInfo,
     TreeEntryInfo,
 };
+use crate::net::metrics::Metrics;
 use crate::net::refs_policy;
 use crate::net::router::{self, Handler};
 use crate::object::{commit, tree};
@@ -146,6 +147,8 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         signers_file: config.signers_file.clone(),
         policy_config: config.policy_config.clone(),
         shutdown: Mutex::new(false),
+        metrics: Metrics::default(),
+        listen_addr: addr,
     });
     let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
 
@@ -164,6 +167,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         }
         match stream {
             Ok(mut s) => {
+                state.metrics.accepts_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                 let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 // Non-blocking permit: if the worker pool is full,
@@ -180,6 +184,10 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
                         // Best-effort 503 — failures (peer reset,
                         // timeout) just close the socket.
                         use std::io::Write as _;
+                        state
+                            .metrics
+                            .pool_exhausted_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = s.write_all(POOL_FULL_RESPONSE);
                         let _ = s.shutdown(std::net::Shutdown::Both);
                         continue;
@@ -269,6 +277,11 @@ struct ServerState {
     signers_file: Option<PathBuf>,
     policy_config: Option<PathBuf>,
     shutdown: Mutex<bool>,
+    metrics: Metrics,
+    /// Bound local address. Stored so the admin-shutdown handler can
+    /// self-connect to unblock accept() — the signal handler does the
+    /// same trick.
+    listen_addr: std::net::SocketAddr,
 }
 
 /// One row in the `--auth-tokens` TSV. A token may appear in multiple
@@ -470,7 +483,14 @@ fn serve_one<R: BufRead, W: Write>(
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
 
-    if !authorize(state, &req, &route) {
+    state.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .request_body_bytes_total
+        .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.record_handler(route.handler);
+
+    if !authorize_with_metric(state, &req, &route) {
         write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
         return Ok(false);
     }
@@ -479,9 +499,28 @@ fn serve_one<R: BufRead, W: Write>(
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
 
+    state
+        .metrics
+        .response_bytes_total
+        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
     let keep_alive = !req.client_wants_close;
     write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
     Ok(keep_alive)
+}
+
+/// Wrapper around `authorize` that bumps the unauthorized counter on
+/// deny. Keeps `authorize` itself free of side effects so test code
+/// can call it without metric pollution.
+fn authorize_with_metric(state: &ServerState, req: &Request, route: &router::RouteMatch) -> bool {
+    let ok = authorize(state, req, route);
+    if !ok {
+        state
+            .metrics
+            .requests_unauthorized_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
 }
 
 /// Derive an audit-log actor identifier for the request. We fingerprint
@@ -537,7 +576,14 @@ fn serve_one_tls(
     let params = router::query_params(query);
     let route = router::route(&req.method, path);
 
-    if !authorize(state, &req, &route) {
+    state.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .request_body_bytes_total
+        .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.record_handler(route.handler);
+
+    if !authorize_with_metric(state, &req, &route) {
         let writer = reader.get_mut();
         write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
         return Ok(false);
@@ -546,6 +592,11 @@ fn serve_one_tls(
     let actor = actor_for(&req);
     let (status, reason, body, ctype) =
         dispatch(&route, &params, query, &req.body, state, actor.as_deref());
+
+    state
+        .metrics
+        .response_bytes_total
+        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
     let keep_alive = !req.client_wants_close;
     let writer = reader.get_mut();
@@ -563,6 +614,9 @@ fn serve_one_tls(
 ///    route (legacy single-token mode).
 /// 3. Neither set → open server. Reads and writes accepted.
 fn authorize(state: &ServerState, req: &Request, route: &router::RouteMatch) -> bool {
+    if route_is_unauth_probe(route) {
+        return true;
+    }
     if let Some(acl) = &state.auth_acl {
         let Some(token) = req
             .auth_header
@@ -601,9 +655,25 @@ fn authorize(state: &ServerState, req: &Request, route: &router::RouteMatch) -> 
 }
 
 /// True iff this route mutates server-side state. Writes need `rw`
-/// permission under the ACL; reads can satisfy with `ro`.
+/// permission under the ACL; reads can satisfy with `ro`. Admin
+/// shutdown is treated as a write — `ro` tokens cannot drain the
+/// server.
 const fn route_needs_write(route: &router::RouteMatch) -> bool {
-    matches!(route.handler, Handler::ObjectsHave | Handler::RefsUpdate)
+    matches!(
+        route.handler,
+        Handler::ObjectsHave | Handler::RefsUpdate | Handler::AdminShutdown
+    )
+}
+
+/// True iff this route is an operator probe that should be reachable
+/// without authentication so probes from k8s / a load balancer don't
+/// have to know the bearer token. `AdminShutdown` is deliberately not
+/// in this set — it must always be auth-gated.
+const fn route_is_unauth_probe(route: &router::RouteMatch) -> bool {
+    matches!(
+        route.handler,
+        Handler::Healthz | Handler::Readyz | Handler::Metrics
+    )
 }
 
 /// Extract the wire repo name from a route's params, if any. Wire
@@ -694,6 +764,10 @@ fn dispatch(
         Handler::RefsList => refs_list(state, &merge_params(&route.params, params)),
         Handler::DiffRevs => diff_revs(state, &merge_params(&route.params, params)),
         Handler::Search => search(state, &merge_params(&route.params, params)),
+        Handler::Healthz => healthz_handler(state),
+        Handler::Readyz => readyz_handler(state),
+        Handler::Metrics => metrics_handler(state),
+        Handler::AdminShutdown => admin_shutdown_handler(state),
         Handler::StaticFile => static_file(state, params),
         Handler::NotFound => (
             404,
@@ -838,6 +912,63 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         auth_header,
         client_wants_close,
     })
+}
+
+// ---------- Operator handlers: health / readiness / metrics / shutdown ----------
+
+fn healthz_handler(_state: &ServerState) -> (u16, String, Vec<u8>, String) {
+    (200, "OK".into(), b"ok\n".to_vec(), "text/plain".into())
+}
+
+fn readyz_handler(state: &ServerState) -> (u16, String, Vec<u8>, String) {
+    let draining = *state
+        .shutdown
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if draining {
+        (
+            503,
+            "Service Unavailable".into(),
+            b"draining\n".to_vec(),
+            "text/plain".into(),
+        )
+    } else {
+        (200, "OK".into(), b"ready\n".to_vec(), "text/plain".into())
+    }
+}
+
+fn metrics_handler(state: &ServerState) -> (u16, String, Vec<u8>, String) {
+    let body = state.metrics.render_prometheus();
+    (
+        200,
+        "OK".into(),
+        body.into_bytes(),
+        "text/plain; version=0.0.4".into(),
+    )
+}
+
+/// POST /admin/shutdown — flips the shutdown flag and self-connects
+/// so the accept loop returns immediately. The actor that fires this
+/// is auth-gated (same as a write route): you need an `rw` token if
+/// ACLs are configured, the full `--auth-token` if single-token, or
+/// nothing if the server runs open.
+fn admin_shutdown_handler(state: &ServerState) -> (u16, String, Vec<u8>, String) {
+    if let Ok(mut g) = state.shutdown.lock() {
+        *g = true;
+    }
+    // Best-effort self-connect to break accept(). Failure means the
+    // listener already had something queued — accept will still
+    // observe the flag on its next iteration.
+    let _ = std::net::TcpStream::connect_timeout(
+        &state.listen_addr,
+        std::time::Duration::from_secs(1),
+    );
+    (
+        202,
+        "Accepted".into(),
+        b"shutting down\n".to_vec(),
+        "text/plain".into(),
+    )
 }
 
 // ---------- Helper: resolve owner/name to .gyt path ----------
@@ -1933,6 +2064,8 @@ mod tests {
             signers_file: None,
             policy_config: None,
             shutdown: Mutex::new(false),
+            metrics: Metrics::default(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
         })
     }
 

@@ -24,12 +24,55 @@ pub enum Handler {
     ObjectsHave,
     /// Wire protocol: POST /{repo}/refs/update
     RefsUpdate,
+    /// Liveness probe: returns 200 with body "ok" if the process is up.
+    Healthz,
+    /// Readiness probe: returns 200 "ready" iff the server is not in
+    /// the shutdown-drain window. During drain we return 503 so the
+    /// load balancer takes us out of rotation before the process
+    /// finishes serving in-flight requests.
+    Readyz,
+    /// Prometheus-format counters dump.
+    Metrics,
+    /// Operator-triggered shutdown: POST /admin/shutdown with the same
+    /// auth as a write route. Used when SIGTERM is not available (e.g.
+    /// container probes, manual drain). Same outcome as a signal.
+    AdminShutdown,
     StaticFile,
     NotFound,
 }
 
 pub fn route(method: &str, path: &str) -> RouteMatch {
     let segments = split_path(path);
+
+    // ── Operator endpoints ──────────────────────────────────────
+    // These are matched first so a repo named "healthz" can't shadow
+    // the probe. They never carry a `repo` param so the ACL falls
+    // through to the "only `*` pattern grants access" rule, matching
+    // every other non-wire route.
+    if method == "GET" && segments == ["healthz"] {
+        return RouteMatch {
+            handler: Handler::Healthz,
+            params: vec![],
+        };
+    }
+    if method == "GET" && segments == ["readyz"] {
+        return RouteMatch {
+            handler: Handler::Readyz,
+            params: vec![],
+        };
+    }
+    if method == "GET" && segments == ["metrics"] {
+        return RouteMatch {
+            handler: Handler::Metrics,
+            params: vec![],
+        };
+    }
+    if method == "POST" && segments == ["admin", "shutdown"] {
+        return RouteMatch {
+            handler: Handler::AdminShutdown,
+            params: vec![],
+        };
+    }
 
     // ── Wire protocol endpoints ─────────────────────────────────
     // These are the gyt protocol endpoints, used by clone/fetch/push.
