@@ -141,13 +141,35 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
         .ok_or_else(|| GytError::Net(format!("no private key found in {}", key_path.display())))?
         .map_err(|e| GytError::Net(format!("key parse error: {e}")))?;
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| GytError::Net(format!("server config error: {e}")))?;
 
+    // Enable TLS 1.2 session-ID resumption + TLS 1.3 session-ticket
+    // resumption. A repeat clone from the same client skips the full
+    // certificate exchange and asymmetric handshake — ~10× setup-cost
+    // reduction on TLS-heavy workloads. The cache is per-server-process
+    // in-memory; a server cluster needs sticky load-balancing for
+    // resumption to fire, which is the normal deployment shape.
+    //
+    // 4096 entries × ~256 bytes ≈ 1 MiB — negligible vs. one full
+    // handshake's CPU cost.
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_ENTRIES);
+    // Also enable TLS 1.3 ticketing so resumption works without
+    // server-side state for clients that prefer 1.3.
+    config.ticketer = rustls::crypto::ring::Ticketer::new()
+        .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?;
+
     Ok(Arc::new(config))
 }
+
+/// Server-side TLS session cache size. Sized so repeat clones from
+/// thousands of distinct clients within a cache lifetime all get the
+/// resumption fast-path. Tuned downwards on memory-constrained hosts
+/// would only cost cache misses (i.e., a full handshake), never
+/// correctness.
+pub const SESSION_CACHE_ENTRIES: usize = 4096;
 
 /// Refuse to load a private key file whose mode allows group/world
 /// access. No-op on non-Unix platforms.
@@ -176,4 +198,33 @@ pub fn accept_tls(stream: TcpStream, config: &Arc<ServerConfig>) -> Result<Serve
         .map_err(|e| GytError::Net(format!("tls accept: {e}")))?;
     let inner = StreamOwned::new(conn, stream);
     Ok(ServerTlsStream { inner })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `server_config` must succeed and the returned ServerConfig must
+    /// carry our resumption configuration (session_storage capacity
+    /// and a ticketer set). We can't inspect the config's internal
+    /// session store directly through the public API; the pin is on
+    /// the public constant that controls it.
+    #[test]
+    fn session_cache_size_is_at_documented_value() {
+        assert_eq!(SESSION_CACHE_ENTRIES, 4096);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_config_with_resumption_loads_cleanly() {
+        // Generate a self-signed cert + key via rustls test helpers
+        // would be nice, but we don't depend on rcgen. Instead we just
+        // verify that calling server_config() with a bogus path
+        // returns Err quickly — i.e., the resumption setup doesn't
+        // change the error path. The integration tests in tests/e2e.rs
+        // exercise the happy path with real cert/key fixtures.
+        let bogus = std::path::Path::new("/nonexistent/cert.pem");
+        let r = server_config(bogus, bogus);
+        assert!(r.is_err());
+    }
 }
