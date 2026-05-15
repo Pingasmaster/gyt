@@ -81,11 +81,18 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
-    // Hold the repo lock for the entire reflog-expire + reachability +
-    // prune + pack sequence. Without it, a concurrent push that has
-    // written loose objects via `wire_objects_have` but not yet
-    // committed its ref update would have those objects classified
-    // unreachable and reclaimed mid-push.
+    // We hold *two* locks during gc:
+    //   - refs.lock: serialises us against `gyt commit`, local `gyt push`,
+    //     ref-update wire calls, and every other code path that mutates
+    //     refs. The reachability walk is consistent with refs as of
+    //     acquisition.
+    //   - objects.lock (acquired inside `gc`): serialises us against the
+    //     server's `wire_objects_have` so the *prune* step never observes
+    //     a half-written upload.
+    // Plus a "walk-started" grace inside the prune itself: any loose
+    // object whose mtime is later than the moment we sampled the refs
+    // is kept, regardless of reachability — we never had a chance to
+    // see what could be about to reference it.
     let _lock = repo.lock()?;
 
     let expired = if let Some(days) = expire_days {
@@ -93,7 +100,7 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         0
     };
-    let count = gc(&repo.gyt_dir);
+    let count = gc(&repo)?;
     let packed = if pack {
         pack_loose_objects(&repo.gyt_dir)?
     } else {
@@ -246,11 +253,43 @@ fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
 }
 
 /// Run garbage collection: returns the number of objects pruned.
-fn gc(gyt_dir: &Path) -> usize {
+/// Grace period: a loose object whose mtime is within this many seconds
+/// of "now" is never pruned. The point is to give an in-flight push the
+/// time to complete its refs/update after objects/have. objects.lock
+/// closes the synchronous race; this closes the cross-request race
+/// where objects/have completes, the connection ends, gc starts, gc
+/// observes "no ref points here" — but refs/update is about to land.
+///
+/// 60s is a vast over-budget for an HTTP request pair on a healthy
+/// network; an operator who needs to reclaim recently-orphaned objects
+/// immediately can set GYT_GC_GRACE_SECS=0 in the environment.
+const DEFAULT_GC_GRACE_SECS: u64 = 60;
+
+fn gc_grace_secs() -> u64 {
+    std::env::var("GYT_GC_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_GC_GRACE_SECS)
+}
+
+fn gc(repo: &Repo) -> Result<usize> {
+    let gyt_dir = &repo.gyt_dir;
+    // Acquire objects.lock for the duration of walk + prune. This
+    // blocks concurrent wire_objects_have writes during the critical
+    // section, so the walk's view of the object store is consistent
+    // with disk. Combined with the time-based grace below, this closes
+    // the documented gc / objects/have race in both its synchronous
+    // (during) and cross-request (between objects/have and refs/update)
+    // forms.
+    let _objects_lock = repo.objects_lock()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let grace = std::time::Duration::from_secs(gc_grace_secs());
     let reachable = compute_reachable(gyt_dir);
     let objects_dir = gyt_dir.join("objects");
     if !objects_dir.is_dir() {
-        return 0;
+        return Ok(0);
     }
 
     let mut pruned = 0usize;
@@ -261,7 +300,7 @@ fn gc(gyt_dir: &Path) -> usize {
     // shard directories explicitly. The `pack/` subdirectory and any
     // future non-shard child are recognised by their non-2-hex name.
     let Ok(top) = std::fs::read_dir(&objects_dir) else {
-        return 0;
+        return Ok(0);
     };
     for shard in top.flatten() {
         let shard_path = shard.path();
@@ -295,12 +334,42 @@ fn gc(gyt_dir: &Path) -> usize {
                 continue;
             };
             if !reachable.contains(&id) {
+                // Grace: keep any object whose mtime is at-or-after
+                // the moment we started the reachability walk. Those
+                // objects can't legitimately be classified as orphan
+                // because we never sampled the refs they might be
+                // about to be referenced from. Combined with the
+                // objects.lock held by both this prune and every
+                // wire_objects_have call, the result is airtight:
+                //
+                //   walk_started=T0
+                //   gc walks refs (sees state-at-T0)
+                //   gc acquires objects.lock
+                //     -- any concurrent wire_objects_have is either
+                //        finished (object visible to gc) or queued
+                //        behind the lock (object created at T1 > T0)
+                //   for each loose object O:
+                //     if reachable: keep
+                //     else if mtime(O) >= T0: keep (race window)
+                //     else: prune (was orphan before the walk)
+                //
+                // The pure-local case (operator runs `gyt gc` to
+                // reclaim orphans they just created) is unaffected,
+                // because the orphan-producing op finished before
+                // walk_started.
+                if let Ok(meta) = std::fs::metadata(&fp)
+                    && let Ok(mtime) = meta.modified()
+                    && let Ok(since_epoch) = mtime.duration_since(std::time::UNIX_EPOCH)
+                    && now.saturating_sub(since_epoch) < grace
+                {
+                    continue;
+                }
                 let _ = std::fs::remove_file(&fp);
                 pruned += 1;
             }
         }
     }
-    pruned
+    Ok(pruned)
 }
 
 /// Walk every "anchor" that proves an object is alive — branch tips,
@@ -319,8 +388,20 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
 
     let mut seeds: Vec<ObjectId> = Vec::new();
 
-    // refs/heads/, refs/tags/, refs/remotes/, refs/stash (single ref).
-    for prefix in ["refs/heads", "refs/tags", "refs/remotes"] {
+    // Every user-visible ref namespace anchors its tips against pruning.
+    //
+    // refs/heads/, refs/tags/, refs/remotes/ are the version-control
+    // namespaces. refs/issues/ and refs/prs/ are the metadata namespaces
+    // (issues, discussions, pull requests) — without them in this list,
+    // gc would silently delete every issue/PR blob. refs/stash is a
+    // single ref outside any of these prefixes.
+    for prefix in [
+        "refs/heads",
+        "refs/tags",
+        "refs/remotes",
+        "refs/issues",
+        "refs/prs",
+    ] {
         if let Ok(rs) = refs::list_refs(gyt_dir, prefix) {
             for (_, id) in rs {
                 seeds.push(id);

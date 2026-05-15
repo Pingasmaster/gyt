@@ -112,7 +112,11 @@ impl Env {
             .env("GYT_AUTHOR_EMAIL", "test@example.com")
             // Disable any inherited gyt config that might pollute tests.
             .env("HOME", &self.dir)
-            .env_remove("XDG_CONFIG_HOME");
+            .env_remove("XDG_CONFIG_HOME")
+            // Production gc keeps recently-modified objects to survive
+            // the cross-request push race. Tests need immediate prune
+            // semantics — disable the grace globally.
+            .env("GYT_GC_GRACE_SECS", "0");
         c
     }
 

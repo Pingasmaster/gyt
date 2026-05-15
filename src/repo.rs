@@ -110,6 +110,26 @@ impl Repo {
         )
     }
 
+    /// Object-store lock. Separate from `lock()` (the refs lock) so a
+    /// long gc pass holding the refs lock for the reachability walk
+    /// doesn't prevent concurrent uploads from streaming new loose
+    /// objects in — but the *prune* phase of gc and every loose-object
+    /// write *do* serialize against each other.
+    ///
+    /// Without this, the `gc` race documented in CLAUDE.md is real: a
+    /// push that wrote a loose object during the gc walk would have it
+    /// reclaimed before the push's refs/update lands, leaving a
+    /// dangling ref on the server. With `objects.lock` held during the
+    /// prune, the prune cannot observe a half-written loose object;
+    /// combined with the mtime grace below it cannot reclaim an object
+    /// the pusher is about to reference.
+    pub fn objects_lock(&self) -> Result<crate::fs_util::FileLock> {
+        crate::fs_util::FileLock::acquire(
+            &self.gyt_dir.join("objects.lock"),
+            std::time::Duration::from_secs(30),
+        )
+    }
+
     /// Path to the `.gyt/objects` directory.
     #[allow(dead_code)]
     pub fn objects_dir(&self) -> PathBuf {
