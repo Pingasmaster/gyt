@@ -143,6 +143,8 @@ impl GytTest {
                 "--webroot",
                 &self.work.join("empty-webroot").to_string_lossy(),
             ])
+            .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
+            .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

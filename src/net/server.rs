@@ -63,6 +63,42 @@ fn configured_worker_count() -> usize {
         .unwrap_or(DEFAULT_WORKERS)
 }
 
+/// Per-IP rate-limit config, overridable via env so tests and
+/// reverse-proxy deployments (where every request appears to come
+/// from 127.0.0.1) can raise the cap. Setting capacity to 0 disables
+/// the IP bucket entirely.
+fn configured_ip_limit() -> LimitConfig {
+    let cap = std::env::var("GYT_SERVE_RATE_IP_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(LimitConfig::DEFAULT_IP.capacity);
+    let rps = std::env::var("GYT_SERVE_RATE_IP_RPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(LimitConfig::DEFAULT_IP.refill_per_sec);
+    LimitConfig {
+        capacity: cap,
+        refill_per_sec: rps,
+    }
+}
+
+/// Per-actor (per bearer-token) rate-limit config. Same env-knob
+/// shape as the per-IP version.
+fn configured_actor_limit() -> LimitConfig {
+    let cap = std::env::var("GYT_SERVE_RATE_ACTOR_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(LimitConfig::DEFAULT_ACTOR.capacity);
+    let rps = std::env::var("GYT_SERVE_RATE_ACTOR_RPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(LimitConfig::DEFAULT_ACTOR.refill_per_sec);
+    LimitConfig {
+        capacity: cap,
+        refill_per_sec: rps,
+    }
+}
+
 /// Body the server writes when it refuses a connection due to pool
 /// exhaustion. Sent before the socket is dropped so clients see a
 /// real HTTP response instead of a TCP RST.
@@ -205,7 +241,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         shutdown: Mutex::new(false),
         metrics: Metrics::default(),
         listen_addr: addr,
-        rate_limiter: RateLimiter::new(LimitConfig::DEFAULT_IP, LimitConfig::DEFAULT_ACTOR),
+        rate_limiter: RateLimiter::new(configured_ip_limit(), configured_actor_limit()),
         response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 10_000),
         pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 256),
     });

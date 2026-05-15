@@ -90,12 +90,22 @@ impl RateLimiter {
         // is allowed to refund nothing on the loser because the cost
         // of the partial charge is at most one token — and the next
         // call will refill it from now.last_refill.
-        let ip_ok = if let Some(ip) = ip {
+        //
+        // Capacity-zero disables that side entirely. This is the
+        // operator escape hatch for reverse-proxy deployments (every
+        // request appears to come from 127.0.0.1, so the per-IP bucket
+        // becomes a global cap) and for test environments that fire
+        // hundreds of requests in burst.
+        let ip_ok = if self.ip_cfg.capacity == 0 {
+            true
+        } else if let Some(ip) = ip {
             Self::take(&mut g, Key::Ip(ip), self.ip_cfg, now)
         } else {
             true
         };
-        let actor_ok = if let Some(a) = actor {
+        let actor_ok = if self.actor_cfg.capacity == 0 {
+            true
+        } else if let Some(a) = actor {
             Self::take(&mut g, Key::Actor(a.to_string()), self.actor_cfg, now)
         } else {
             true
