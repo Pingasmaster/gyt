@@ -10,6 +10,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut webroot = PathBuf::from("site");
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut tls_ticket_key: Option<PathBuf> = None;
     let mut auth_token: Option<String> = None;
     let mut auth_tokens_file: Option<PathBuf> = None;
     let mut signers_file: Option<PathBuf> = None;
@@ -44,6 +45,11 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 println!(
                     "  --listen-h3 <addr>    Optional HTTP/3 (UDP/QUIC) listen address (requires --cert/--key)"
                 );
+                println!(
+                    "  --tls-ticket-key <f>  Hex-encoded shared TLS session-ticket key file.\n\
+                     \x20                      Line 1 = current key (32-byte hex), optional line 2 = previous key.\n\
+                     \x20                      Use the same file on every replica for cross-replica resumption."
+                );
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     h2_listen_addr: h2_listen,
@@ -52,6 +58,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     webroot,
                     tls_cert,
                     tls_key,
+                    tls_ticket_key,
                     auth_token,
                     auth_tokens_file,
                     signers_file,
@@ -148,6 +155,15 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 })?;
                 h3_listen = Some(s);
             }
+            "--tls-ticket-key" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--tls-ticket-key requires a file path".into(),
+                    )
+                })?;
+                tls_ticket_key = Some(PathBuf::from(s));
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -175,6 +191,12 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         ));
     }
 
+    if tls_ticket_key.is_some() && tls_cert.is_none() {
+        return Err(crate::errors::GytError::InvalidArgument(
+            "--tls-ticket-key requires --cert and --key (it's only useful for TLS resumption)".into(),
+        ));
+    }
+
     Ok(ServeConfig {
         listen_addr: listen,
         h2_listen_addr: h2_listen,
@@ -183,6 +205,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         webroot,
         tls_cert,
         tls_key,
+        tls_ticket_key,
         auth_token,
         auth_tokens_file,
         signers_file,

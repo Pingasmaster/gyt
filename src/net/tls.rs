@@ -109,7 +109,11 @@ pub fn connect_tls(host: &str, port: u16) -> Result<TlsStream> {
 ///
 /// The certificate file may contain a chain of certificates (leaf first).
 /// The private key must be in PKCS#8, PKCS#1, or SEC1 PEM format.
-pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
+pub fn server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ticket_key_path: Option<&Path>,
+) -> Result<Arc<ServerConfig>> {
     ensure_provider_installed();
 
     // Load certificate chain
@@ -167,8 +171,14 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
     // 4096 entries × ~256 bytes ≈ 1 MiB — negligible vs. one full
     // handshake's CPU cost.
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_ENTRIES);
-    config.ticketer = rustls::crypto::ring::Ticketer::new()
-        .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?;
+    config.ticketer = match ticket_key_path {
+        Some(p) => {
+            let t = crate::net::ticket::SharedTicketer::from_file(p)?;
+            Arc::new(t)
+        }
+        None => rustls::crypto::ring::Ticketer::new()
+            .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?,
+    };
 
     // ALPN: advertise "http/1.1" explicitly. The server speaks HTTP/1.1
     // only — there is no HTTP/2 or HTTP/3 implementation here. Without
@@ -249,7 +259,7 @@ mod tests {
         // change the error path. The integration tests in tests/e2e.rs
         // exercise the happy path with real cert/key fixtures.
         let bogus = std::path::Path::new("/nonexistent/cert.pem");
-        let r = server_config(bogus, bogus);
+        let r = server_config(bogus, bogus, None);
         assert!(r.is_err());
     }
 }
