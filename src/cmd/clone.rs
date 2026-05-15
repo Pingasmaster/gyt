@@ -133,10 +133,14 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> R
 
     let n_objects = walk_and_fetch(&client, &repo, &server_refs, true, depth)?;
 
-    // Mirror server refs locally as heads/tags.
+    // Mirror server refs locally. Includes refs/heads/*, refs/tags/*,
+    // and the metadata namespaces (refs/issues/*, refs/prs/*) so that
+    // issues, discussions and PRs travel with the repo. Anything outside
+    // these namespaces is dropped — we don't want a malicious server to
+    // be able to fill our ref database with arbitrary names.
     let mut n_refs = 0usize;
     for r in &server_refs {
-        if r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/") {
+        if is_user_visible_ref(&r.name) {
             refs::write_ref(&repo.gyt_dir, &r.name, &r.id)?;
             n_refs += 1;
         }
@@ -153,6 +157,16 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> R
 
     println!("done. cloned {n_objects} objects, {n_refs} refs.");
     Ok(())
+}
+
+/// Ref-name namespace whitelist for clone / fetch. We accept the
+/// version-control names (heads / tags) plus the metadata namespaces
+/// that carry issues, discussions and PRs.
+pub fn is_user_visible_ref(name: &str) -> bool {
+    name.starts_with("refs/heads/")
+        || name.starts_with("refs/tags/")
+        || name.starts_with("refs/issues/")
+        || name.starts_with("refs/prs/")
 }
 
 fn pick_head(server_refs: &[RefEntry]) -> Option<String> {
@@ -233,7 +247,7 @@ pub fn walk_and_fetch(
     let mut new_objects = 0usize;
 
     for r in server_refs {
-        if r.name.starts_with("refs/heads/") || r.name.starts_with("refs/tags/") {
+        if is_user_visible_ref(&r.name) {
             commit_depth.entry(r.id).or_insert(0);
             if store::exists(&repo.gyt_dir, &r.id) {
                 downloaded.insert(r.id);
