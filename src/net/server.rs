@@ -2135,20 +2135,37 @@ fn static_file(state: &ServerState, params: &[(String, String)]) -> (u16, String
 
     let rel = raw_path.trim_start_matches('/');
 
-    // Path-traversal defense. We canonicalize webroot once at startup
-    // (well — once per request; not on the hot path), then build the
-    // request's target and require it to resolve to something whose
-    // canonical form *also* starts with webroot's canonical form.
-    // The pre-async code did a lexical starts_with() on un-canonicalized
-    // paths, which let `..` through (webroot/../secret.txt lexically
-    // starts with webroot but resolves outside it).
+    // Path-traversal defense. Apply the same segment validator the
+    // wire / REST paths use to every component of the static path,
+    // then canonicalize and verify the resolved file is still under
+    // webroot. The per-segment validator handles ~22 attack classes
+    // (Unicode normalization, control chars, Windows reserved
+    // device names, double-encoding, etc.); canonicalize + starts_with
+    // closes the symlink escape that segments alone can't catch.
     //
-    // Stronger: refuse any path segment of "..", "." or with a NUL
-    // before even touching the filesystem. The combined check survives
-    // %-encoded vectors too because the URL parser already decoded
-    // them by the time we see `rel`.
+    // We also reject path lengths > 4096 bytes pre-emptively (Linux
+    // PATH_MAX) so an obscenely-long URL can't push the OS error
+    // path before we get a chance to deny it cleanly.
+    if rel.len() > 4096 {
+        return (
+            414,
+            "URI Too Long".into(),
+            b"path too long".to_vec(),
+            "text/plain".into(),
+        );
+    }
     for seg in rel.split('/') {
-        if seg == ".." || seg == "." || seg.contains('\0') {
+        if seg.is_empty() {
+            // Consecutive `//` produce empty segments — harmless on
+            // disk, but reject for cleanliness.
+            return (
+                404,
+                "Not Found".into(),
+                b"not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+        if !is_safe_repo_segment(seg) {
             return (
                 404,
                 "Not Found".into(),
@@ -2231,35 +2248,109 @@ fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std
 }
 
 /// True iff `s` is safe to join under `repos_root` as a single segment.
+///
 /// The wire URL `/{repo}/...` and the REST `/api/repos/:owner/:name`
-/// path both eventually feed a single segment into `Path::join`, so
-/// the segment must NOT be one of the two strings that climb the tree
-/// (`.`, `..`) and must NOT contain anything that would alias to a
-/// different on-disk location (path separators, NUL, drive separator).
+/// path both eventually feed a single segment into `Path::join`. This
+/// is the only validation point between attacker-controlled bytes and
+/// the filesystem; it has to cover the full modern attack surface.
 ///
-/// What this DOES NOT block (deliberately):
-///   - leading dot: `.config`, `.well-known`, `.foo` — these are
-///     literal directory names; they don't escape.
-///   - `..` as a substring: `my..repo`, `foo..bar` — only the exact
-///     two-byte string `..` is a parent-dir reference. Substrings
-///     are just literal characters.
-///   - trailing dot, double dots in the middle, etc.
+/// Defended attack classes (with the validator rule that catches each):
 ///
-/// The pre-relax version also banned `starts_with('.')`. That was
-/// over-cautious paternalism and broke any operator who legitimately
-/// named a repo `.dotfiles` or similar. Path-traversal protection
-/// comes from blocking the *exact* parent-dir reference and the
-/// segment-separator characters, not from cosmetic restrictions on
-/// what a name "looks like."
+/// 1.  Classic `..` / `.`                        — exact-match deny.
+/// 2.  All-dots segments (`...`, `....`, …)     — `chars.all(=='.')`.
+/// 3.  Path separators `/` `\`                  — byte deny.
+/// 4.  Drive separator `:` (also NTFS streams)  — byte deny.
+/// 5.  NUL injection (`%00` after decode)       — byte deny.
+/// 6.  Other control chars (C0 + DEL)           — byte deny.
+/// 7.  Non-ASCII bytes                          — wholesale deny.
+///     This is the single biggest defense: it closes Unicode
+///     normalization (fullwidth `．．` → `..` under NFKC), combining
+///     marks, bidi controls (U+200E/U+202E), zero-width invisibles,
+///     overlong UTF-8 (Rust `str` already rejects but defense-in-
+///     depth), and Latin/Cyrillic/script-g confusables for `.gyt`,
+///     `.git`, `.ssh`, etc. If a future deployment legitimately
+///     needs Unicode repo names, do it through an explicit
+///     allow-list, not by relaxing this rule.
+/// 8.  Surviving `%` (double-encoding)          — byte deny.
+///     If a segment still contains `%` after HTTP decode, something
+///     upstream skipped its decoder pass. Don't double-decode here;
+///     refuse the request. (Apache Tomcat CVE-2025-55752 pattern.)
+/// 9.  Trailing dot or trailing space (Windows) — suffix deny.
+///     Win32 silently strips these (`secret.txt.` → `secret.txt`),
+///     defeating any extension-based deny-list. Apply on every
+///     platform because the server might be deployed on Windows or
+///     read by a Windows-hosted indexer over SMB.
+/// 10. Leading space                            — prefix deny.
+/// 11. Length > 255 bytes / empty               — length bounds.
+/// 12. Windows reserved device names            — stem case-fold deny.
+///     `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` —
+///     including with a `.ext` suffix (Win32 opens the device
+///     regardless of extension). Case-insensitive ASCII compare on
+///     the part before the first dot.
+///
+/// What this deliberately allows (verified non-escaping):
+///   - leading dot: `.config`, `.well-known`, `.dotfiles`
+///   - `..` as substring: `my..repo`, `foo..bar..baz`
+///   - dots, dashes, underscores, digits anywhere in the middle
+///
+/// What this DOES NOT defend (handled elsewhere):
+///   - Symlink traversal where the resolved path escapes — see
+///     `repo_path`, which canonicalizes and checks `starts_with`.
+///   - TOCTOU races between canonicalize and open — addressed at a
+///     deeper layer (would need `openat2(RESOLVE_BENEATH)`).
+///   - Total path length (PATH_MAX 4096 on Linux) — per-segment
+///     255 caps each segment, but a deeply-nested URL chain could
+///     overshoot. Caller is the right place to bound segment count.
 pub(crate) fn is_safe_repo_segment(s: &str) -> bool {
+    // 1. Length bounds.
     if s.is_empty() || s.len() > 255 {
         return false;
     }
-    if s == "." || s == ".." {
+    // 2. ASCII-only. Closes the entire Unicode attack surface in one
+    //    rule (see above).
+    if !s.is_ascii() {
         return false;
     }
-    !s.bytes()
-        .any(|b| b == b'/' || b == b'\\' || b == 0 || b == b':')
+    // 3. All-dots segments. Catches "." and ".." (classic) plus
+    //    "...", "....", etc. (Windows trailing-dot canaries).
+    if s.bytes().all(|b| b == b'.') {
+        return false;
+    }
+    // 4. Reject path separators, drive separator, NUL, and any byte
+    //    that survives percent-decoding (double-encoding indicator).
+    if s.bytes().any(|b| matches!(b, b'/' | b'\\' | 0 | b':' | b'%')) {
+        return false;
+    }
+    // 5. Reject C0 controls (0x00..=0x1F) and DEL (0x7F).
+    if s.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return false;
+    }
+    // 6. Trailing dot or trailing space (Windows path normalization
+    //    silently strips these). Leading space is also rare and
+    //    typo-aliasing-prone.
+    if s.ends_with('.') || s.ends_with(' ') || s.starts_with(' ') {
+        return false;
+    }
+    // 7. Windows reserved device names. Case-insensitive ASCII
+    //    compare on the stem (part before first '.'). Matches
+    //    plain `CON` and `CON.txt`/`con.tar.gz` alike — Win32 opens
+    //    the device regardless of extension.
+    let stem_upper: String = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let stem = stem_upper.as_str();
+    if matches!(stem, "CON" | "PRN" | "AUX" | "NUL") {
+        return false;
+    }
+    if stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit()
+    {
+        return false;
+    }
+    true
 }
 
 /// GET /{repo}/info/refs - list all refs as tab-separated text
@@ -2925,23 +3016,30 @@ mod tests {
     }
 
     #[test]
-    fn segment_validator_blocks_traversal_only() {
-        // Allowed: literal names with dots anywhere, including
-        // names that start with a dot. These cannot escape
-        // repos_root; they're just literal directory names.
+    fn segment_validator_attack_catalog() {
+        // ────────────── ALLOWED (legitimate names) ──────────────
+        // Repo / file names that look unusual but cannot escape.
+        // The validator must NOT punish these.
         for ok in [
             "myrepo",
             "my.repo",
             "release-1.0",
             "foo.bar.baz",
+            "Helvetica.ttf",
+            "style.min.css",
             ".config",
             ".well-known",
             ".dotfiles",
-            "my..repo",     // ".." as substring, not segment
+            "my..repo",        // ".." as substring is legal
             "foo..bar..baz",
-            "..foo",        // leading double-dot but more chars
-            "a",            // single char
+            "..foo",           // leading double-dot, more chars
+            "x",
+            "a",
             &"x".repeat(255),
+            "with-hyphens",
+            "with_underscores",
+            "v1.0.0-beta",
+            "123-numeric-start",
         ] {
             assert!(
                 is_safe_repo_segment(ok),
@@ -2949,24 +3047,95 @@ mod tests {
             );
         }
 
-        // Blocked: the literal parent-dir / cwd references, the
-        // segment separators that would alias the path, and
-        // out-of-bounds lengths.
-        for bad in [
-            "",
-            ".",
-            "..",
-            "foo/bar",      // path separator
-            "foo\\bar",     // Windows separator
-            "foo:bar",      // drive separator
-            "foo\0bar",     // NUL injection
-            &"x".repeat(256),
-        ] {
-            assert!(
-                !is_safe_repo_segment(bad),
-                "should reject {bad:?}"
-            );
-        }
+        // ────────────── REJECTED (attack catalog) ──────────────
+        // One assertion per attack class so a regression in any
+        // single rule is immediately attributable.
+
+        // CLASS 1 — classic traversal
+        assert!(!is_safe_repo_segment("."), "classic .");
+        assert!(!is_safe_repo_segment(".."), "classic ..");
+
+        // CLASS 2 — all-dots canary (Windows trailing-dot strip, …)
+        assert!(!is_safe_repo_segment("..."), "three dots");
+        assert!(!is_safe_repo_segment("...."), "four dots");
+        assert!(!is_safe_repo_segment("....."), "five dots");
+
+        // CLASS 3 — path separators
+        assert!(!is_safe_repo_segment("a/b"), "forward slash");
+        assert!(!is_safe_repo_segment("a\\b"), "backslash");
+        assert!(!is_safe_repo_segment("/foo"), "leading slash");
+        assert!(!is_safe_repo_segment("foo/"), "trailing slash");
+
+        // CLASS 4 — drive separator + NTFS streams
+        assert!(!is_safe_repo_segment("C:foo"), "drive separator");
+        assert!(!is_safe_repo_segment("foo:stream"), "NTFS ADS");
+        assert!(!is_safe_repo_segment("foo:$DATA"), "NTFS $DATA stream");
+
+        // CLASS 5 — NUL injection
+        assert!(!is_safe_repo_segment("foo\0.html"), "NUL truncation");
+        assert!(!is_safe_repo_segment("\0"), "bare NUL");
+
+        // CLASS 6 — control characters
+        assert!(!is_safe_repo_segment("foo\nbar"), "newline");
+        assert!(!is_safe_repo_segment("foo\rbar"), "carriage return");
+        assert!(!is_safe_repo_segment("foo\tbar"), "tab");
+        assert!(!is_safe_repo_segment("foo\x1Bbar"), "ESC");
+        assert!(!is_safe_repo_segment("foo\x7Fbar"), "DEL");
+
+        // CLASS 7 — non-ASCII: closes the entire Unicode surface.
+        // Each of these has a documented attack vector (see the
+        // catalog comment above the validator).
+        assert!(!is_safe_repo_segment("café"), "Latin Extended");
+        assert!(!is_safe_repo_segment("．．"), "fullwidth dots → '..'");
+        assert!(!is_safe_repo_segment("。。"), "ideographic dots");
+        assert!(!is_safe_repo_segment("..／foo"), "fullwidth solidus");
+        assert!(!is_safe_repo_segment("..⁄foo"), "fraction slash");
+        assert!(!is_safe_repo_segment("..∕foo"), "division slash");
+        assert!(!is_safe_repo_segment("foo\u{200B}bar"), "zero-width space");
+        assert!(!is_safe_repo_segment("foo\u{202E}bar"), "RTL override");
+        assert!(!is_safe_repo_segment("foo\u{FEFF}"), "BOM");
+        assert!(!is_safe_repo_segment(".ɡyt"), "script-g confusable for .gyt");
+        assert!(!is_safe_repo_segment("ｐａｓｓｗｄ"), "fullwidth ASCII");
+
+        // CLASS 8 — double-encoding signal (% surviving HTTP decode)
+        assert!(!is_safe_repo_segment("%2e%2e"), "encoded ..");
+        assert!(!is_safe_repo_segment("%252e%252e"), "double-encoded ..");
+        assert!(!is_safe_repo_segment("foo%00bar"), "encoded NUL");
+        assert!(!is_safe_repo_segment("foo%2Fbar"), "encoded /");
+
+        // CLASS 9 — Windows trailing-dot / trailing-space alias
+        assert!(!is_safe_repo_segment("secret.txt."), "trailing dot");
+        assert!(!is_safe_repo_segment("config."), "trailing dot");
+        assert!(!is_safe_repo_segment("foo "), "trailing space");
+        assert!(!is_safe_repo_segment("foo. "), "trailing dot+space");
+
+        // CLASS 10 — leading space
+        assert!(!is_safe_repo_segment(" foo"), "leading space");
+
+        // CLASS 11 — length bounds
+        assert!(!is_safe_repo_segment(""), "empty");
+        assert!(!is_safe_repo_segment(&"x".repeat(256)), "256 bytes");
+        assert!(!is_safe_repo_segment(&"x".repeat(4096)), "huge");
+
+        // CLASS 12 — Windows reserved device names (any case, any ext)
+        assert!(!is_safe_repo_segment("CON"), "CON");
+        assert!(!is_safe_repo_segment("con"), "con (lowercase)");
+        assert!(!is_safe_repo_segment("Con"), "Con (mixed case)");
+        assert!(!is_safe_repo_segment("CON.txt"), "CON.txt");
+        assert!(!is_safe_repo_segment("con.tar.gz"), "con.tar.gz");
+        assert!(!is_safe_repo_segment("PRN"), "PRN");
+        assert!(!is_safe_repo_segment("AUX"), "AUX");
+        assert!(!is_safe_repo_segment("NUL"), "NUL");
+        assert!(!is_safe_repo_segment("nul.dat"), "nul.dat");
+        assert!(!is_safe_repo_segment("COM1"), "COM1");
+        assert!(!is_safe_repo_segment("COM9"), "COM9");
+        assert!(!is_safe_repo_segment("com0"), "com0 (Win11 expanded)");
+        assert!(!is_safe_repo_segment("LPT1"), "LPT1");
+        assert!(!is_safe_repo_segment("LPT9.png"), "LPT9.png");
+
+        // CLASS-NOT-COVERED-BY-VALIDATOR (handled by canonicalize +
+        // starts_with elsewhere): symlink escape, TOCTOU. Not unit-
+        // testable at this layer.
     }
 
     #[test]
