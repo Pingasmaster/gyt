@@ -2313,6 +2313,10 @@ fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std
 ///   - Total path length (PATH_MAX 4096 on Linux) — per-segment
 ///     255 caps each segment, but a deeply-nested URL chain could
 ///     overshoot. Caller is the right place to bound segment count.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "stem.as_bytes()[3] is gated by the `stem.len() == 4` check on the same expression"
+)]
 pub(crate) fn is_safe_repo_segment(s: &str) -> bool {
     // 1. Length bounds.
     if s.is_empty() || s.len() > 255 {
