@@ -317,7 +317,8 @@ fn start_server_with_acl(env: &Env, repos_root: &Path, acl_file: Option<&Path>) 
         &webroot.display().to_string(),
     ])
     .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
-    .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0");
+    .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
+    .env("GYT_SERVE_CACHE_TTL_MS", "0");
     if let Some(a) = acl_file {
         cmd.args(["--auth-tokens", &a.display().to_string()]);
     }

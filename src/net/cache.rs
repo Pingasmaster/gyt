@@ -40,6 +40,11 @@ impl ResponseCache {
     /// Look up a cached response. Returns `Some((body, content-type))`
     /// when fresh, `None` on miss or expiry.
     pub fn get(&self, key: &str) -> Option<(Vec<u8>, String)> {
+        // TTL=0 disables the cache entirely. Tests use this to make
+        // direct-FS ref manipulations observable on the next fetch.
+        if self.ttl.is_zero() {
+            return None;
+        }
         let now = Instant::now();
         let g = self
             .inner

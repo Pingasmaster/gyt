@@ -389,6 +389,7 @@ fn start_server(env: &Env, repos_root: &Path, webroot: &Path) -> (Child, u16) {
         ])
         .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
         .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
+        .env("GYT_SERVE_CACHE_TTL_MS", "0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
