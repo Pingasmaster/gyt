@@ -260,10 +260,35 @@ fn build_quic_server_config(
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(cfg)
         .map_err(|e| GytError::Net(format!("h3: rustls→quic: {e}")))?;
     let mut quic_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    // Lift a couple of QUIC transport defaults that are too tight for
-    // typical clone payloads. `concurrent_bidi_streams` is the per-
-    // connection in-flight cap; default is ~100, fine for now.
+
+    // QUIC transport tuning. Mirrors the HTTP/2 SETTINGS rationale —
+    // pack responses are big and the default windows throttle them.
+    //
+    // - `stream_receive_window = 4 MiB`. Per-stream receive window
+    //   the *server* advertises for incoming data (push uploads).
+    //   Same scale as h2's initial_stream_window_size.
+    // - `receive_window = 16 MiB`. Connection-level receive window;
+    //   same as h2's initial_connection_window_size.
+    // - `send_window = 16 MiB`. How much in-flight data we'll buffer
+    //   before applying backpressure. Sized for pack-response bursts.
+    // - `max_concurrent_bidi_streams = 200`. Mirrors h2's
+    //   max_concurrent_streams. Each stream still spawn_blocking's
+    //   into the sync handler pool so going higher doesn't help.
+    // - `max_concurrent_uni_streams = 10`. HTTP/3 only needs a few
+    //   uni streams (QPACK encoder/decoder + the control stream);
+    //   10 is generous, blocks resource exhaustion via stream floods.
+    // - `max_idle_timeout = 30s`. Already set; kept for symmetry.
+    //
+    // These are static; not env-tunable today. The "right" value at
+    // 1M-user scale will come from load testing — current numbers
+    // are the IETF-blog / Cloudflare-blog consensus for HTTP-over-
+    // QUIC at production scale.
     let mut tp = quinn::TransportConfig::default();
+    tp.stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+    tp.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    tp.send_window(16 * 1024 * 1024);
+    tp.max_concurrent_bidi_streams(quinn::VarInt::from_u32(200));
+    tp.max_concurrent_uni_streams(quinn::VarInt::from_u32(10));
     tp.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
             .expect("30s within QUIC limits"),
