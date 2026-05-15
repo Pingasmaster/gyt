@@ -1339,6 +1339,18 @@ fn repo_path(state: &ServerState, owner: &str, name: &str) -> Option<PathBuf> {
     // serve a bare server-side repo. The wire path already handles
     // both — without this the API silently 404s on every bare repo
     // (which is the only layout `gyt serve` actually accepts at scale).
+    //
+    // Path-traversal guard: validate every URL-derived segment before
+    // joining it. A URL like `/api/repos/../foo/bar` would parse the
+    // owner as `..` and slip out of repos_root — pre-this, the
+    // existence check at the bottom of this function was the only
+    // thing standing between the attacker and a file named `.gyt`
+    // anywhere on the host. The wire path already validates via
+    // `is_safe_repo_segment`; the REST path now does the same so
+    // there's one validation surface for the whole server.
+    if !is_safe_repo_segment(owner) || !is_safe_repo_segment(name) {
+        return None;
+    }
     let candidate = state.repos_root.join(owner).join(name);
     if candidate.join(".gyt").is_dir() {
         return Some(candidate);
@@ -2210,19 +2222,31 @@ fn wire_repo_dir(state: &ServerState, params: &[(String, String)]) -> Option<std
 }
 
 /// True iff `s` is safe to join under `repos_root` as a single segment.
-/// The wire URL `/{repo}/...` uses one path component, so the repo name
-/// must NOT contain anything that would either escape (`..`, `/`, `\`)
-/// or alias to a hidden / special name. We also bound the length to
-/// keep paths reasonable. This is the only checkpoint between an
-/// attacker-controlled URL and `Path::join`.
-fn is_safe_repo_segment(s: &str) -> bool {
+/// The wire URL `/{repo}/...` and the REST `/api/repos/:owner/:name`
+/// path both eventually feed a single segment into `Path::join`, so
+/// the segment must NOT be one of the two strings that climb the tree
+/// (`.`, `..`) and must NOT contain anything that would alias to a
+/// different on-disk location (path separators, NUL, drive separator).
+///
+/// What this DOES NOT block (deliberately):
+///   - leading dot: `.config`, `.well-known`, `.foo` — these are
+///     literal directory names; they don't escape.
+///   - `..` as a substring: `my..repo`, `foo..bar` — only the exact
+///     two-byte string `..` is a parent-dir reference. Substrings
+///     are just literal characters.
+///   - trailing dot, double dots in the middle, etc.
+///
+/// The pre-relax version also banned `starts_with('.')`. That was
+/// over-cautious paternalism and broke any operator who legitimately
+/// named a repo `.dotfiles` or similar. Path-traversal protection
+/// comes from blocking the *exact* parent-dir reference and the
+/// segment-separator characters, not from cosmetic restrictions on
+/// what a name "looks like."
+pub(crate) fn is_safe_repo_segment(s: &str) -> bool {
     if s.is_empty() || s.len() > 255 {
         return false;
     }
     if s == "." || s == ".." {
-        return false;
-    }
-    if s.starts_with('.') {
         return false;
     }
     !s.bytes()
@@ -2889,5 +2913,77 @@ mod tests {
         let json = info.to_json();
         assert!(json.contains(r#"\"quotes\""#));
         assert!(json.contains("\\n"));
+    }
+
+    #[test]
+    fn segment_validator_blocks_traversal_only() {
+        // Allowed: literal names with dots anywhere, including
+        // names that start with a dot. These cannot escape
+        // repos_root; they're just literal directory names.
+        for ok in [
+            "myrepo",
+            "my.repo",
+            "release-1.0",
+            "foo.bar.baz",
+            ".config",
+            ".well-known",
+            ".dotfiles",
+            "my..repo",     // ".." as substring, not segment
+            "foo..bar..baz",
+            "..foo",        // leading double-dot but more chars
+            "a",            // single char
+            &"x".repeat(255),
+        ] {
+            assert!(
+                is_safe_repo_segment(ok),
+                "should accept {ok:?}"
+            );
+        }
+
+        // Blocked: the literal parent-dir / cwd references, the
+        // segment separators that would alias the path, and
+        // out-of-bounds lengths.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "foo/bar",      // path separator
+            "foo\\bar",     // Windows separator
+            "foo:bar",      // drive separator
+            "foo\0bar",     // NUL injection
+            &"x".repeat(256),
+        ] {
+            assert!(
+                !is_safe_repo_segment(bad),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_path_rejects_traversal_in_owner_or_name() {
+        let repos = TempDir::new("gyt-traversal");
+        let webroot = TempDir::new("gyt-traversal-web");
+        let state = make_state(repos.path(), webroot.path());
+        // Plant a real .gyt outside repos_root so a successful
+        // traversal would actually find it. (Otherwise the
+        // existence check at the bottom of repo_path would hide
+        // the bug.)
+        let outside = repos.path().parent().unwrap().join("outside-victim");
+        std::fs::create_dir_all(outside.join(".gyt")).unwrap();
+
+        // The attacker-controlled URL segments climb the tree.
+        assert_eq!(repo_path(&state, "..", "outside-victim"), None);
+        assert_eq!(repo_path(&state, ".", "anything"), None);
+        assert_eq!(repo_path(&state, "alice", ".."), None);
+        assert_eq!(repo_path(&state, "alice", "../outside-victim"), None);
+
+        // Sanity: a legitimately-named repo (including one with a
+        // leading dot) still resolves when it exists.
+        let dotted = repos.path().join("alice").join(".dotfiles");
+        std::fs::create_dir_all(dotted.join(".gyt")).unwrap();
+        assert!(repo_path(&state, "alice", ".dotfiles").is_some());
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
