@@ -145,6 +145,14 @@ pub struct ServeConfig {
     pub webroot: PathBuf,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// Path to a hex-encoded TLS session-ticket key file (current key
+    /// on line 1; optional previous key on line 2 for one-rotation
+    /// tolerance). When None, rustls auto-generates a per-process
+    /// rotating ticket key — fine for a single host, but means
+    /// resumption tickets from replica A won't decrypt on replica B.
+    /// Multi-replica deployments behind a non-sticky LB should set
+    /// this to the same file on every replica.
+    pub tls_ticket_key: Option<PathBuf>,
     pub auth_token: Option<String>,
     /// Path to a TSV ACL file. Each non-blank, non-comment line is
     /// `<token>\t<repo-pattern>\t<rw|ro>`. When set, this replaces the
@@ -231,7 +239,8 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
 
     let tls_config = match (&config.tls_cert, &config.tls_key) {
         (Some(cert), Some(key)) => {
-            let base = crate::net::tls::server_config(cert, key)?;
+            let base =
+                crate::net::tls::server_config(cert, key, config.tls_ticket_key.as_deref())?;
             // Main listener supports both h1 and h2 via ALPN. The base
             // config sets ALPN to http/1.1 only; clone and re-set so
             // h2-capable clients can land on the same socket. (HTTP/3
@@ -304,11 +313,18 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         config.tls_key.clone(),
     ) {
         let st = state.clone();
+        let tk = config.tls_ticket_key.clone();
         Some(
             thread::Builder::new()
                 .name("gyt-h2".into())
                 .spawn(move || {
-                    if let Err(e) = crate::net::h2_server::run_h2(&h2_addr, &cert, &key, st) {
+                    if let Err(e) = crate::net::h2_server::run_h2(
+                        &h2_addr,
+                        &cert,
+                        &key,
+                        tk.as_deref(),
+                        st,
+                    ) {
                         eprintln!("gyt serve: h2 listener exited: {e}");
                     }
                 })
@@ -318,20 +334,25 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         None
     };
 
-    // HTTP/3 listener (over QUIC) on its own UDP port. Wired in a
-    // follow-up commit; the flag is plumbed through so the CLI
-    // surface lands first.
+    // HTTP/3 listener (over QUIC) on its own UDP port.
     let h3_thread = if let (Some(h3_addr), Some(cert), Some(key)) = (
         config.h3_listen_addr.clone(),
         config.tls_cert.clone(),
         config.tls_key.clone(),
     ) {
         let st = state.clone();
+        let tk = config.tls_ticket_key.clone();
         Some(
             thread::Builder::new()
                 .name("gyt-h3".into())
                 .spawn(move || {
-                    if let Err(e) = crate::net::h3_server::run_h3(&h3_addr, &cert, &key, st) {
+                    if let Err(e) = crate::net::h3_server::run_h3(
+                        &h3_addr,
+                        &cert,
+                        &key,
+                        tk.as_deref(),
+                        st,
+                    ) {
                         eprintln!("gyt serve: h3 listener exited: {e}");
                     }
                 })

@@ -25,6 +25,7 @@ pub(crate) fn run_h3(
     listen_addr: &str,
     cert_path: &Path,
     key_path: &Path,
+    ticket_key: Option<&Path>,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -38,7 +39,7 @@ pub(crate) fn run_h3(
         .parse()
         .map_err(|e| GytError::Net(format!("h3: parse {listen_addr}: {e}")))?;
 
-    let server_config = build_quic_server_config(cert_path, key_path)?;
+    let server_config = build_quic_server_config(cert_path, key_path, ticket_key)?;
 
     runtime.block_on(async move {
         let endpoint = quinn::Endpoint::server(server_config, addr)
@@ -247,8 +248,9 @@ async fn write_h3_simple(
 fn build_quic_server_config(
     cert_path: &Path,
     key_path: &Path,
+    ticket_key: Option<&Path>,
 ) -> Result<quinn::ServerConfig> {
-    let rustls_cfg = crate::net::tls::server_config(cert_path, key_path)?;
+    let rustls_cfg = crate::net::tls::server_config(cert_path, key_path, ticket_key)?;
     let mut cfg: rustls::ServerConfig = (*rustls_cfg).clone();
     // h3 is the standardized ALPN token for HTTP/3 (RFC 9114).
     cfg.alpn_protocols = vec![b"h3".to_vec()];

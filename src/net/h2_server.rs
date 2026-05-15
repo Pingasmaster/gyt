@@ -35,6 +35,7 @@ pub(crate) fn run_h2(
     listen_addr: &str,
     cert_path: &Path,
     key_path: &Path,
+    ticket_key: Option<&Path>,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -44,7 +45,7 @@ pub(crate) fn run_h2(
         .build()
         .map_err(|e| GytError::Net(format!("h2: build runtime: {e}")))?;
 
-    let server_config = build_tls_config(cert_path, key_path)?;
+    let server_config = build_tls_config(cert_path, key_path, ticket_key)?;
     let addr: SocketAddr = listen_addr
         .parse()
         .map_err(|e| GytError::Net(format!("h2: parse {listen_addr}: {e}")))?;
@@ -211,11 +212,12 @@ fn build_response(
 fn build_tls_config(
     cert_path: &Path,
     key_path: &Path,
+    ticket_key: Option<&Path>,
 ) -> Result<Arc<rustls::ServerConfig>> {
     // Reuse the existing TLS loader, then mutate ALPN. We can't share
     // the Arc directly because we need a different ALPN list — alpn_protocols
     // is set inside server_config() to http/1.1 only.
-    let base = crate::net::tls::server_config(cert_path, key_path)?;
+    let base = crate::net::tls::server_config(cert_path, key_path, ticket_key)?;
     let mut cfg: rustls::ServerConfig = (*base).clone();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
