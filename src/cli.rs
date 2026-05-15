@@ -116,7 +116,8 @@ SERVER & CI
     serve [--listen <addr>] [--repos <dir>] [--webroot <dir>]
           [--cert <f> --key <f>] [--auth-token <t>]
           [--signers <f>] [--policy-config <f>]
-    ci [--list] [--docker <image>] [--output <dir>]
+    ci [--list] [--output <dir>]
+                                 run sandboxed .wasm CI scripts from .gyt-ci/
     ci secret {{init | set <name> | list | remove <name>}}
     ci env    {{set <name> <val> | list | remove <name>}}
 

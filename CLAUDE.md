@@ -17,6 +17,28 @@ If a future change needs to make compression faster, the answer is to compress f
 
 This rule supersedes any performance recommendation that suggests otherwise (including any prior recommendation by Claude to use zstd for the wire).
 
+### CI runs WASM only — no shell, no docker
+
+`gyt ci` executes `.wasm` files in `.gyt-ci/` only. The `run_in_docker`,
+`run_shell_script`, `--docker` flag, and `.sh` collection paths were
+deleted because neither could be confined to a useful sandbox on a
+multi-tenant host. Do not reintroduce them.
+
+The WASM sandbox in `src/ci_wasm.rs` is the supported execution path
+and its caps are part of the security contract:
+
+- `CI_MAX_MEMORY_BYTES = 256 MiB` — enforced by `CiLimits::memory_growing`
+- `CI_INITIAL_FUEL = 1 000 000 000` instructions — terminates infinite loops
+- `CI_MAX_FILE_BYTES = 64 MiB` per `read_file` / `write_file`
+- `CI_MAX_LOG_BYTES = 16 MiB` cumulative per run
+- `CI_MAX_WASM_STACK = 1 MiB`
+- WASI is not linked. `env`/`getenv` are not linked. Threads, SIMD,
+  reference-types, multi-memory, memory64 are disabled at the engine.
+- `.gyt/` is invisible to `read_file` (CI secrets / signing keys / index
+  must not be reachable from a workflow).
+
+Tests pinning these in `tests/ci_wasm_sandbox.rs`.
+
 ## Other operational notes
 
 - See `AGENTS.md` for full contributor conventions (clippy policy, branch strategy, CI secrets, no push webhooks).
