@@ -153,6 +153,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         listen_addr: addr,
         rate_limiter: RateLimiter::new(LimitConfig::DEFAULT_IP, LimitConfig::DEFAULT_ACTOR),
         response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 10_000),
+        pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 256),
     });
 
     // Background GC for idle rate-limit buckets. Without this the
@@ -306,6 +307,11 @@ struct ServerState {
     /// distinct keys; entries expire in 2 s by default and are
     /// invalidated explicitly on refs/update.
     response_cache: ResponseCache,
+    /// Long-TTL cache for `objects/want` responses. Keyed by repo +
+    /// BLAKE3 of the sorted want-set. Invalidated on push so a fresh
+    /// clone never observes stale objects. Sized small (256 entries)
+    /// because each entry can be hundreds of MB.
+    pack_cache: ResponseCache,
 }
 
 /// One row in the `--auth-tokens` TSV. A token may appear in multiple
@@ -1989,6 +1995,34 @@ fn wire_objects_want(
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+
+    // Cache key: BLAKE3 of the sorted want-set. Sorting normalizes
+    // permutations (same wants in different order = same key); the
+    // hash gives a fixed-size key regardless of how many wants the
+    // client asked for. We collide-check the resulting cache hit
+    // implicitly: if two distinct want-sets ever hashed the same,
+    // the BLAKE3 birthday bound would make this the smallest of our
+    // problems.
+    let repo = router::get_param(params, "repo").unwrap_or("");
+    let cache_key = {
+        let mut sorted = ids.clone();
+        sorted.sort();
+        let joined = sorted.join("\n");
+        let h = blake3::hash(joined.as_bytes());
+        format!("pack:{repo}:{}", h.to_hex())
+    };
+
+    if let Some((body, ctype)) = state.pack_cache.get(&cache_key) {
+        // Account served-objects against the hot path too — without
+        // this the counter would understate the actual work the
+        // server saved a client (encoding-equivalent cost).
+        state.metrics.objects_served_total.fetch_add(
+            ids.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return (200, "OK".into(), body, ctype);
+    }
+
     // Read each object, reconstruct on-disk bytes, then packfile them
     let mut entries = Vec::new();
     for id_str in &ids {
@@ -2006,6 +2040,13 @@ fn wire_objects_want(
         });
     }
     let out = crate::net::protocol::encode_packfile(&entries);
+    state.metrics.objects_served_total.fetch_add(
+        entries.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    state
+        .pack_cache
+        .insert(cache_key, out.clone(), "application/octet-stream".into());
     (200, "OK".into(), out, "application/octet-stream".into())
 }
 
@@ -2113,6 +2154,21 @@ fn wire_objects_have(
             Err(_) => n_skipped += 1,
         }
     }
+    // Pushing new objects doesn't *change* what an existing
+    // (sorted-wants) cache key resolves to — the BLAKE3 of the
+    // want-set is content-keyed, so the same wants will continue to
+    // resolve to the same bytes. But a new push can extend reachability
+    // such that the next `objects/want` arrives with a different
+    // want-set that overlaps with cached entries' object IDs. Those
+    // older cache entries are still bit-for-bit correct (they
+    // packfile the same on-disk objects), so we do NOT invalidate
+    // here — wire_refs_update is the right place for that, and it
+    // does invalidate the pack cache by repo prefix.
+    state.metrics.objects_stored_total.fetch_add(
+        u64::from(n_stored),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     let body = format!("stored={n_stored} skipped={n_skipped}");
     (200, "OK".into(), body.into_bytes(), "text/plain".into())
 }
@@ -2224,15 +2280,16 @@ fn wire_refs_update(
         }
     }
     // Invalidate every cached response that depended on this repo's
-    // refs — wire info/refs, the REST refs list, and the per-page
-    // repo listings (which include each repo's head commit).
+    // refs — wire info/refs, the REST refs list, the per-page repo
+    // listings (head commit included), and any packfile cache entry
+    // for this repo. A pushed-then-pulled-back fetch must observe
+    // the new objects on the next clone.
     if n_updated > 0 {
         let repo = router::get_param(params, "repo").unwrap_or("");
         state.response_cache.invalidate_prefix(&format!("wire_info_refs:{repo}"));
-        // We don't know which owner/name the REST API mapped this
-        // repo to, so flush the whole api_refs/repo_list family.
         state.response_cache.invalidate_prefix("api_refs:");
         state.response_cache.invalidate_prefix("repo_list:");
+        state.pack_cache.invalidate_prefix(&format!("pack:{repo}:"));
     }
 
     state
@@ -2317,6 +2374,7 @@ mod tests {
                 LimitConfig::DEFAULT_ACTOR,
             ),
             response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 1000),
+            pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 16),
         })
     }
 
