@@ -299,6 +299,18 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         None => None,
     };
 
+    // Pre-build the Alt-Svc value. RFC 7838 format:
+    //   h3=":<port>"; ma=86400
+    // Port is parsed from --listen-h3 (it's the QUIC UDP port). 24-hour
+    // max-age matches Cloudflare's default and is long enough that
+    // a client's next visit hits the h3 fast path even if it's hours
+    // away.
+    let alt_svc_value = config.h3_listen_addr.as_ref().and_then(|a| {
+        a.parse::<std::net::SocketAddr>().ok().map(|sa| {
+            format!(r#"h3=":{}"; ma=86400"#, sa.port())
+        })
+    });
+
     let state = Arc::new(ServerState {
         repos_root: config.repos_root.clone(),
         webroot: config.webroot.clone(),
@@ -313,6 +325,8 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         response_cache: ResponseCache::new(configured_response_cache_ttl(), 10_000),
         pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 256),
         repo_index: RepoIndex::build(&config.repos_root),
+        alt_svc_value,
+        tls_enabled: tls_config.is_some(),
     });
 
     // Periodic rescan: catches operator-side `gyt init` that bypasses
@@ -657,11 +671,13 @@ async fn handle_async_request(
         match limited.collect().await {
             Ok(c) => c.to_bytes().to_vec(),
             Err(e) => {
-                return Ok(build_response(
+                let mut resp = build_response(
                     413,
                     format!("body too large or read error: {e}").into_bytes(),
                     "text/plain",
-                ));
+                );
+                apply_protocol_headers(resp.headers_mut(), &state);
+                return Ok(resp);
             }
         }
     };
@@ -690,7 +706,9 @@ async fn handle_async_request(
         ),
     };
 
-    Ok(build_response(status, body, &ctype))
+    let mut resp = build_response(status, body, &ctype);
+    apply_protocol_headers(resp.headers_mut(), &state);
+    Ok(resp)
 }
 
 fn build_response(
@@ -709,6 +727,39 @@ fn build_response(
         hyper::header::HeaderValue::from_static("*"),
     );
     resp
+}
+
+/// Append the operator-level response headers we want on every
+/// outbound message: Alt-Svc (advertises HTTP/3) and HSTS (forces
+/// HTTPS-only on browser clients). Both are independent of the
+/// handler's content, so this lives in one place instead of being
+/// remembered at every response site.
+pub(crate) fn apply_protocol_headers(
+    headers: &mut hyper::HeaderMap,
+    state: &ServerState,
+) {
+    if let Some(v) = state.alt_svc_value.as_deref()
+        && let Ok(val) = hyper::header::HeaderValue::from_str(v)
+    {
+        // Alt-Svc tells the client "this origin also speaks h3 at
+        // this port for `ma` seconds." Without it, browsers never
+        // try HTTP/3 even if our --listen-h3 port is reachable.
+        headers.insert(
+            hyper::header::HeaderName::from_static("alt-svc"),
+            val,
+        );
+    }
+    if state.tls_enabled {
+        // HSTS: 1 year, all subdomains. Sending over plain HTTP is
+        // a no-op per RFC 6797 §7.2, but we condition on tls_enabled
+        // anyway so plain-HTTP test fixtures don't see noise.
+        headers.insert(
+            hyper::header::HeaderName::from_static("strict-transport-security"),
+            hyper::header::HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains",
+            ),
+        );
+    }
 }
 
 /// 503 body sent inline by the accept loop when the in-flight cap is
@@ -827,6 +878,16 @@ pub(crate) struct ServerState {
     /// thread. Backs /api/repos so pagination is O(per_page) instead
     /// of O(total).
     repo_index: RepoIndex,
+    /// Pre-built `Alt-Svc` header value, e.g. `h3=":443"; ma=86400`.
+    /// `None` when no HTTP/3 listener is configured. Emitted on every
+    /// HTTPS response so browsers discover the h3 endpoint without a
+    /// DNS HTTPS RR fallback. RFC 7838.
+    pub(crate) alt_svc_value: Option<String>,
+    /// True when --cert/--key are configured, which is when HSTS
+    /// makes sense. HSTS sent over plain HTTP is ignored by clients
+    /// per RFC 6797 §7.2, so emitting it conditionally is purely
+    /// to avoid noise in plain-HTTP test fixtures.
+    pub(crate) tls_enabled: bool,
 }
 
 /// One row in the `--auth-tokens` TSV. A token may appear in multiple
@@ -2596,6 +2657,8 @@ mod tests {
             response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 1000),
             pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 16),
             repo_index: RepoIndex::build(repos_root),
+            alt_svc_value: None,
+            tls_enabled: false,
         })
     }
 
