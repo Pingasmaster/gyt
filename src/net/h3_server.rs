@@ -293,7 +293,12 @@ fn build_quic_server_config(
     // - `max_concurrent_uni_streams = 10`. HTTP/3 only needs a few
     //   uni streams (QPACK encoder/decoder + the control stream);
     //   10 is generous, blocks resource exhaustion via stream floods.
-    // - `max_idle_timeout = 30s`. Already set; kept for symmetry.
+    // - `max_idle_timeout = 60s`. RFC-typical max-idle is 30 s on
+    //   the conservative end; we go to 60 s so a flaky link with
+    //   packet-loss bursts (cellular handover, marginal Wi-Fi,
+    //   satellite weather fade) doesn't get closed mid-transfer.
+    //   Active flows reset the timer on every packet so this is
+    //   the silence-tolerance budget, not a hard transfer cap.
     //
     // These are static; not env-tunable today. The "right" value at
     // 1M-user scale will come from load testing — current numbers
@@ -306,8 +311,8 @@ fn build_quic_server_config(
     tp.max_concurrent_bidi_streams(quinn::VarInt::from_u32(200));
     tp.max_concurrent_uni_streams(quinn::VarInt::from_u32(10));
     tp.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
-            .expect("30s within QUIC limits"),
+        quinn::IdleTimeout::try_from(std::time::Duration::from_mins(1))
+            .expect("60s within QUIC limits"),
     ));
     quic_cfg.transport_config(Arc::new(tp));
     Ok(quic_cfg)

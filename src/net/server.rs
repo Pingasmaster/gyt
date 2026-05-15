@@ -551,11 +551,20 @@ async fn serve_conn_plain(
         async move { handle_async_request(req, st, peer_ip).await }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
-    // 30 s header-read budget matches the pre-async TcpStream read
-    // timeout. Body reads are bounded by the size cap (256 MiB) and
-    // by the request-level rate limiter. Hyper needs a Timer
-    // instance to enforce the timeout — TokioTimer is the canonical
-    // one for tokio runtimes.
+    // 60 s header-read budget. Headers are typically <2 KiB, which
+    // is sub-second even on a sad EDGE connection at ~50 kbit/s.
+    // The 60 s ceiling is for pathological cases: high jitter,
+    // packet loss bursts, captive-portal interception, a peer
+    // whose process is paged out mid-write. We want "bad network"
+    // to succeed eventually, not 408 in the user's face. Anything
+    // shorter punishes real users with bad links; anything longer
+    // hands slow-loris attackers a bigger window. 60 s is the
+    // Caddy / nginx common default for the same reason.
+    //
+    // Body reads have no timeout — hyper streams them; the only
+    // body bounds are the 256 MiB size cap and the per-request
+    // rate limiter. A user pulling a 50 MiB pack at 100 kbit/s
+    // (~1.5 hours) is fine.
     //
     // max_buf_size caps the per-connection buffer hyper uses for
     // headers + body framing. Set tight (64 KiB) so a single
@@ -564,7 +573,7 @@ async fn serve_conn_plain(
     // chunks, so the cap only constrains header parsing.
     builder
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(30))
+        .header_read_timeout(std::time::Duration::from_mins(1))
         .max_buf_size(64 * 1024);
     if let Err(e) = builder.serve_connection(io, service).with_upgrades().await {
         let _ = e; // peer reset / slow-loris not actionable
@@ -590,7 +599,7 @@ async fn serve_conn_tls(
     builder
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(30))
+        .header_read_timeout(std::time::Duration::from_mins(1))
         .max_buf_size(64 * 1024);
     configure_h2(builder.http2());
     if let Err(e) = builder.serve_connection(io, service).await {
@@ -626,10 +635,14 @@ async fn serve_conn_tls(
 ///   going much higher because each stream still spawn_blocking's
 ///   into the same sync handler pool. 200 absorbs the occasional
 ///   burst from a parallel-clone client.
-/// - `keep_alive_interval = 30s` + `keep_alive_timeout = 20s`.
+/// - `keep_alive_interval = 30s` + `keep_alive_timeout = 30s`.
 ///   Sends PING frames on idle to detect dead peers before the
-///   client's next stream hits a stale connection. Matches the
-///   gRPC server defaults — the most-deployed h2 server pattern.
+///   client's next stream hits a stale connection. 30 s PONG
+///   window (up from gRPC's 20 s default) so a busy client on a
+///   bad link — one that's actively receiving a big response and
+///   slow to schedule the PONG reply — isn't closed mid-transfer.
+///   PONG is an 8-byte payload; the only thing that delays it
+///   meaningfully is scheduling, not bandwidth.
 /// - Explicit `enable_connect_protocol` — future-proofs against
 ///   CONNECT-method clients (h2 RFC 8441). Cheap to set.
 pub(crate) fn configure_h2(
@@ -641,7 +654,7 @@ pub(crate) fn configure_h2(
         .max_frame_size(32 * 1024)
         .max_concurrent_streams(200)
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
-        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .keep_alive_timeout(std::time::Duration::from_secs(30))
         .enable_connect_protocol();
 }
 

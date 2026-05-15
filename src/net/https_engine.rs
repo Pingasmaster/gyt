@@ -208,6 +208,31 @@ async fn send_async(
     Ok(resp)
 }
 
+async fn collect_response(
+    resp: hyper::Response<hyper::body::Incoming>,
+) -> Result<HttpResponse> {
+    let status = resp.status().as_u16();
+    let reason = resp.status().canonical_reason().unwrap_or("").to_string();
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
+    for (k, v) in resp.headers() {
+        if let Ok(vs) = v.to_str() {
+            headers.push((k.to_string(), vs.to_string()));
+        }
+    }
+    let body_stream = Limited::new(resp.into_body(), MAX_BODY_BYTES);
+    let collected = body_stream
+        .collect()
+        .await
+        .map_err(|e| GytError::Net(format!("read body: {e}")))?;
+    let body = collected.to_bytes().to_vec();
+    Ok(HttpResponse {
+        status,
+        reason,
+        headers,
+        body,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,29 +262,4 @@ mod tests {
         let _ = send("127.0.0.1", 1, "GET", "/", None, &[]);
         let _ = send("127.0.0.1", 1, "GET", "/", None, &[]);
     }
-}
-
-async fn collect_response(
-    resp: hyper::Response<hyper::body::Incoming>,
-) -> Result<HttpResponse> {
-    let status = resp.status().as_u16();
-    let reason = resp.status().canonical_reason().unwrap_or("").to_string();
-    let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers().len());
-    for (k, v) in resp.headers() {
-        if let Ok(vs) = v.to_str() {
-            headers.push((k.to_string(), vs.to_string()));
-        }
-    }
-    let body_stream = Limited::new(resp.into_body(), MAX_BODY_BYTES);
-    let collected = body_stream
-        .collect()
-        .await
-        .map_err(|e| GytError::Net(format!("read body: {e}")))?;
-    let body = collected.to_bytes().to_vec();
-    Ok(HttpResponse {
-        status,
-        reason,
-        headers,
-        body,
-    })
 }
