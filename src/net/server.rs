@@ -138,7 +138,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     for stream in listener.incoming() {
         let st = state.clone();
         let tls = tls_config.clone();
-        if *state.shutdown.lock().unwrap() {
+        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
         match stream {
@@ -148,17 +148,32 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
                 let permit = workers.clone().acquire();
                 thread::spawn(move || {
                     let _hold = permit;
-                    if let Some(cfg) = &tls {
-                        match crate::net::tls::accept_tls(s, cfg) {
-                            Ok(tls_stream) => {
-                                let _ = handle_tls_conn(tls_stream, &st);
+                    // Catch any panic that escapes a handler. A bug
+                    // in handler code that unwinds the worker thread
+                    // could otherwise leave a Mutex on `state.shutdown`
+                    // poisoned, degrading every subsequent connection.
+                    // `AssertUnwindSafe` is appropriate here because
+                    // `s` is local to this thread and `st` (Arc) is
+                    // immutable from a panic-safety standpoint —
+                    // panicked code can't observe a partial mutation
+                    // through a shared reference because there is none.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if let Some(cfg) = &tls {
+                            match crate::net::tls::accept_tls(s, cfg) {
+                                Ok(tls_stream) => {
+                                    let _ = handle_tls_conn(tls_stream, &st);
+                                }
+                                Err(e) => {
+                                    eprintln!("gyt serve: tls accept error: {e}");
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("gyt serve: tls accept error: {e}");
-                            }
+                        } else {
+                            let _ = handle_conn(s, &st);
                         }
-                    } else {
-                        let _ = handle_conn(s, &st);
+                    }));
+                    if let Err(payload) = result {
+                        let msg = downcast_panic_payload(&payload);
+                        eprintln!("gyt serve: worker panic (request dropped): {msg}");
                     }
                 });
             }
@@ -307,6 +322,19 @@ impl Drop for WorkerPermit {
     }
 }
 
+/// Best-effort string for a panic payload that came back from
+/// `catch_unwind`. Panics are usually `&'static str` or `String`;
+/// we fall back to a generic marker if neither downcast succeeds.
+fn downcast_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -316,7 +344,7 @@ fn handle_conn(stream: std::net::TcpStream, state: &ServerState) -> std::io::Res
         // the shutdown flag. Without this check a single client could
         // hold a worker for the whole MAX_REQUESTS_PER_CONN × timeout
         // window after the operator asked us to exit.
-        if *state.shutdown.lock().unwrap() {
+        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
         if !serve_one(&mut reader, &mut writer, state)? {
@@ -392,7 +420,7 @@ fn handle_tls_conn(
 ) -> std::io::Result<()> {
     let mut reader = std::io::BufReader::new(stream);
     for _ in 0..MAX_REQUESTS_PER_CONN {
-        if *state.shutdown.lock().unwrap() {
+        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
         }
         if !serve_one_tls(&mut reader, state)? {
@@ -538,6 +566,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
+/// Concatenate two param lists. Used by REST API dispatch to combine
+/// URL-path parameters (route.params: owner, name, ref, sha) with
+/// query-string parameters (params: page, per_page) — the handlers
+/// expect a single flat lookup table.
+fn merge_params(a: &[(String, String)], b: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    out.extend_from_slice(a);
+    out.extend_from_slice(b);
+    out
+}
+
 fn dispatch(
     route: &router::RouteMatch,
     params: &[(String, String)],
@@ -552,15 +591,19 @@ fn dispatch(
         Handler::ObjectsWant => wire_objects_want(state, &route.params, body),
         Handler::ObjectsHave => wire_objects_have(state, &route.params, body),
         Handler::RefsUpdate => wire_refs_update(state, &route.params, raw_query, body, actor),
-        // REST API handlers use query params
+        // REST API handlers need *both* the path-extracted params
+        // (owner / name / ref / sha / path) AND the query string
+        // (page, per_page). Merge them — path entries first so a
+        // future query parameter with the same key cannot override
+        // an authoritative URL segment.
         Handler::RepoList => repo_list(state, params),
-        Handler::RepoInfo => repo_info(state, params),
-        Handler::CommitList => commit_list(state, params),
-        Handler::CommitDetail => commit_detail(state, params),
-        Handler::TreeBrowse => tree_browse(state, params),
-        Handler::RefsList => refs_list(state, params),
-        Handler::DiffRevs => diff_revs(state, params),
-        Handler::Search => search(state, params),
+        Handler::RepoInfo => repo_info(state, &merge_params(&route.params, params)),
+        Handler::CommitList => commit_list(state, &merge_params(&route.params, params)),
+        Handler::CommitDetail => commit_detail(state, &merge_params(&route.params, params)),
+        Handler::TreeBrowse => tree_browse(state, &merge_params(&route.params, params)),
+        Handler::RefsList => refs_list(state, &merge_params(&route.params, params)),
+        Handler::DiffRevs => diff_revs(state, &merge_params(&route.params, params)),
+        Handler::Search => search(state, &merge_params(&route.params, params)),
         Handler::StaticFile => static_file(state, params),
         Handler::NotFound => (
             404,
@@ -710,12 +753,19 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
 // ---------- Helper: resolve owner/name to .gyt path ----------
 
 fn repo_path(state: &ServerState, owner: &str, name: &str) -> Option<PathBuf> {
+    // Match both non-bare (`<owner>/<name>/.gyt/`) and bare
+    // (`<owner>/<name>/HEAD` directly) layouts so the REST API can
+    // serve a bare server-side repo. The wire path already handles
+    // both — without this the API silently 404s on every bare repo
+    // (which is the only layout `gyt serve` actually accepts at scale).
     let candidate = state.repos_root.join(owner).join(name);
     if candidate.join(".gyt").is_dir() {
-        Some(candidate)
-    } else {
-        None
+        return Some(candidate);
     }
+    if candidate.join("HEAD").is_file() {
+        return Some(candidate);
+    }
+    None
 }
 
 fn open_repo(state: &ServerState, owner: &str, name: &str) -> Option<crate::repo::Repo> {
@@ -835,6 +885,12 @@ fn repo_info(state: &ServerState, params: &[(String, String)]) -> (u16, String, 
 
 // ---------- Handler: commit list ----------
 
+/// DoS bound for `commit_list`'s parent walk. A million-commit history
+/// must not be able to pin a worker thread before the first byte hits
+/// the wire. Pagination beyond 10k requires re-anchoring the request
+/// at an earlier `?ref=<sha>`.
+const MAX_ANCESTORS: usize = 10_000;
+
 fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String, Vec<u8>, String) {
     let owner = router::get_param(params, "owner").unwrap_or("");
     let name = router::get_param(params, "name").unwrap_or("");
@@ -856,7 +912,7 @@ fn commit_list(state: &ServerState, params: &[(String, String)]) -> (u16, String
     let mut cur = Some(start_id);
 
     while let Some(id) = cur {
-        if seen.contains(&id) {
+        if seen.contains(&id) || commits.len() >= MAX_ANCESTORS {
             break;
         }
         seen.insert(id);

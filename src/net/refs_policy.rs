@@ -450,7 +450,13 @@ const AUDIT_LOG_KEEP: usize = 5;
 static AUDIT_ROTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Append an entry to `<gyt>/audit.log` describing a successful ref update.
-/// Crash-resistant best-effort: errors are dropped because audit is advisory.
+///
+/// Audit is advisory — failures don't abort the ref update — but a
+/// silent drop has burned operators before (disk full not noticed
+/// until much later when an investigation can't find evidence of who
+/// did what). We surface every distinct failure on stderr exactly once
+/// per process so log spam doesn't flood the operator's terminal but
+/// the first failure is impossible to miss.
 ///
 /// Rotation: when the active log crosses `AUDIT_LOG_MAX_BYTES` we rename
 /// `audit.log.{N-1} -> audit.log.N` down through `.1`, then rotate the
@@ -476,12 +482,27 @@ pub fn append_audit(
     );
     let path = gyt_dir.join("audit.log");
     rotate_audit_if_needed(gyt_dir, &path);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let res = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-    {
-        let _ = f.write_all(line.as_bytes());
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+    if let Err(e) = res {
+        audit_warn_once(&format!("audit.log write failed: {e}"));
+    }
+}
+
+/// Process-wide warn-once cache so repeated audit failures (the common
+/// case once a disk fills) don't drown the operator in identical lines.
+fn audit_warn_once(msg: &str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    let unseen = set.insert(msg.to_string());
+    drop(g);
+    if unseen {
+        eprintln!("gyt audit: {msg}");
     }
 }
 
