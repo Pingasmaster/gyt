@@ -156,6 +156,7 @@ async fn handle_h3_request(
                             413,
                             b"body too large",
                             "text/plain",
+                            &state,
                         )
                         .await;
                         return;
@@ -200,7 +201,7 @@ async fn handle_h3_request(
         ),
     };
 
-    let _ = write_h3_response(&mut stream, status, body, &ctype).await;
+    let _ = write_h3_response(&mut stream, status, body, &ctype, &state).await;
 }
 
 async fn write_h3_response(
@@ -208,11 +209,25 @@ async fn write_h3_response(
     status: u16,
     body: Vec<u8>,
     content_type: &str,
+    state: &ServerState,
 ) -> std::result::Result<(), String> {
-    let resp = Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header("content-type", content_type)
-        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-origin", "*");
+    // Alt-Svc on an h3 response is technically redundant (the client
+    // is already speaking h3), but it refreshes the ma= window so
+    // subsequent connections from the same client keep the h3
+    // fast-path even after the previous Alt-Svc expires.
+    if let Some(alt) = state.alt_svc_value.as_deref() {
+        builder = builder.header("alt-svc", alt);
+    }
+    // QUIC is always TLS-encrypted, so HSTS is always meaningful here.
+    builder = builder.header(
+        "strict-transport-security",
+        "max-age=31536000; includeSubDomains",
+    );
+    let resp = builder
         .body(())
         .map_err(|e| format!("h3 build response: {e}"))?;
     stream
@@ -238,8 +253,9 @@ async fn write_h3_simple(
     status: u16,
     body: &[u8],
     ctype: &str,
+    state: &ServerState,
 ) -> std::result::Result<(), String> {
-    write_h3_response(stream, status, body.to_vec(), ctype).await
+    write_h3_response(stream, status, body.to_vec(), ctype, state).await
 }
 
 /// Build a quinn ServerConfig with our cert+key and ALPN=h3. We

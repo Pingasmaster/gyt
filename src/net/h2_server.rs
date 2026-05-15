@@ -144,12 +144,14 @@ async fn handle_request(
     let body_bytes = match buffer_body(req.into_body()).await {
         Ok(b) => b,
         Err(msg) => {
-            return Ok(build_response(
+            let mut resp = build_response(
                 413,
                 "Payload Too Large",
                 msg.into_bytes(),
                 "text/plain",
-            ));
+            );
+            crate::net::server::apply_protocol_headers(resp.headers_mut(), &state);
+            return Ok(resp);
         }
     };
 
@@ -179,7 +181,9 @@ async fn handle_request(
         ),
     };
 
-    Ok(build_response(status, &reason, body, &ctype))
+    let mut resp = build_response(status, &reason, body, &ctype);
+    crate::net::server::apply_protocol_headers(resp.headers_mut(), &state);
+    Ok(resp)
 }
 
 async fn buffer_body(body: Incoming) -> std::result::Result<Vec<u8>, String> {
