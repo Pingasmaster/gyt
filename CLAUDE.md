@@ -133,6 +133,54 @@ host B can't see host A's pids and may incorrectly conclude that
 A's still-live lock is stale. Multi-host serving of one repo is
 out of scope; shard repos across hosts and route at the LB.
 
+### Advertising HTTP/3 via DNS HTTPS RR
+
+`gyt serve` emits `Alt-Svc: h3=":<port>"; ma=86400` on every HTTPS
+response when `--listen-h3` is configured (RFC 7838). Clients that
+have already hit the HTTP/1.1 or HTTP/2 endpoint at least once
+discover HTTP/3 from that header and switch on the next visit.
+
+The faster path — and now the recommended one for production
+deployments per RFC 9460 — is a DNS HTTPS resource record.
+Browsers and DNS resolvers that support SVCB/HTTPS RRs see h3
+*before* the first TCP handshake, so the very first connection
+goes straight to QUIC.
+
+Operator setup (BIND zone file syntax; equivalent forms in
+Cloudflare / Route 53 / etc.):
+
+```
+repo.example.com.  3600  IN  HTTPS  1 . alpn="h3,h2" port=443
+```
+
+- `1` is the priority (lower = higher preference).
+- `.` is the target (same name as the owner record).
+- `alpn="h3,h2"` advertises both protocols, preferring h3.
+- `port=443` is optional if the service runs on the default port.
+
+DNS HTTPS RR is supported by Chrome 117+, Firefox 116+, Safari 17+,
+and by `curl --doh-url`. Older clients fall back to the Alt-Svc
+discovery path automatically — no extra config needed.
+
+### TLS session-ticket key rotation
+
+`--tls-ticket-key <file>` is the operator-controlled rotation point
+for cross-replica TLS resumption. File is hex-encoded:
+
+```
+# Current key (32 bytes, 64 hex chars)
+00112233...
+
+# Optional previous key for one-rotation tolerance
+ffeeddcc...
+```
+
+Multi-replica deployments behind a non-sticky LB need every replica
+reading the same file. Rotate by pushing a new file with the new
+key on line 1 and the old key on line 2 to every replica, then
+restart each one. After the 12-hour ticket lifetime expires, push
+again with the new key on line 1 only.
+
 ## Other operational notes
 
 - See `AGENTS.md` for full contributor conventions (clippy policy, branch strategy, CI secrets, no push webhooks).
