@@ -494,13 +494,19 @@ pub fn append_audit(
 
 /// Process-wide warn-once cache so repeated audit failures (the common
 /// case once a disk fills) don't drown the operator in identical lines.
+///
+/// `LazyLock<Mutex<HashSet>>` is the modern stdlib pattern (stable in
+/// 1.80) — it replaces the previous `Mutex<Option<HashSet>>` +
+/// `get_or_insert_with()` dance. Same semantics, one fewer indirection
+/// on every call, no `Option::None` to handle.
 fn audit_warn_once(msg: &str) {
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
-    let mut g = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let set = g.get_or_insert_with(std::collections::HashSet::new);
-    let unseen = set.insert(msg.to_string());
-    drop(g);
+    use std::sync::{LazyLock, Mutex};
+    static SEEN: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    let unseen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(msg.to_string());
     if unseen {
         eprintln!("gyt audit: {msg}");
     }
