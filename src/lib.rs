@@ -33,6 +33,7 @@ pub mod hash;
 pub mod ignore;
 pub mod index;
 pub mod issues;
+pub mod prs;
 pub mod merge3;
 pub mod net;
 pub mod object;

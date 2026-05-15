@@ -16,6 +16,7 @@ pub mod getthefuckoutofmyrepo;
 pub mod grep_cmd;
 pub mod init;
 pub mod issue;
+pub mod pr;
 pub mod keygen;
 pub mod log;
 pub mod merge;

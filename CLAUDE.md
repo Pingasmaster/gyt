@@ -56,6 +56,36 @@ implementation and differ only in the `kind` field (`issue` vs
   by design (don't replicate arbitrary server-controlled namespaces).
 - Tests: `tests/issues.rs` + unit tests in `src/issues.rs`.
 
+### Pull requests are in-repo refs
+
+PRs live at `refs/prs/<N>`, pointing to a TOML blob with the same shape
+as issues plus `source_ref`, `target_ref`, a tri-state `state` (open/
+closed/merged), and two extra event kinds: `merge` and `ci_run`. See
+`src/prs.rs`. They share the wire path with issues (the
+`is_user_visible_ref` whitelist).
+
+PR-triggered CI is the *manual* model the user asked for:
+
+- `gyt pr ci-run <N>` runs the local `.gyt-ci/*.wasm` scripts through
+  the same hardened sandbox as `gyt ci`, then records a `ci_run` event
+  with result `pass` or `fail: <reason>`.
+- The execution happens on the *client*. There is no "server-side
+  runner" in scope — server-side CI requires a worker pool, a workdir
+  checkout per request, and result-blob persistence that the
+  contributor model doesn't yet need.
+- The "rw-only" admin gate is the server's *existing* refs/update ACL:
+  pushing the recorded `ci_run` event to the server requires an `rw`
+  ACL entry. A `ro` token can `ci-run` locally but cannot publish the
+  result (verified in `tests/prs.rs::pr_ro_client_blocked_from_pushing_ci_run_event`).
+- `gyt pr merge <N>` delegates to the existing merge implementation
+  (FF-only by default, `--no-ff` for a merge commit). The PR's state
+  flips to `merged` once the target ref advances.
+
+URL-embedded bearer tokens: `https://<token>@host/repo` is now parsed
+into an `Authorization: Bearer <token>` header by `src/net/http.rs`.
+The previous test surface relied on tokenless requests being rejected;
+this enables real ACL flows on the wire.
+
 ## Other operational notes
 
 - See `AGENTS.md` for full contributor conventions (clippy policy, branch strategy, CI secrets, no push webhooks).
