@@ -24,7 +24,7 @@ use crate::net::refs_policy;
 use crate::net::router::{self, Handler};
 use crate::object::{commit, tree};
 use crate::refs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -34,33 +34,51 @@ use std::thread;
 /// the server tries to allocate a buffer for it.
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default size of the connection worker pool. The OS-thread-per-
-/// connection cost is paid up front (pool is pre-spawned, threads
-/// idle on a channel) instead of per accepted connection. Override
-/// via the `GYT_SERVE_WORKERS` env var; values up to a few thousand
-/// are reasonable on modern kernels — past ~10k you want an async
-/// runtime, which is a different change.
-const DEFAULT_WORKERS: usize = 256;
-
-/// Per-worker thread stack size. The Rust default of 8 MiB × N
-/// threads dominates memory at large pool sizes; 512 KiB is plenty
-/// for our handlers (Myers diff is the only deep recursion candidate
-/// and it's iteratively bounded by MAX_DIFF_BYTES).
-const WORKER_STACK_BYTES: usize = 512 * 1024;
-
-/// Queue capacity in front of the pool. Sized at 2× the worker count
-/// so a brief burst doesn't immediately overflow into 503s — clients
-/// see queuing latency first, refusal only when the burst sustains.
-const fn queue_capacity(workers: usize) -> usize {
-    workers.saturating_mul(2)
-}
-
-fn configured_worker_count() -> usize {
-    std::env::var("GYT_SERVE_WORKERS")
+/// Number of tokio worker threads for the *async* runtime. The async
+/// runtime needs only a small handful of threads (one per CPU is the
+/// usual rule); blocking work (disk I/O, xz, BLAKE3) goes to the
+/// blocking pool, which is sized separately via
+/// `GYT_SERVE_BLOCKING_THREADS`.
+fn configured_async_workers() -> usize {
+    std::env::var("GYT_SERVE_ASYNC_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_WORKERS)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(4, std::num::NonZeroUsize::get)
+                .min(16)
+        })
+}
+
+/// Maximum threads in the blocking pool. Every request lands on one
+/// of these via `spawn_blocking` to call our sync disk-touching
+/// handlers (`dispatch_request` ultimately reads object files,
+/// runs xz, hashes blobs). The default is generous because tokio's
+/// blocking pool only allocates threads on demand and lets idle
+/// threads expire on their own.
+///
+/// Pre-async, this was capped at 256 OS threads with 512 KiB stacks.
+/// Tokio's default stack for blocking threads is 2 MiB; you can drop
+/// it via the env if memory pressure shows up.
+fn configured_blocking_threads() -> usize {
+    std::env::var("GYT_SERVE_BLOCKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2048)
+}
+
+/// Maximum concurrent in-flight connections accepted before the
+/// listener returns 503. With async I/O each connection is just a
+/// tokio task — far cheaper than the old OS-thread-per-conn model
+/// — so the default is bumped 40× from the pre-async cap.
+fn configured_max_inflight() -> usize {
+    std::env::var("GYT_SERVE_MAX_INFLIGHT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10_000)
 }
 
 /// Per-IP rate-limit config, overridable via env so tests and
@@ -111,17 +129,6 @@ fn configured_actor_limit() -> LimitConfig {
     }
 }
 
-/// Body the server writes when it refuses a connection due to pool
-/// exhaustion. Sent before the socket is dropped so clients see a
-/// real HTTP response instead of a TCP RST.
-const POOL_FULL_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
-Connection: close\r\n\
-Retry-After: 1\r\n\
-Content-Length: 24\r\n\
-Content-Type: text/plain\r\n\
-\r\n\
-server pool exhausted\r\n";
-
 pub struct ServeConfig {
     pub listen_addr: String,
     /// Optional dedicated HTTP/2 listener address. When set, gyt
@@ -159,21 +166,6 @@ pub struct ServeConfig {
     /// for their own next push.
     pub policy_config: Option<PathBuf>,
 }
-
-struct Request {
-    method: String,
-    target: String,
-    body: Vec<u8>,
-    auth_header: Option<String>,
-    /// True iff the request sent `Connection: close`. We default to
-    /// HTTP/1.1 keep-alive otherwise and reuse the connection for the
-    /// next request from the same client.
-    client_wants_close: bool,
-}
-
-/// Maximum number of requests served on one keep-alive connection.
-/// After this we close so a single client can't pin a worker forever.
-const MAX_REQUESTS_PER_CONN: u32 = 256;
 
 pub fn serve(config: &ServeConfig) -> Result<()> {
     // Fail fast: if the operator passed `--signers <file>` but the file
@@ -229,11 +221,25 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         config.repos_root.display(),
     )))?;
 
-    let listener = TcpListener::bind(&config.listen_addr)?;
-    let addr = listener.local_addr()?;
+    // Bind synchronously so we can fail fast with a clean error. We
+    // then hand the listener to the tokio runtime via from_std after
+    // marking it nonblocking — tokio needs that to drive accept() on
+    // its reactor.
+    let listener_std = TcpListener::bind(&config.listen_addr)?;
+    let addr = listener_std.local_addr()?;
+    listener_std.set_nonblocking(true)?;
 
     let tls_config = match (&config.tls_cert, &config.tls_key) {
-        (Some(cert), Some(key)) => Some(crate::net::tls::server_config(cert, key)?),
+        (Some(cert), Some(key)) => {
+            let base = crate::net::tls::server_config(cert, key)?;
+            // Main listener supports both h1 and h2 via ALPN. The base
+            // config sets ALPN to http/1.1 only; clone and re-set so
+            // h2-capable clients can land on the same socket. (HTTP/3
+            // remains on its own UDP port.)
+            let mut new_cfg: rustls::ServerConfig = (*base).clone();
+            new_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(Arc::new(new_cfg))
+        }
         (None, None) => None,
         _ => {
             return Err(crate::errors::GytError::InvalidArgument(
@@ -243,9 +249,9 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     };
 
     if tls_config.is_some() {
-        eprintln!("gyt serve: listening on https://{addr}");
+        eprintln!("gyt serve: listening on https://{addr} (h1+h2 via ALPN)");
     } else {
-        eprintln!("gyt serve: listening on http://{addr}");
+        eprintln!("gyt serve: listening on http://{addr} (h1)");
     }
 
     let auth_acl = match &config.auth_tokens_file {
@@ -281,14 +287,6 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
             st.rate_limiter.gc_idle(std::time::Duration::from_mins(5));
         });
     }
-    let pool_size = configured_worker_count();
-    let pool = WorkerPool::spawn(
-        pool_size,
-        queue_capacity(pool_size),
-        &state,
-        tls_config.as_ref(),
-    );
-
     // Install signal handlers. SIGTERM / SIGINT flip the shutdown flag
     // and then poke our own listen socket once so the blocking accept
     // returns. Without the self-connect, the accept loop would only
@@ -343,36 +341,100 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         None
     };
 
-    for stream in listener.incoming() {
-        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-            break;
-        }
-        match stream {
-            Ok(s) => {
-                state.metrics.accepts_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let peer_ip = s.peer_addr().ok().map(|sa| sa.ip());
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-                if let Err(mut returned) = pool.try_submit(Job {
-                    stream: s,
-                    peer_ip,
-                }) {
-                    use std::io::Write as _;
-                    state
+    // Tokio runtime. Async workers are sized for I/O multiplexing
+    // (small — one per core suffices); the blocking pool absorbs
+    // sync handler work via spawn_blocking and is sized much larger.
+    // Both dimensions are env-tunable for operators tuning a real
+    // deployment.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(configured_async_workers())
+        .max_blocking_threads(configured_blocking_threads())
+        .thread_name("gyt-rt")
+        .enable_all()
+        .build()
+        .map_err(|e| crate::errors::GytError::Net(format!("build runtime: {e}")))?;
+
+    let accept_state = state.clone();
+    let accept_tls = tls_config.clone();
+    runtime.block_on(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener_std) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("gyt serve: from_std listener: {e}");
+                return;
+            }
+        };
+        let inflight = Arc::new(tokio::sync::Semaphore::new(configured_max_inflight()));
+
+        loop {
+            if *accept_state
+                .shutdown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                break;
+            }
+            // Race accept against a 1 s timeout so we recheck the
+            // shared shutdown flag at most once per second — the
+            // signal handler self-connects so accept normally returns
+            // immediately, but the timeout is a belt + suspenders.
+            let accept = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                listener.accept(),
+            )
+            .await;
+            let (stream, peer) = match accept {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    eprintln!("gyt serve: accept: {e}");
+                    continue;
+                }
+                Err(_) => continue, // 1 s tick — re-check shutdown
+            };
+
+            accept_state
+                .metrics
+                .accepts_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // try_acquire so an overload doesn't queue up sockets in
+            // the kernel backlog (which would cause LBs to time out).
+            // Past the cap, return 503 inline.
+            let permit = match inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    accept_state
                         .metrics
                         .pool_exhausted_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let _ = returned.stream.write_all(POOL_FULL_RESPONSE);
-                    let _ = returned.stream.shutdown(std::net::Shutdown::Both);
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt as _;
+                        let mut s = stream;
+                        let _ = s.write_all(POOL_FULL_RESPONSE).await;
+                        let _ = s.shutdown().await;
+                    });
+                    continue;
                 }
-            }
-            Err(_) => break,
+            };
+
+            let peer_ip = peer.ip();
+            let st = accept_state.clone();
+            let tls = accept_tls.clone();
+            tokio::spawn(async move {
+                let _permit = permit; // released when this task ends
+                if let Some(cfg) = tls {
+                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => serve_conn_tls(tls_stream, st, peer_ip).await,
+                        Err(e) => eprintln!("gyt serve: tls accept: {e}"),
+                    }
+                } else {
+                    serve_conn_plain(stream, st, peer_ip).await;
+                }
+            });
         }
-    }
-    // Drop the pool: closing the channel signals every worker to exit
-    // after finishing its current job. We block until they all join so
-    // the process actually drains before main() returns.
-    drop(pool);
+        eprintln!("gyt serve: main listener draining");
+    });
 
     // Wait for the h2/h3 listeners (if any) to drain. They poll the
     // same shutdown flag we just observed, so they'll exit shortly.
@@ -383,139 +445,169 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         let _ = h.join();
     }
 
+    // Drop the runtime explicitly — gives in-flight tasks a chance
+    // to finish before the runtime's threads are torn down.
+    drop(runtime);
+
     // Hold the serve lock until after the workers have drained so a
     // restart can't race in mid-shutdown.
     drop(serve_lock);
     Ok(())
 }
 
-/// One unit of work handed off from the accept loop to a worker thread.
-struct Job {
-    stream: std::net::TcpStream,
-    peer_ip: Option<std::net::IpAddr>,
-}
-
-/// Fixed-size worker pool. Threads block on `rx.recv()` until a Job
-/// arrives or the channel closes (pool dropped). TLS handshakes
-/// happen *inside* the worker, not on the accept thread, so a slow
-/// TLS handshake from one peer can't stall accept for everyone else.
-struct WorkerPool {
-    /// Bounded sender. `try_send` lets us refuse a job when the pool
-    /// is saturated without blocking the accept loop.
-    tx: Option<sync_channel::Sender>,
-    workers: Vec<thread::JoinHandle<()>>,
-}
-
-impl WorkerPool {
-    fn spawn(
-        n: usize,
-        queue: usize,
-        state: &Arc<ServerState>,
-        tls: Option<&Arc<rustls::ServerConfig>>,
-    ) -> Self {
-        let (tx, rx) = sync_channel::bounded(queue);
-        let rx = Arc::new(rx);
-        let mut workers = Vec::with_capacity(n);
-        for i in 0..n {
-            let rx = rx.clone();
-            let st = state.clone();
-            let tls = tls.cloned();
-            let builder = thread::Builder::new()
-                .name(format!("gyt-worker-{i}"))
-                .stack_size(WORKER_STACK_BYTES);
-            let handle = builder
-                .spawn(move || worker_loop(&rx, &st, tls.as_ref()))
-                .expect("spawn worker thread");
-            workers.push(handle);
-        }
-        Self {
-            tx: Some(tx),
-            workers,
-        }
-    }
-
-    fn try_submit(&self, job: Job) -> std::result::Result<(), Job> {
-        // tx is Some until Drop runs. Outside Drop it's safe to unwrap.
-        self.tx
-            .as_ref()
-            .expect("pool sender still open")
-            .try_send(job)
-    }
-}
-
-impl Drop for WorkerPool {
-    fn drop(&mut self) {
-        // Close the channel so every worker's recv() returns Err and
-        // the loop exits.
-        self.tx = None;
-        for h in self.workers.drain(..) {
-            let _ = h.join();
-        }
-    }
-}
-
-fn worker_loop(
-    rx: &sync_channel::Receiver,
-    state: &ServerState,
-    tls: Option<&Arc<rustls::ServerConfig>>,
+/// Serve a single plain-TCP HTTP/1.1 connection. Uses hyper's http1
+/// builder directly — no h2c, no ALPN.
+async fn serve_conn_plain(
+    stream: tokio::net::TcpStream,
+    state: Arc<ServerState>,
+    peer_ip: std::net::IpAddr,
 ) {
-    while let Ok(job) = rx.recv() {
-        // catch_unwind so a handler panic doesn't kill the worker
-        // thread — we want the thread to come back for the next job.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if let Some(cfg) = tls {
-                match crate::net::tls::accept_tls(job.stream, cfg) {
-                    Ok(tls_stream) => {
-                        let _ = handle_tls_conn(tls_stream, state, job.peer_ip);
-                    }
-                    Err(e) => {
-                        eprintln!("gyt serve: tls accept error: {e}");
-                    }
-                }
-            } else {
-                let _ = handle_conn(job.stream, state, job.peer_ip);
-            }
-        }));
-        if let Err(payload) = result {
-            let msg = downcast_panic_payload(&payload);
-            eprintln!("gyt serve: worker panic (request dropped): {msg}");
-        }
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let st = state.clone();
+        async move { handle_async_request(req, st, peer_ip).await }
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    // 30 s header-read budget matches the pre-async TcpStream read
+    // timeout. Body reads are bounded by the size cap (256 MiB) and
+    // by the request-level rate limiter. Hyper needs a Timer
+    // instance to enforce the timeout — TokioTimer is the canonical
+    // one for tokio runtimes.
+    //
+    // max_buf_size caps the per-connection buffer hyper uses for
+    // headers + body framing. Set tight (64 KiB) so a single
+    // oversized-header request can't allocate a multi-MB buffer.
+    // Bodies that exceed 64 KiB are streamed past this buffer in
+    // chunks, so the cap only constrains header parsing.
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
+        .max_buf_size(64 * 1024);
+    if let Err(e) = builder.serve_connection(io, service).with_upgrades().await {
+        let _ = e; // peer reset / slow-loris not actionable
     }
 }
 
-/// Small synchronous bounded-channel wrapper. std's mpsc Receiver is
-/// `!Sync`, so we wrap it in a Mutex to let N workers fan out from
-/// one queue. The Mutex is only held during the recv() handoff, not
-/// for the duration of request handling, so it isn't on the request
-/// path's hot loop.
-mod sync_channel {
-    use super::Job;
-    use std::sync::mpsc::{self, SyncSender, TrySendError};
-    use std::sync::Mutex;
-
-    pub struct Sender(SyncSender<Job>);
-    pub struct Receiver(Mutex<mpsc::Receiver<Job>>);
-
-    pub fn bounded(cap: usize) -> (Sender, Receiver) {
-        let (tx, rx) = mpsc::sync_channel(cap);
-        (Sender(tx), Receiver(Mutex::new(rx)))
-    }
-
-    impl Sender {
-        pub fn try_send(&self, job: Job) -> std::result::Result<(), Job> {
-            match self.0.try_send(job) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(j) | TrySendError::Disconnected(j)) => Err(j),
-            }
-        }
-    }
-    impl Receiver {
-        pub fn recv(&self) -> std::result::Result<Job, mpsc::RecvError> {
-            let g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.recv()
-        }
+/// Serve a single TLS connection. Uses hyper-util's auto::Builder
+/// which dispatches to either h1 or h2 based on the ALPN value the
+/// TLS layer negotiated.
+async fn serve_conn_tls(
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    state: Arc<ServerState>,
+    peer_ip: std::net::IpAddr,
+) {
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let st = state.clone();
+        async move { handle_async_request(req, st, peer_ip).await }
+    });
+    let mut builder = hyper_util::server::conn::auto::Builder::new(
+        hyper_util::rt::TokioExecutor::new(),
+    );
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
+        .max_buf_size(64 * 1024);
+    if let Err(e) = builder.serve_connection(io, service).await {
+        let _ = e;
     }
 }
+
+/// Per-request async handler shared by every protocol path on the
+/// main listener (plain HTTP/1.1, TLS HTTP/1.1, TLS HTTP/2). Buffers
+/// the request body up to MAX_BODY_BYTES, then hands the parsed
+/// fields to `dispatch_request` on the blocking pool so disk I/O,
+/// xz, and BLAKE3 don't stall the async runtime.
+async fn handle_async_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    state: Arc<ServerState>,
+    peer_ip: std::net::IpAddr,
+) -> std::result::Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible>
+{
+    use http_body_util::{BodyExt, Limited};
+
+    let method = req.method().as_str().to_string();
+    let uri = req.uri().clone();
+    let target = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_string(), |pq| pq.as_str().to_string());
+    let auth_header = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let body_bytes = {
+        let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
+        match limited.collect().await {
+            Ok(c) => c.to_bytes().to_vec(),
+            Err(e) => {
+                return Ok(build_response(
+                    413,
+                    format!("body too large or read error: {e}").into_bytes(),
+                    "text/plain",
+                ));
+            }
+        }
+    };
+
+    let st_blocking = state.clone();
+    let auth_clone = auth_header.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        dispatch_request(
+            &st_blocking,
+            &method,
+            &target,
+            &body_bytes,
+            auth_clone.as_deref(),
+            Some(peer_ip),
+        )
+    })
+    .await;
+
+    let (status, _reason, body, ctype) = match result {
+        Ok(t) => t,
+        Err(e) => (
+            500u16,
+            "Internal Server Error".to_string(),
+            format!("dispatch panicked: {e}").into_bytes(),
+            "text/plain".to_string(),
+        ),
+    };
+
+    Ok(build_response(status, body, &ctype))
+}
+
+fn build_response(
+    status: u16,
+    body: Vec<u8>,
+    content_type: &str,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    let mut resp = hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(body)));
+    *resp.status_mut() = hyper::StatusCode::from_u16(status)
+        .unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    if let Ok(v) = hyper::header::HeaderValue::from_str(content_type) {
+        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, v);
+    }
+    resp.headers_mut().insert(
+        hyper::header::HeaderName::from_static("access-control-allow-origin"),
+        hyper::header::HeaderValue::from_static("*"),
+    );
+    resp
+}
+
+/// 503 body sent inline by the accept loop when the in-flight cap is
+/// exhausted. Plain-HTTP/1.1-only — even TLS connections get this if
+/// the cap fires before the handshake starts. Includes Retry-After:1
+/// so a reasonable LB or client backs off promptly.
+const POOL_FULL_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+Connection: close\r\n\
+Retry-After: 1\r\n\
+Content-Length: 24\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+server pool exhausted\r\n";
 
 /// Spawn a thread that watches for SIGTERM / SIGINT / SIGQUIT, flips
 /// `state.shutdown`, then opens a single self-connection so the
@@ -660,117 +752,6 @@ fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
     Ok(out)
 }
 
-/// Best-effort string for a panic payload that came back from
-/// `catch_unwind`. Panics are usually `&'static str` or `String`;
-/// we fall back to a generic marker if neither downcast succeeds.
-fn downcast_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<non-string panic payload>".to_string()
-    }
-}
-
-fn handle_conn(
-    stream: std::net::TcpStream,
-    state: &ServerState,
-    peer_ip: Option<std::net::IpAddr>,
-) -> std::io::Result<()> {
-    let mut reader = std::io::BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-    for _ in 0..MAX_REQUESTS_PER_CONN {
-        // Respect graceful shutdown: a keep-alive worker waiting for
-        // the next request must drop out promptly when serve() flips
-        // the shutdown flag. Without this check a single client could
-        // hold a worker for the whole MAX_REQUESTS_PER_CONN × timeout
-        // window after the operator asked us to exit.
-        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-            break;
-        }
-        if !serve_one(&mut reader, &mut writer, state, peer_ip)? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Serve one HTTP request on a plain (non-TLS) connection. Returns
-/// `Ok(true)` if the connection may be reused for another request,
-/// `Ok(false)` if it should be closed (client requested close, parse
-/// error, or auth failure).
-fn serve_one<R: BufRead, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    state: &ServerState,
-    peer_ip: Option<std::net::IpAddr>,
-) -> std::io::Result<bool> {
-    let req = match read_request(reader) {
-        Ok(r) => r,
-        Err(_) => {
-            // EOF or read timeout: just close. No 400 — the client may
-            // have walked away mid-keep-alive, which is normal.
-            return Ok(false);
-        }
-    };
-
-    let (path, query) = match req.target.find('?') {
-        Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
-        None => (req.target.as_str(), None),
-    };
-
-    let params = router::query_params(query);
-    let route = router::route(&req.method, path);
-
-    state.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state
-        .metrics
-        .request_body_bytes_total
-        .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.record_handler(route.handler);
-
-    let actor = actor_for(&req);
-
-    // Rate limit *before* dispatch, but *after* parsing — so we still
-    // charge a misbehaving client and so we know whether to exempt
-    // probes. Probes have no auth and we don't want a noisy probe
-    // setup to throttle real traffic; they bypass the limiter too.
-    if !route_is_unauth_probe(&route)
-        && !state.rate_limiter.allow(peer_ip, actor.as_deref())
-    {
-        state
-            .metrics
-            .requests_rate_limited_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        write_response(
-            writer,
-            429,
-            "Too Many Requests",
-            "text/plain",
-            b"rate limited\n",
-        )?;
-        return Ok(true);
-    }
-
-    if !authorize_with_metric(state, &req, &route) {
-        write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
-        return Ok(false);
-    }
-
-    let (status, reason, body, ctype) =
-        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
-
-    state
-        .metrics
-        .response_bytes_total
-        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-    let keep_alive = !req.client_wants_close;
-    write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
-    Ok(keep_alive)
-}
-
 /// Protocol-agnostic request handler. Takes the already-parsed
 /// request fields and the peer's IP (when known) and returns the
 /// response tuple. This is the shared entry point: the HTTP/1.1 sync
@@ -786,7 +767,7 @@ pub(crate) fn dispatch_request(
     state: &ServerState,
     method: &str,
     target: &str,
-    body: Vec<u8>,
+    body: &[u8],
     auth_header: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
 ) -> (u16, String, Vec<u8>, String) {
@@ -805,14 +786,7 @@ pub(crate) fn dispatch_request(
         .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
     state.metrics.record_handler(route.handler);
 
-    let req = Request {
-        method: method.to_string(),
-        target: target.to_string(),
-        body,
-        auth_header: auth_header.map(str::to_string),
-        client_wants_close: false,
-    };
-    let actor = actor_for(&req);
+    let actor = actor_for(auth_header);
 
     if !route_is_unauth_probe(&route)
         && !state.rate_limiter.allow(peer_ip, actor.as_deref())
@@ -829,7 +803,7 @@ pub(crate) fn dispatch_request(
         );
     }
 
-    if !authorize_with_metric(state, &req, &route) {
+    if !authorize_with_metric(state, auth_header, &route) {
         return (
             401,
             "Unauthorized".into(),
@@ -839,7 +813,7 @@ pub(crate) fn dispatch_request(
     }
 
     let (status, reason, resp_body, ctype) =
-        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
+        dispatch(&route, &params, query, body, state, actor.as_deref());
 
     state
         .metrics
@@ -852,8 +826,12 @@ pub(crate) fn dispatch_request(
 /// Wrapper around `authorize` that bumps the unauthorized counter on
 /// deny. Keeps `authorize` itself free of side effects so test code
 /// can call it without metric pollution.
-fn authorize_with_metric(state: &ServerState, req: &Request, route: &router::RouteMatch) -> bool {
-    let ok = authorize(state, req, route);
+fn authorize_with_metric(
+    state: &ServerState,
+    auth_header: Option<&str>,
+    route: &router::RouteMatch,
+) -> bool {
+    let ok = authorize(state, auth_header, route);
     if !ok {
         state
             .metrics
@@ -869,8 +847,8 @@ fn authorize_with_metric(state: &ServerState, req: &Request, route: &router::Rou
 /// forensic adversary can't feasibly brute-force a target fingerprint
 /// to forge audit entries. Anonymous requests get None → the audit
 /// path records "anon".
-fn actor_for(req: &Request) -> Option<String> {
-    let header = req.auth_header.as_deref()?;
+fn actor_for(auth_header: Option<&str>) -> Option<String> {
+    let header = auth_header?;
     let token = header.strip_prefix("Bearer ")?;
     let h = blake3::hash(token.as_bytes());
     let bytes = h.as_bytes();
@@ -882,88 +860,6 @@ fn actor_for(req: &Request) -> Option<String> {
     Some(format!("token:{hex}"))
 }
 
-/// Handle a TLS-wrapped connection.
-fn handle_tls_conn(
-    stream: crate::net::tls::ServerTlsStream,
-    state: &ServerState,
-    peer_ip: Option<std::net::IpAddr>,
-) -> std::io::Result<()> {
-    let mut reader = std::io::BufReader::new(stream);
-    for _ in 0..MAX_REQUESTS_PER_CONN {
-        if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
-            break;
-        }
-        if !serve_one_tls(&mut reader, state, peer_ip)? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn serve_one_tls(
-    reader: &mut std::io::BufReader<crate::net::tls::ServerTlsStream>,
-    state: &ServerState,
-    peer_ip: Option<std::net::IpAddr>,
-) -> std::io::Result<bool> {
-    let req = match read_request(reader) {
-        Ok(r) => r,
-        Err(_) => return Ok(false),
-    };
-
-    let (path, query) = match req.target.find('?') {
-        Some(i) => (&req.target[..i], Some(&req.target[i + 1..])),
-        None => (req.target.as_str(), None),
-    };
-
-    let params = router::query_params(query);
-    let route = router::route(&req.method, path);
-
-    state.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    state
-        .metrics
-        .request_body_bytes_total
-        .fetch_add(req.body.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    state.metrics.record_handler(route.handler);
-
-    let actor = actor_for(&req);
-    if !route_is_unauth_probe(&route)
-        && !state.rate_limiter.allow(peer_ip, actor.as_deref())
-    {
-        state
-            .metrics
-            .requests_rate_limited_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let writer = reader.get_mut();
-        write_response(
-            writer,
-            429,
-            "Too Many Requests",
-            "text/plain",
-            b"rate limited\n",
-        )?;
-        return Ok(true);
-    }
-
-    if !authorize_with_metric(state, &req, &route) {
-        let writer = reader.get_mut();
-        write_response(writer, 401, "Unauthorized", "text/plain", b"unauthorized\n")?;
-        return Ok(false);
-    }
-
-    let (status, reason, body, ctype) =
-        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
-
-    state
-        .metrics
-        .response_bytes_total
-        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
-
-    let keep_alive = !req.client_wants_close;
-    let writer = reader.get_mut();
-    write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
-    Ok(keep_alive)
-}
-
 /// Authorize a request. Resolution order:
 ///
 /// 1. `auth_acl` set → must present a bearer token matching at least
@@ -973,16 +869,16 @@ fn serve_one_tls(
 /// 2. `auth_token` set → must present that exact token; full rw on every
 ///    route (legacy single-token mode).
 /// 3. Neither set → open server. Reads and writes accepted.
-fn authorize(state: &ServerState, req: &Request, route: &router::RouteMatch) -> bool {
+fn authorize(
+    state: &ServerState,
+    auth_header: Option<&str>,
+    route: &router::RouteMatch,
+) -> bool {
     if route_is_unauth_probe(route) {
         return true;
     }
     if let Some(acl) = &state.auth_acl {
-        let Some(token) = req
-            .auth_header
-            .as_deref()
-            .and_then(|h| h.strip_prefix("Bearer "))
-        else {
+        let Some(token) = auth_header.and_then(|h| h.strip_prefix("Bearer ")) else {
             return false;
         };
         let needs_write = route_needs_write(route);
@@ -1008,7 +904,7 @@ fn authorize(state: &ServerState, req: &Request, route: &router::RouteMatch) -> 
     }
 
     if let Some(ref token) = state.auth_token {
-        return check_auth(req, token);
+        return check_auth(auth_header, token);
     }
 
     true
@@ -1058,8 +954,8 @@ fn wire_repo_name(route: &router::RouteMatch) -> Option<&str> {
 /// — explicitly *not* a short-circuit `==` — so a timing oracle cannot leak
 /// the token byte-by-byte. We compare lengths into the same accumulator so
 /// even a wrong-length input still costs the full XOR pass.
-fn check_auth(req: &Request, expected_token: &str) -> bool {
-    match &req.auth_header {
+fn check_auth(auth_header: Option<&str>, expected_token: &str) -> bool {
+    match auth_header {
         Some(val) => {
             // Expect "Bearer <token>"
             if let Some(token) = val.strip_prefix("Bearer ") {
@@ -1128,7 +1024,14 @@ fn dispatch(
         Handler::Readyz => readyz_handler(state),
         Handler::Metrics => metrics_handler(state),
         Handler::AdminShutdown => admin_shutdown_handler(state),
-        Handler::StaticFile => static_file(state, params),
+        // StaticFile pulls `path` out of `route.params` — the router
+        // built it from the URL when nothing else matched. We had been
+        // passing query params here, which yielded raw_path="" → an
+        // unconditional 200 for any otherwise-unrouted method+path
+        // combination. The hand-rolled sync parser hid this by
+        // rejecting smuggling attempts before dispatch; hyper accepts
+        // them and reveals the bug.
+        Handler::StaticFile => static_file(state, &route.params),
         Handler::NotFound => (
             404,
             "Not Found".into(),
@@ -1136,142 +1039,6 @@ fn dispatch(
             "text/plain".into(),
         ),
     }
-}
-
-fn write_response(
-    w: &mut impl Write,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    write_response_keepalive(w, status, reason, content_type, body, false)
-}
-
-/// Like `write_response` but lets the caller mark the connection as
-/// reusable. We always emit an explicit `Connection:` header so the
-/// client doesn't have to guess against HTTP/1.1 defaults.
-fn write_response_keepalive(
-    w: &mut impl Write,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &[u8],
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let mut out = Vec::with_capacity(256 + body.len());
-    out.extend_from_slice(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes());
-    if keep_alive {
-        out.extend_from_slice(b"Connection: keep-alive\r\n");
-    } else {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
-    out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
-    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
-    w.write_all(&out)?;
-    w.flush()
-}
-
-fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
-    let mut header_buf = Vec::with_capacity(4096);
-    loop {
-        let n_before = header_buf.len();
-        let n = reader.read_until(b'\n', &mut header_buf)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "eof in request",
-            ));
-        }
-        if header_buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if header_buf.len() == n_before {
-            return Err(std::io::Error::other("no progress"));
-        }
-        if header_buf.len() > 64 * 1024 {
-            return Err(std::io::Error::other("headers too large"));
-        }
-    }
-    let header_str =
-        std::str::from_utf8(&header_buf).map_err(|_| std::io::Error::other("non-utf8 headers"))?;
-    let mut lines = header_str.split("\r\n");
-    let req_line = lines
-        .next()
-        .ok_or_else(|| std::io::Error::other("no request line"))?;
-    let mut parts = req_line.splitn(3, ' ');
-    let method = parts
-        .next()
-        .ok_or_else(|| std::io::Error::other("bad request line"))?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or_else(|| std::io::Error::other("bad request line"))?
-        .to_string();
-
-    let mut content_length: Option<usize> = None;
-    let mut auth_header: Option<String> = None;
-    let mut client_wants_close = false;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let k_trim = k.trim();
-        let v_trim = v.trim();
-        if k_trim.eq_ignore_ascii_case("content-length") {
-            // Reject malformed lengths instead of silently falling
-            // back to 0 — on a keep-alive connection a "0-length"
-            // request with a body fed in afterwards would let the
-            // body bytes be parsed as the *next* request, the
-            // classic CL-smuggling pattern. A duplicate header is
-            // also a smuggling signal per RFC 7230 §3.3.2.
-            if content_length.is_some() {
-                return Err(std::io::Error::other("duplicate Content-Length header"));
-            }
-            let parsed: usize = v_trim
-                .parse()
-                .map_err(|_| std::io::Error::other(format!("bad Content-Length: {v_trim:?}")))?;
-            content_length = Some(parsed);
-        } else if k_trim.eq_ignore_ascii_case("transfer-encoding") {
-            // We don't implement chunked request decoding. Refuse so a
-            // client can't smuggle bytes past the body cap by sending
-            // them as a chunked stream we'd otherwise leave unread.
-            return Err(std::io::Error::other(
-                "Transfer-Encoding header not supported by server",
-            ));
-        } else if k_trim.eq_ignore_ascii_case("authorization") {
-            auth_header = Some(v_trim.to_string());
-        } else if k_trim.eq_ignore_ascii_case("connection")
-            && v_trim
-                .split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("close"))
-        {
-            client_wants_close = true;
-        }
-    }
-    let content_length = content_length.unwrap_or(0);
-    if content_length > MAX_BODY_BYTES {
-        return Err(std::io::Error::other(format!(
-            "request body too large: {content_length} bytes (max {MAX_BODY_BYTES})"
-        )));
-    }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
-    Ok(Request {
-        method,
-        target,
-        body,
-        auth_header,
-        client_wants_close,
-    })
 }
 
 // ---------- Operator handlers: health / readiness / metrics / shutdown ----------
@@ -2129,9 +1896,39 @@ fn static_file(state: &ServerState, params: &[(String, String)]) -> (u16, String
     }
 
     let rel = raw_path.trim_start_matches('/');
-    let file_path = state.webroot.join(rel);
 
-    if file_path.starts_with(&state.webroot)
+    // Path-traversal defense. We canonicalize webroot once at startup
+    // (well — once per request; not on the hot path), then build the
+    // request's target and require it to resolve to something whose
+    // canonical form *also* starts with webroot's canonical form.
+    // The pre-async code did a lexical starts_with() on un-canonicalized
+    // paths, which let `..` through (webroot/../secret.txt lexically
+    // starts with webroot but resolves outside it).
+    //
+    // Stronger: refuse any path segment of "..", "." or with a NUL
+    // before even touching the filesystem. The combined check survives
+    // %-encoded vectors too because the URL parser already decoded
+    // them by the time we see `rel`.
+    for seg in rel.split('/') {
+        if seg == ".." || seg == "." || seg.contains('\0') {
+            return (
+                404,
+                "Not Found".into(),
+                b"not found".to_vec(),
+                "text/plain".into(),
+            );
+        }
+    }
+
+    let file_path = state.webroot.join(rel);
+    let webroot_canon = state.webroot.canonicalize().ok();
+    let file_canon = file_path.canonicalize().ok();
+    let in_webroot = match (webroot_canon.as_ref(), file_canon.as_ref()) {
+        (Some(w), Some(f)) => f.starts_with(w),
+        _ => false,
+    };
+
+    if in_webroot
         && file_path.exists()
         && file_path.is_file()
         && let Ok(data) = std::fs::read(&file_path)

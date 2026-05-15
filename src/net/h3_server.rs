@@ -182,7 +182,7 @@ async fn handle_h3_request(
             &st_blocking,
             &method,
             &target,
-            body_buf,
+            &body_buf,
             auth_clone.as_deref(),
             Some(peer_ip),
         )

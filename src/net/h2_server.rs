@@ -156,7 +156,7 @@ async fn handle_request(
             &st_blocking,
             &method,
             &target,
-            body_bytes,
+            &body_bytes,
             auth_clone.as_deref(),
             Some(peer_ip),
         )
