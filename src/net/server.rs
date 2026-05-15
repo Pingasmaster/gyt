@@ -578,9 +578,54 @@ async fn serve_conn_tls(
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(30))
         .max_buf_size(64 * 1024);
+    configure_h2(builder.http2());
     if let Err(e) = builder.serve_connection(io, service).await {
         let _ = e;
     }
+}
+
+/// Shared HTTP/2 SETTINGS tuning for both the main TLS listener and
+/// the dedicated --listen-h2 listener.
+///
+/// hyper's defaults are conservative — designed for a generic web
+/// server returning small responses. Our workload is **big pack
+/// files**: an `objects/want` response can be hundreds of MiB on one
+/// stream. The relevant settings:
+///
+/// - `initial_stream_window_size = 4 MiB`. Default 64 KiB means the
+///   server must wait for a WINDOW_UPDATE every 64 KiB sent. On a
+///   100 ms RTT link, a 100 MiB body takes 160 s of pure RTT latency
+///   added to the actual transfer. 4 MiB makes that 2.5 s. Cap is
+///   2 GiB (2^31 − 1) but 4 MiB is a reasonable balance vs. per-
+///   stream memory (one allocation per active stream).
+/// - `initial_connection_window_size = 16 MiB`. Connection-level
+///   flow control is separate; same problem at the connection scope.
+///   16 MiB is the practical max ("near-max" — 2 GiB is technically
+///   allowed but pointless for our workload).
+/// - `max_frame_size = 256 KiB`. Default 16 KiB; each frame has a
+///   9-byte header so larger frames reduce overhead and syscalls.
+///   256 KiB matches the typical TCP-segment-aggregation sweet spot.
+/// - `max_concurrent_streams = 200`. Default 100; we don't gain by
+///   going much higher because each stream still spawn_blocking's
+///   into the same sync handler pool. 200 absorbs the occasional
+///   burst from a parallel-clone client.
+/// - `keep_alive_interval = 30s` + `keep_alive_timeout = 20s`.
+///   Sends PING frames on idle to detect dead peers before the
+///   client's next stream hits a stale connection. Matches the
+///   gRPC server defaults — the most-deployed h2 server pattern.
+/// - Explicit `enable_connect_protocol` — future-proofs against
+///   CONNECT-method clients (h2 RFC 8441). Cheap to set.
+pub(crate) fn configure_h2(
+    mut b: hyper_util::server::conn::auto::Http2Builder<'_, hyper_util::rt::TokioExecutor>,
+) {
+    b.timer(hyper_util::rt::TokioTimer::new())
+        .initial_stream_window_size(4 * 1024 * 1024)
+        .initial_connection_window_size(16 * 1024 * 1024)
+        .max_frame_size(256 * 1024)
+        .max_concurrent_streams(200)
+        .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .enable_connect_protocol();
 }
 
 /// Per-request async handler shared by every protocol path on the

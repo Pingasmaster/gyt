@@ -97,7 +97,12 @@ pub(crate) fn run_h2(
                     let st = st.clone();
                     async move { handle_request(req, st, peer.ip()).await }
                 });
-                let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                // Same h2 tuning as the main listener (see
+                // server::configure_h2 docstring). Without this hyper
+                // ships 64 KiB stream windows that throttle our pack
+                // responses to one WINDOW_UPDATE per 64 KiB.
+                crate::net::server::configure_h2(builder.http2());
                 if let Err(e) = builder.serve_connection(io, service).await {
                     // Connection-level errors (client reset, slow loris timeout)
                     // are not actionable — log and move on.
