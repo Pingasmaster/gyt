@@ -174,6 +174,29 @@ impl HttpClient {
         extra_headers: &[(&str, &str)],
     ) -> Result<HttpResponse> {
         let target = self.build_target(path_suffix);
+
+        // HTTPS path: route through the hyper-based async engine so
+        // we get HTTP/2 when the server speaks it (ALPN-negotiated).
+        // The sync HTTP/1.1 keep-alive pool below stays the
+        // canonical path for plain HTTP — its byte-exact wire
+        // behaviour is what the data_integrity smuggling tests pin.
+        if self.scheme == Scheme::Https {
+            let mut combined_headers: Vec<(&str, &str)> =
+                Vec::with_capacity(extra_headers.len() + 1);
+            if let Some(auth) = self.auth.as_deref() {
+                combined_headers.push(("authorization", auth));
+            }
+            combined_headers.extend_from_slice(extra_headers);
+            return crate::net::https_engine::send(
+                &self.host,
+                self.port,
+                method,
+                &target,
+                body,
+                &combined_headers,
+            );
+        }
+
         let request_bytes = self.build_request(method, &target, body, extra_headers);
 
         // Try a recycled connection. The ONLY transparent retry case is
