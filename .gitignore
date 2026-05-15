@@ -6,3 +6,6 @@ target/
 # gyt's own metadata when running gyt on its own source tree
 .gyt/
 .gyt-ci-output/
+
+# Claude Code worktrees (sub-agents create these; not part of the repo)
+.claude/
