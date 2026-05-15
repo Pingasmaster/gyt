@@ -38,7 +38,13 @@ fn client_config() -> Arc<ClientConfig> {
         .get_or_init(|| {
             ensure_provider_installed();
             let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-            let cfg = ClientConfig::builder()
+            // TLS 1.3 only. TLS 1.2 has weaker forward secrecy guarantees
+            // (server-side ticket key rotation is operator-dependent and
+            // historically mishandled), exposes the legacy renegotiation
+            // surface, and offers no functionality we use. Refusing 1.2
+            // on the client guarantees we never downgrade silently — a
+            // misconfigured peer fails fast at handshake.
+            let cfg = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             Arc::new(cfg)
@@ -141,23 +147,26 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
         .ok_or_else(|| GytError::Net(format!("no private key found in {}", key_path.display())))?
         .map_err(|e| GytError::Net(format!("key parse error: {e}")))?;
 
-    let mut config = ServerConfig::builder()
+    // TLS 1.3 only on the server side as well. See the matching
+    // comment in `client_config` for the rationale.
+    let mut config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| GytError::Net(format!("server config error: {e}")))?;
 
-    // Enable TLS 1.2 session-ID resumption + TLS 1.3 session-ticket
-    // resumption. A repeat clone from the same client skips the full
-    // certificate exchange and asymmetric handshake — ~10× setup-cost
-    // reduction on TLS-heavy workloads. The cache is per-server-process
-    // in-memory; a server cluster needs sticky load-balancing for
-    // resumption to fire, which is the normal deployment shape.
+    // TLS 1.3 ticket-based session resumption. A repeat clone from the
+    // same client skips the full certificate exchange and asymmetric
+    // handshake — ~10× setup-cost reduction on TLS-heavy workloads.
+    // Tickets are encrypted by a server-held key, so resumption works
+    // without server-side state on the cache; the in-memory cache below
+    // is kept anyway because rustls reuses it for the TLS 1.3 ticket
+    // record bookkeeping. A server cluster needs sticky load-balancing
+    // for resumption to fire across nodes, which is the normal
+    // deployment shape.
     //
     // 4096 entries × ~256 bytes ≈ 1 MiB — negligible vs. one full
     // handshake's CPU cost.
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_ENTRIES);
-    // Also enable TLS 1.3 ticketing so resumption works without
-    // server-side state for clients that prefer 1.3.
     config.ticketer = rustls::crypto::ring::Ticketer::new()
         .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?;
 
@@ -213,6 +222,7 @@ mod tests {
     fn session_cache_size_is_at_documented_value() {
         assert_eq!(SESSION_CACHE_ENTRIES, 4096);
     }
+
 
     #[cfg(unix)]
     #[test]

@@ -16,7 +16,7 @@ gyt (pronounced "gift" but with a 'g') is a modern version control system design
 - **Signing**: ed25519-dalek cryptographically signed commits. The server enforces signatures when its repo config has `sign_required = true` — every commit hitting `POST /refs/update` is verified against `<repo>.gyt/allowed_signers`.
 - **Merge**: Real three-way merge (file-level Myers + tree-level reconciliation) in `src/merge3.rs`. Used by `merge`, `cherry-pick`, and `rebase`. Conflicts produce standard `<<<<<<<` / `=======` / `>>>>>>>` markers and leave `.gyt/MERGE_HEAD` (or `CHERRY_PICK_HEAD`, `REBASE_HEAD`).
 - **Reflog**: Every HEAD/branch movement records an entry under `<gyt>/logs/<refname>`; `gyt reflog` reads it back.
-- **CI**: Built-in `gyt ci` command with WASM sandbox or shell fallback. Docker mode (`--docker`) runs with `--network none --cap-drop ALL --read-only` and feeds secrets via a private `--env-file` so they don't leak via `docker inspect`.
+- **CI**: Built-in `gyt ci` command. **WASM is the only supported runtime** — shell scripts and `--docker` were deliberately removed because neither can be confined to a useful sandbox on a multi-tenant host (`.sh` files in `.gyt-ci/` are warned about and skipped; `--docker` is rejected with a migration error). The wasmtime sandbox in `src/ci_wasm.rs` runs with an operator-controlled `CiPolicy` set by CLI flags only — a `.gyt-ci/` script (which lives inside the cloned repo) cannot widen the sandbox by any in-tree declaration. See `CLAUDE.md` for the full policy, caps, and flag set.
 
 ## Testing
 
@@ -77,5 +77,5 @@ Webhooks / push notifications / CI triggers on push are **never** to be implemen
 
 - Encrypted secrets: `.gyt/secrets/<name>` — AES-256-GCM, key at `~/.config/gyt/ci-key`
 - Env vars: `.gyt/ci-env.toml` — plaintext, checkable
-- Both injected as real env vars to shell CI scripts; secrets masked in output
+- Stored on disk under `.gyt/` only. WASM scripts must read them as files via the `read_file` hostcall — there is no env (`getenv`) hostcall linked into the sandbox, so secrets can never be injected as environment variables.
 - CLI: `gyt ci secret {init|set|list|remove}`, `gyt ci env {set|list|remove}`

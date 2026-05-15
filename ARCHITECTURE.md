@@ -33,6 +33,7 @@ gyt/
 │   │   ├── log.rs           # Walk commit history
 │   │   ├── show.rs          # Display commit/object
 │   │   ├── diff.rs          # Myers diff CLI wrapper
+│   │   ├── blame.rs         # Line-by-line authorship
 │   │   ├── branch.rs        # Branch management
 │   │   ├── switch.rs        # Change HEAD to another branch
 │   │   ├── restore.rs       # Restore files from index
@@ -53,16 +54,18 @@ gyt/
 │   │   ├── grep_cmd.rs      # Pattern search
 │   │   ├── gc.rs            # Garbage collect unreachable objects
 │   │   ├── config_cmd.rs    # Read/list repository config
-│   │   ├── serve.rs         # HTTP server
-│   │   ├── ci.rs            # Built-in CI runner (gyt ci)
+│   │   ├── serve.rs         # HTTP server CLI / flag parser
+│   │   ├── ci.rs            # Built-in CI runner (WASM-only; policy flag parsing)
 │   │   ├── ci_env.rs        # CI env-var store (.gyt/ci-env.toml)
 │   │   ├── ci_secret.rs     # Encrypted CI secret store (AES-256-GCM)
+│   │   ├── issue.rs         # `gyt issue` and `gyt discussion` (refs/issues/<N>)
+│   │   ├── pr.rs            # `gyt pr` — pull requests (refs/prs/<N>)
 │   │   ├── keygen.rs        # ed25519 keypair generation
 │   │   ├── signing.rs       # Commit-signing helpers
 │   │   ├── verify.rs        # Signature verification
 │   │   ├── util.rs          # Shared utilities
-│   │   ├── test_support.rs  # Test helpers
-│   │   └── getthefuckoutofmyrepo.rs  # Safety utility
+│   │   ├── test_support.rs  # Test helpers (`#[cfg(test)]`)
+│   │   └── getthefuckoutofmyrepo.rs  # Permanent history rewrite
 │   ├── net/                 # Networking
 │   │   ├── mod.rs           # Re-exports
 │   │   ├── http.rs          # HTTP/1.1 client (hand-rolled)
@@ -82,49 +85,49 @@ gyt/
 │   │   ├── tag.rs           # Tag codec
 │   │   └── store.rs         # Loose object storage
 │   ├── compress.rs          # Object on-disk wrapping with XZ/LZMA (raw passthrough fallback for unwrapped files)
-│   ├── ci_wasm.rs           # wasmtime sandbox for WASM CI workflows
+│   ├── ci_wasm.rs           # wasmtime sandbox + CiPolicy for WASM CI workflows
 │   ├── fuzz.rs              # Fuzzing harnesses
 │   ├── config.rs            # .gyt/config parser
 │   ├── diff.rs              # Myers diff algorithm
 │   ├── ignore.rs            # .gytignore matching
 │   ├── index.rs             # GYTI index format
+│   ├── issues.rs            # Canonical TOML codec for issues/discussions (shared with PRs)
+│   ├── prs.rs               # PR-specific decode (state, source_ref, target_ref, ci_run/merge events)
 │   ├── refs.rs              # Ref read/write/resolve
-│   ├── repo.rs              # Repository opener
+│   ├── repo.rs              # Repository opener / locking
 │   ├── workdir.rs           # Working tree operations
 │   ├── errors.rs            # Unified error types
 │   ├── hash.rs              # BLAKE3 hashing
-│   ├── fs_util.rs           # Filesystem utilities
+│   ├── fs_util.rs           # Filesystem utilities (atomic_write, dir fsync)
 │   └── term.rs              # Terminal color helpers
 ├── tests/
 │   ├── smoke_comprehensive.sh  # End-to-end smoke test
-│   ├── e2e.rs                  # End-to-end CLI tests (200+ scenarios)
+│   ├── e2e.rs                  # End-to-end CLI tests
 │   ├── wire_integration.rs     # Wire-protocol integration tests
-│   └── data_integrity.rs       # Corruption / data-loss invariants (60 tests)
+│   ├── internals.rs            # Internal-state assertions
+│   ├── data_integrity.rs       # Corruption / data-loss invariants (145 tests; 4 marked #[ignore] soak)
+│   ├── gc_race.rs              # gc vs. push race; issue/PR reachability
+│   ├── issues.rs               # In-repo issues / discussions
+│   ├── prs.rs                  # In-repo pull requests + ci_run ACL gate
+│   ├── ci_wasm_sandbox.rs      # wasmtime sandbox enforcement
+│   ├── ci_wasm_policy.rs       # CiPolicy field-by-field coverage
+│   └── server_hardening.rs     # Pool exhaustion, panic isolation, request caps
 ├── Cargo.toml               # Dependencies + clippy config
 ├── check.sh                 # Full CI pipeline
 └── rust-toolchain.toml      # Rust edition/year pinning
 ```
 
-## Development phases
+## Recent additions
 
-The project was built incrementally across multiple phases:
+Use `git log` for the authoritative timeline. The list below captures the load-bearing additions beyond the original bootstrap (objects → refs → workdir → core commands → branch ops → stash/worktree → HTTP client + wire → network commands → smoke test → server + merge engine):
 
-| Phase | Scope | Description |
-|-------|-------|-------------|
-| **1** | Bootstrap | Project skeleton, object store, BLAKE3 hashing |
-| **2** | Objects | Blob/tree/commit/tag codecs, object store |
-| **3a** | Index + Refs | GYTI index format, ref read/write/resolve |
-| **3b** | .gytignore | Ignore file parser and matcher |
-| **3c** | Workdir | File walking, blob hashing, conflict detection |
-| **4a** | Core commands | init, add, commit, status, log, show, diff |
-| **4b** | Branch ops | branch, switch, restore, reset, tag |
-| **4c** | Stash + worktree | Stash pop/list/push/drop, secondary worktrees |
-| **5** | (skipped) | — |
-| **6a** | HTTP client | Hand-rolled HTTP/1.1 client, rustls TLS, wire protocol |
-| **6b** | Network commands | clone, fetch, pull, push |
-| **7** | Smoke test | End-to-end integration test script |
-| **8** | Server + merge | HTTP server (serve), merge --ff-only, cherry-pick, rebase, grep |
-| **8+** | Refinements | serve.rs refactor, test isolation, compress API, let_chains cleanup |
+- **WASM-only CI sandbox** — `src/ci_wasm.rs` + `src/cmd/ci.rs`. Operator-controlled `CiPolicy` set by CLI flags only; defaults are conservative (`repo_read` minus `.gyt/*`, `output_write` only, no network/subprocess/env). Default caps: 8 GiB memory, 1×10¹¹ wasm fuel, 4 h wall-time, 1 GiB per file, 256 MiB cumulative log, 8 MiB wasm stack. `--docker` and `.sh` execution were deliberately removed.
+- **In-repo issues, discussions, and pull requests** — `src/issues.rs`, `src/prs.rs`, `src/cmd/issue.rs`, `src/cmd/pr.rs`. Stored at `refs/issues/<N>` / `refs/prs/<N>`, shared counter at `<gyt>/meta/issues_next`, whitelist-pushed by `cmd::clone::is_user_visible_ref`.
+- **Server worker pool & non-blocking accept** — `src/net/server.rs` enforces `MAX_WORKERS = 256` with `try_acquire`-based admission and a `503 Service Unavailable` + `Retry-After: 1` response when the pool is exhausted. `MAX_REQUESTS_PER_CONN = 256` caps a single keep-alive client. Worker panics are caught with `catch_unwind` so the shared shutdown mutex can't be poisoned.
+- **TLS 1.3 only + session resumption** — `src/net/tls.rs` pins client and server to `&[&rustls::version::TLS13]` and the `tls12` rustls feature is off in `Cargo.toml`, so the binary cannot speak TLS 1.2 at all. `Ticketer::new` enables TLS 1.3 ticket resumption with an in-memory cache of `SESSION_CACHE_ENTRIES = 4096`.
+- **Push/GC race closure** — `<gyt>/objects.lock` is taken by `wire_objects_have` for the duration of its loose-object writes and by `gyt gc`'s prune phase (acquired after the reachability walk). A 60 s `GC_GRACE_SECS` mtime grace protects loose objects written by older clients. `compute_reachable` seeds `refs/issues/*` and `refs/prs/*`.
+- **Server-side trust hardening** — `--auth-tokens <file>` TSV ACL (per-repo `rw`/`ro` patterns), `--signers <file>` (shared `allowed_signers` overriding per-repo), `--policy-config <file>` (server-side override for `[commit].sign_required`). All three close the "pusher edits their own trust config" loophole.
+- **URL-embedded bearer tokens** — `https://<token>@host/repo` is parsed by `src/net/http.rs` into an `Authorization: Bearer <token>` header so real ACL flows work on the wire.
 
 ## Object format
 
@@ -188,6 +191,23 @@ The protocol codec (`net/protocol.rs`) handles encoding/decoding of all wire for
 
 Packfiles (the body of `objects/want` responses and `objects/have` uploads) carry a 1-byte version prefix: `0x01` = uncompressed inner stream, `0x02` = XZ-compressed inner stream. See `src/net/protocol.rs`. XZ is the only compression used by gyt — both for on-disk loose objects and for wire-protocol packfiles — provided by the `lzma-rust2` crate.
 
+### Server hardening
+
+`src/net/server.rs` enforces:
+
+- `MAX_BODY_BYTES = 256 MiB` — request body cap, refused before allocation.
+- `MAX_WORKERS = 256` — concurrent connections. Permits are acquired with `try_acquire`; if the pool is full the listener sends `POOL_FULL_RESPONSE` (`HTTP/1.1 503 Service Unavailable` with `Retry-After: 1` and `Connection: close`) and drops the socket rather than wedging the accept loop on a `Condvar`.
+- `MAX_REQUESTS_PER_CONN = 256` — keep-alive cap; closes the connection after this many requests so a single client can't pin a worker forever.
+- 30 s read+write timeouts per connection.
+- Every worker runs inside `catch_unwind(AssertUnwindSafe(...))` so a panicked handler can't poison the shared `state.shutdown` mutex.
+- `--signers <file>` and `--policy-config <file>` are validated at startup: if they were specified but the file doesn't exist, the server refuses to start rather than silently falling back to per-repo trust.
+
+### TLS 1.3 only + session resumption
+
+`src/net/tls.rs` configures both the client and the server with `builder_with_protocol_versions(&[&rustls::version::TLS13])`. The rustls `tls12` cargo feature is also off in `Cargo.toml`, so TLS 1.2 isn't even linked into the binary — a malicious peer cannot negotiate a downgrade, and an operator cannot accidentally re-enable 1.2 through configuration. A misconfigured peer fails fast at the ClientHello/ServerHello stage with a protocol-version alert.
+
+TLS 1.3 ticket-based session resumption is enabled (`Ticketer::new`). `SESSION_CACHE_ENTRIES = 4096` keeps the in-memory cache rustls uses for ticket bookkeeping. Resumption skips the full certificate exchange and asymmetric handshake on repeat clones from the same client; a server cluster needs sticky load-balancing for resumption to fire across nodes.
+
 ## Error model
 
 All functions return `Result<T, GytError>` where `GytError` is an enum with variants:
@@ -207,7 +227,11 @@ All functions return `Result<T, GytError>` where `GytError` is an enum with vari
 - **Integration tests**: `net/transport_tests.rs` spins up a server stub, tests HTTP client against it
 - **Smoke tests**: `tests/smoke_comprehensive.sh` runs the full build and basic CLI commands
 - **End-to-end CLI**: `tests/e2e.rs` drives the real binary as a subprocess
-- **Data-integrity / corruption**: `tests/data_integrity.rs` — 60 subprocess-driven tests asserting no-loss/no-corruption invariants on bit flips, truncation, concurrent writes, smuggling attempts, lock semantics, push/clone round trips, packs, and signing. 2 soak tests run with `--ignored`.
+- **Data-integrity / corruption**: `tests/data_integrity.rs` — 145 subprocess-driven tests asserting no-loss/no-corruption invariants on bit flips, truncation, concurrent writes, smuggling attempts, lock semantics, push/clone round trips, packs, and signing. Of those 145, 141 run by default; 4 long-running soak tests are marked `#[ignore]` and opt in via `--ignored`.
+- **In-repo issues / PRs**: `tests/issues.rs` (17 tests) and `tests/prs.rs` (13 tests, including `pr_ro_client_blocked_from_pushing_ci_run_event`) — number allocation, transport whitelist, state transitions, ACL gate on `ci_run` event publication.
+- **CI sandbox**: `tests/ci_wasm_sandbox.rs` (12 tests) pins wasmtime engine config and hostcall surface; `tests/ci_wasm_policy.rs` (9 tests) exercises every `CiPolicy` field including the `.gyt/*` exclusion.
+- **GC race**: `tests/gc_race.rs` covers the `objects.lock` + grace-window invariants and the issue/PR reachability seeds.
+- **Server hardening**: `tests/server_hardening.rs` covers pool exhaustion (503 + `Retry-After`), per-connection request cap, and panic isolation.
 - **Test harness**: Shared `test_support` module provides `init::init_at(&dir)`, `test_repo()`, and a global file lock for parallel test safety
 
 ## Canonical-encoding gate on the wire
