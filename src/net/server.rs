@@ -682,10 +682,19 @@ async fn handle_async_request(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let body_bytes = {
+    // Read the request body straight into a `Bytes`. The previous
+    // shape did `.to_bytes().to_vec()` which allocated a full
+    // body-sized Vec and copied — for a 256 MiB push that's an
+    // unnecessary 256 MiB alloc + memcpy on every request.
+    //
+    // `Bytes` is Send+Sync (atomic refcounted), derefs to `[u8]`,
+    // and moves cheaply across the spawn_blocking boundary.
+    // dispatch_request already takes `&[u8]`; we just pass
+    // `&body_bytes` and let Bytes::deref handle the slice view.
+    let body_bytes: bytes::Bytes = {
         let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
         match limited.collect().await {
-            Ok(c) => c.to_bytes().to_vec(),
+            Ok(c) => c.to_bytes(),
             Err(e) => {
                 let mut resp = build_response(
                     413,
