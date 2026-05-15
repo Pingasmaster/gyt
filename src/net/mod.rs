@@ -5,6 +5,7 @@ pub mod api;
 pub mod http;
 pub mod metrics;
 pub mod protocol;
+pub mod rate_limit;
 pub mod refs_policy;
 pub mod router;
 pub mod server;
