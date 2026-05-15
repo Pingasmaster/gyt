@@ -2220,26 +2220,24 @@ fn init_commit_in(e: &Env, dir: &Path, file: &str, body: &[u8], msg: &str) {
 
 #[test]
 fn server_keep_alive_closed_after_400() {
-    // Plan #68. After a 400 the server MUST close the keep-alive
-    // connection (otherwise a subsequent request could be
-    // smuggled). Verify by attempting two pipelined requests and
-    // observing the second is not honoured.
+    // Plan #68. After a smuggling-shape request the server MUST NOT
+    // honour a pipelined follower. The unambiguous smuggling signal
+    // is *differing* Content-Length values (RFC 9112 §6.1 — MUST
+    // reject). Same-value duplicates are RFC-legal (hyper canonicalises
+    // them) and are not what this test pins.
     let mut e = Env::new("ka-after-400");
     let (_url, _repos) = e.start_server(&[]);
     let port = e.server.as_ref().unwrap().1;
-    // Pipeline: malformed request (duplicate CL → 400) followed by
-    // a valid GET. The second must NOT be processed.
-    let pipeline = b"POST /info/refs HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\nGET /info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let pipeline = b"POST /info/refs HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nGET /info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     s.write_all(pipeline).unwrap();
     let mut buf = Vec::new();
     let _ = s.read_to_end(&mut buf);
-    // Expect exactly ONE response, not two.
+    // Expect at most ONE response. Zero (server closes immediately
+    // on the smuggling-shape request) is also acceptable. Two would
+    // mean smuggling succeeded.
     let count = buf.windows(8).filter(|w| w.starts_with(b"HTTP/1.1")).count();
-    // The integrity invariant: at most ONE response. Zero (server
-    // closes immediately on smuggling attempt) is even better.
-    // Two would mean smuggling succeeded.
     assert!(
         count <= 1,
         "second pipelined request was processed (smuggling): {count} responses"
