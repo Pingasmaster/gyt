@@ -186,14 +186,17 @@ async fn handle_request(
     Ok(resp)
 }
 
-async fn buffer_body(body: Incoming) -> std::result::Result<Vec<u8>, String> {
+async fn buffer_body(body: Incoming) -> std::result::Result<Bytes, String> {
     // Limited rejects with an error once total bytes pass the cap.
+    // Return Bytes directly (instead of to_vec'ing it) so the caller
+    // can move the body across spawn_blocking without an extra
+    // body-sized memcpy. Saves up to ~256 MiB per push.
     let limited = Limited::new(body, H2_MAX_BODY_BYTES);
     let collected = limited
         .collect()
         .await
         .map_err(|e| format!("body read: {e}"))?;
-    Ok(collected.to_bytes().to_vec())
+    Ok(collected.to_bytes())
 }
 
 fn build_response(
