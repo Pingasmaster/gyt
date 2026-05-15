@@ -82,6 +82,18 @@ fn configured_ip_limit() -> LimitConfig {
     }
 }
 
+/// Response-cache TTL in milliseconds. Default 2000 (2 s). Setting
+/// to 0 disables the cache entirely (every read endpoint hits its
+/// origin handler). Used by tests that manipulate refs at the FS
+/// layer and need the next /info/refs read to see the change.
+fn configured_response_cache_ttl() -> std::time::Duration {
+    let ms = std::env::var("GYT_SERVE_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2000);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Per-actor (per bearer-token) rate-limit config. Same env-knob
 /// shape as the per-IP version.
 fn configured_actor_limit() -> LimitConfig {
@@ -252,7 +264,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         metrics: Metrics::default(),
         listen_addr: addr,
         rate_limiter: RateLimiter::new(configured_ip_limit(), configured_actor_limit()),
-        response_cache: ResponseCache::new(std::time::Duration::from_secs(2), 10_000),
+        response_cache: ResponseCache::new(configured_response_cache_ttl(), 10_000),
         pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 256),
     });
 

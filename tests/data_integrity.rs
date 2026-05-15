@@ -187,6 +187,7 @@ impl Env {
         // as "push failed". Disable both buckets for tests.
         .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
         .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
+        .env("GYT_SERVE_CACHE_TTL_MS", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
         let mut child = c.spawn().unwrap();
