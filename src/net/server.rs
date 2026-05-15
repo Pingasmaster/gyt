@@ -112,6 +112,16 @@ server pool exhausted\r\n";
 
 pub struct ServeConfig {
     pub listen_addr: String,
+    /// Optional dedicated HTTP/2 listener address. When set, gyt
+    /// brings up a tokio + hyper-based HTTP/2 server in parallel
+    /// with the HTTP/1.1 listener. ALPN advertises both h2 and
+    /// http/1.1 so a single client can pick. Defaults to None —
+    /// HTTP/2 is opt-in because it requires the tokio runtime and
+    /// adds 50+ transitive crates worth of attack surface.
+    pub h2_listen_addr: Option<String>,
+    /// Optional HTTP/3-over-QUIC listener address. UDP-bound. Like
+    /// h2_listen_addr, opt-in because the QUIC stack is large.
+    pub h3_listen_addr: Option<String>,
     pub repos_root: PathBuf,
     pub webroot: PathBuf,
     pub tls_cert: Option<PathBuf>,
@@ -274,6 +284,53 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     // would hit their hard-kill grace.
     install_shutdown_signals(state.clone(), addr);
 
+    // HTTP/2 listener on its own port, if configured. It runs an
+    // independent tokio runtime in a dedicated thread; the shared
+    // ServerState gives it access to the same metrics, ACL,
+    // rate-limiter, and caches as the HTTP/1.1 path.
+    let h2_thread = if let (Some(h2_addr), Some(cert), Some(key)) = (
+        config.h2_listen_addr.clone(),
+        config.tls_cert.clone(),
+        config.tls_key.clone(),
+    ) {
+        let st = state.clone();
+        Some(
+            thread::Builder::new()
+                .name("gyt-h2".into())
+                .spawn(move || {
+                    if let Err(e) = crate::net::h2_server::run_h2(&h2_addr, &cert, &key, st) {
+                        eprintln!("gyt serve: h2 listener exited: {e}");
+                    }
+                })
+                .expect("spawn h2 thread"),
+        )
+    } else {
+        None
+    };
+
+    // HTTP/3 listener (over QUIC) on its own UDP port. Wired in a
+    // follow-up commit; the flag is plumbed through so the CLI
+    // surface lands first.
+    let h3_thread = if let (Some(h3_addr), Some(cert), Some(key)) = (
+        config.h3_listen_addr.clone(),
+        config.tls_cert.clone(),
+        config.tls_key.clone(),
+    ) {
+        let st = state.clone();
+        Some(
+            thread::Builder::new()
+                .name("gyt-h3".into())
+                .spawn(move || {
+                    if let Err(e) = crate::net::h3_server::run_h3(&h3_addr, &cert, &key, st) {
+                        eprintln!("gyt serve: h3 listener exited: {e}");
+                    }
+                })
+                .expect("spawn h3 thread"),
+        )
+    } else {
+        None
+    };
+
     for stream in listener.incoming() {
         if *state.shutdown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             break;
@@ -304,6 +361,16 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     // after finishing its current job. We block until they all join so
     // the process actually drains before main() returns.
     drop(pool);
+
+    // Wait for the h2/h3 listeners (if any) to drain. They poll the
+    // same shutdown flag we just observed, so they'll exit shortly.
+    if let Some(h) = h2_thread {
+        let _ = h.join();
+    }
+    if let Some(h) = h3_thread {
+        let _ = h.join();
+    }
+
     // Hold the serve lock until after the workers have drained so a
     // restart can't race in mid-shutdown.
     drop(serve_lock);
@@ -472,8 +539,8 @@ fn install_shutdown_signals(state: Arc<ServerState>, listen_addr: std::net::Sock
     });
 }
 
-struct ServerState {
-    repos_root: PathBuf,
+pub(crate) struct ServerState {
+    pub(crate) repos_root: PathBuf,
     webroot: PathBuf,
     auth_token: Option<String>,
     /// Parsed ACL entries. None means no per-repo ACL configured (fall
@@ -484,7 +551,7 @@ struct ServerState {
     auth_acl: Option<Vec<AclEntry>>,
     signers_file: Option<PathBuf>,
     policy_config: Option<PathBuf>,
-    shutdown: Mutex<bool>,
+    pub(crate) shutdown: Mutex<bool>,
     metrics: Metrics,
     /// Bound local address. Stored so the admin-shutdown handler can
     /// self-connect to unblock accept() — the signal handler does the
@@ -690,6 +757,84 @@ fn serve_one<R: BufRead, W: Write>(
     let keep_alive = !req.client_wants_close;
     write_response_keepalive(writer, status, &reason, &ctype, &body, keep_alive)?;
     Ok(keep_alive)
+}
+
+/// Protocol-agnostic request handler. Takes the already-parsed
+/// request fields and the peer's IP (when known) and returns the
+/// response tuple. This is the shared entry point: the HTTP/1.1 sync
+/// path here, the HTTP/2 async path (`h2_server.rs`), and the HTTP/3
+/// async path (`h3_server.rs`) all funnel through it so they share
+/// metrics, rate limiting, auth, and caching.
+///
+/// Returns `(status, reason, body, content_type, rate_limited)` —
+/// the `rate_limited` flag lets the caller know whether to keep the
+/// connection alive (we deliberately keep it alive for 429 so a
+/// reasonable client can retry on the same connection).
+pub(crate) fn dispatch_request(
+    state: &ServerState,
+    method: &str,
+    target: &str,
+    body: Vec<u8>,
+    auth_header: Option<&str>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> (u16, String, Vec<u8>, String) {
+    let (path, query) = match target.find('?') {
+        Some(i) => (&target[..i], Some(&target[i + 1..])),
+        None => (target, None),
+    };
+
+    let params = router::query_params(query);
+    let route = router::route(method, path);
+
+    state.metrics.requests_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state
+        .metrics
+        .request_body_bytes_total
+        .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    state.metrics.record_handler(route.handler);
+
+    let req = Request {
+        method: method.to_string(),
+        target: target.to_string(),
+        body,
+        auth_header: auth_header.map(str::to_string),
+        client_wants_close: false,
+    };
+    let actor = actor_for(&req);
+
+    if !route_is_unauth_probe(&route)
+        && !state.rate_limiter.allow(peer_ip, actor.as_deref())
+    {
+        state
+            .metrics
+            .requests_rate_limited_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return (
+            429,
+            "Too Many Requests".into(),
+            b"rate limited\n".to_vec(),
+            "text/plain".into(),
+        );
+    }
+
+    if !authorize_with_metric(state, &req, &route) {
+        return (
+            401,
+            "Unauthorized".into(),
+            b"unauthorized\n".to_vec(),
+            "text/plain".into(),
+        );
+    }
+
+    let (status, reason, resp_body, ctype) =
+        dispatch(&route, &params, query, &req.body, state, actor.as_deref());
+
+    state
+        .metrics
+        .response_bytes_total
+        .fetch_add(resp_body.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    (status, reason, resp_body, ctype)
 }
 
 /// Wrapper around `authorize` that bumps the unauthorized counter on
