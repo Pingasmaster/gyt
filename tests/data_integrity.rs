@@ -181,6 +181,12 @@ impl Env {
             &webroot.to_string_lossy(),
         ])
         .args(extra_args)
+        // Burst-tests drive hundreds of requests from 127.0.0.1; the
+        // production rate-limit defaults (60 req/IP, 10 rps refill)
+        // would throttle them and produce 429s the test code reads
+        // as "push failed". Disable both buckets for tests.
+        .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
+        .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
         let mut child = c.spawn().unwrap();
