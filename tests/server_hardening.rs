@@ -299,6 +299,72 @@ fn server_survives_burst_of_malformed_requests() {
     let _ = srv.wait();
 }
 
+/// Under heavy concurrency the accept loop must never block on the
+/// worker pool. Old behaviour (blocking Condvar): the accept thread
+/// stops draining the listener, the kernel backlog fills, the LB
+/// marks us dead. New behaviour: full pool → immediate 503 with
+/// Retry-After, connection drains. We verify by hammering with 400
+/// concurrent connections and confirming every one terminates with
+/// an HTTP response (200 / 4xx / 503), never a bare TCP reset that
+/// would surface as an empty buffer.
+#[test]
+fn accept_loop_does_not_block_under_concurrent_flood() {
+    let env = Env::new("flood");
+    let repos = env.path("repos");
+    let server_repo = repos.join("r1");
+    std::fs::create_dir_all(&server_repo).unwrap();
+    env.ok_in(&server_repo, &["init", "--bare"]);
+    let (mut srv, port) = start_server(&env, &repos);
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut handles = Vec::new();
+    for _ in 0..400 {
+        let addr = addr.clone();
+        handles.push(std::thread::spawn(move || -> Option<String> {
+            let mut s = TcpStream::connect(&addr).ok()?;
+            let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = s.write_all(
+                b"GET /r1/info/refs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            );
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            String::from_utf8(buf).ok()
+        }));
+    }
+
+    let mut ok = 0;
+    let mut throttled = 0;
+    let mut other = 0;
+    let mut empty = 0;
+    for h in handles {
+        match h.join().unwrap() {
+            Some(b) if b.starts_with("HTTP/1.1 200") => ok += 1,
+            Some(b) if b.starts_with("HTTP/1.1 503") => throttled += 1,
+            Some(b) if b.starts_with("HTTP/1.1 4") => other += 1,
+            Some(b) if b.is_empty() => empty += 1,
+            Some(_) => other += 1,
+            None => empty += 1,
+        }
+    }
+
+    // The cardinal property: every request got a real HTTP response,
+    // OR the connection failed cleanly (timeout / refused). No silent
+    // half-closes. Empty buffers are tolerated only if they're a
+    // small fraction (kernel backlog overflow before we ever see
+    // them).
+    assert!(
+        ok + throttled + other >= 350,
+        "responses=ok={ok}, throttled={throttled}, other={other}, empty={empty}"
+    );
+    // At least SOME requests should have succeeded (the pool is 256
+    // and per-request time is tiny).
+    assert!(ok > 0, "no requests succeeded: ok={ok}, throttled={throttled}, other={other}");
+
+    let _ = srv.kill();
+    let _ = srv.wait();
+}
+
 #[test]
 fn server_panic_payload_helper_returns_useful_string() {
     // White-box check: the downcast_panic_payload function used by the

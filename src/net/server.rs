@@ -31,8 +31,22 @@ use std::thread;
 /// the server tries to allocate a buffer for it.
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Maximum number of concurrent connection workers.
-const MAX_WORKERS: usize = 64;
+/// Maximum number of concurrent connection workers. 256 is sized for
+/// a single multi-tenant host serving CI runners + clones; raise via
+/// recompile if a deployment justifies more. Each worker is a real
+/// OS thread; values past ~1000 start to lose to scheduler overhead.
+const MAX_WORKERS: usize = 256;
+
+/// Body the server writes when it refuses a connection due to pool
+/// exhaustion. Sent before the socket is dropped so clients see a
+/// real HTTP response instead of a TCP RST.
+const POOL_FULL_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+Connection: close\r\n\
+Retry-After: 1\r\n\
+Content-Length: 24\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+server pool exhausted\r\n";
 
 pub struct ServeConfig {
     pub listen_addr: String,
@@ -142,10 +156,28 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
             break;
         }
         match stream {
-            Ok(s) => {
+            Ok(mut s) => {
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
                 let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-                let permit = workers.clone().acquire();
+                // Non-blocking permit: if the worker pool is full,
+                // send a 503 with Retry-After and drop the
+                // connection rather than wedging the accept loop on
+                // a Condvar. Stalling the accept thread is what
+                // turns a transient spike into a multi-minute
+                // outage: the kernel backlog fills, new SYNs are
+                // dropped by the listener, and every load balancer
+                // marks us dead before our existing workers finish.
+                let permit = match workers.clone().try_acquire() {
+                    Some(p) => p,
+                    None => {
+                        // Best-effort 503 — failures (peer reset,
+                        // timeout) just close the socket.
+                        use std::io::Write as _;
+                        let _ = s.write_all(POOL_FULL_RESPONSE);
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                };
                 thread::spawn(move || {
                     let _hold = permit;
                     // Catch any panic that escapes a handler. A bug
@@ -305,6 +337,23 @@ impl WorkerLimiter {
         WorkerPermit {
             limiter: self.clone(),
         }
+    }
+
+    /// Non-blocking variant: returns None when at capacity instead of
+    /// stalling the accept thread on a Condvar. Used to bound the
+    /// accept loop's latency under load — if every worker is busy we
+    /// send a 503 immediately rather than letting connections pile
+    /// up in the kernel backlog.
+    fn try_acquire(self: Arc<Self>) -> Option<WorkerPermit> {
+        let mut n = self.inner.lock().unwrap();
+        if *n >= self.cap {
+            return None;
+        }
+        *n += 1;
+        drop(n);
+        Some(WorkerPermit {
+            limiter: self.clone(),
+        })
     }
 }
 
