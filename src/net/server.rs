@@ -149,6 +149,13 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
     });
     let workers = Arc::new(WorkerLimiter::new(MAX_WORKERS));
 
+    // Install signal handlers. SIGTERM / SIGINT flip the shutdown flag
+    // and then poke our own listen socket once so the blocking accept
+    // returns. Without the self-connect, the accept loop would only
+    // exit on the next *real* incoming connection — k8s / systemd
+    // would hit their hard-kill grace.
+    install_shutdown_signals(state.clone(), addr);
+
     for stream in listener.incoming() {
         let st = state.clone();
         let tls = tls_config.clone();
@@ -213,6 +220,40 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Spawn a thread that watches for SIGTERM / SIGINT / SIGQUIT, flips
+/// `state.shutdown`, then opens a single self-connection so the
+/// blocking `listener.incoming()` returns immediately. Without that
+/// self-poke the accept loop would only exit on the next real client
+/// connection — under k8s `terminationGracePeriodSeconds` the pod
+/// would be SIGKILLed mid-flight.
+fn install_shutdown_signals(state: Arc<ServerState>, listen_addr: std::net::SocketAddr) {
+    thread::spawn(move || {
+        let mut signals = match signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGQUIT,
+        ]) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gyt serve: could not install signal handlers: {e}");
+                return;
+            }
+        };
+        if let Some(sig) = signals.forever().next() {
+            eprintln!("gyt serve: received signal {sig}; beginning graceful shutdown");
+            if let Ok(mut g) = state.shutdown.lock() {
+                *g = true;
+            }
+            // Self-connect to unblock accept(). Connect-then-drop is
+            // enough; we don't need to write or read.
+            let _ = std::net::TcpStream::connect_timeout(
+                &listen_addr,
+                std::time::Duration::from_secs(1),
+            );
+        }
+    });
 }
 
 struct ServerState {
