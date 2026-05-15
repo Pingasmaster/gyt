@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod protocol;
 pub mod rate_limit;
 pub mod refs_policy;
+pub mod repo_index;
 pub mod router;
 pub mod server;
 pub mod ticket;
