@@ -170,6 +170,21 @@ pub fn server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConf
     config.ticketer = rustls::crypto::ring::Ticketer::new()
         .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?;
 
+    // ALPN: advertise "http/1.1" explicitly. The server speaks HTTP/1.1
+    // only — there is no HTTP/2 or HTTP/3 implementation here. Without
+    // an ALPN entry, a client that prefers h2 may negotiate "no agreed
+    // protocol" then attempt h2 anyway; in the worst case we read
+    // HTTP/2's connection preface as if it were an HTTP/1.1 request
+    // line and emit a confusing 400.
+    //
+    // HTTP/2 is intentionally out of scope: the h2 crate needs an
+    // async runtime to be useful (header frames + window updates are
+    // interleaved with bodies and have to be served concurrently per
+    // stream), and async-ification of `gyt serve` is a separate, much
+    // larger change. "http/1.1" is the only protocol we want clients
+    // to attempt until that change lands.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
     Ok(Arc::new(config))
 }
 
