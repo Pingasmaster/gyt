@@ -24,20 +24,50 @@ This rule supersedes any performance recommendation that suggests otherwise (inc
 deleted because neither could be confined to a useful sandbox on a
 multi-tenant host. Do not reintroduce them.
 
-The WASM sandbox in `src/ci_wasm.rs` is the supported execution path
-and its caps are part of the security contract:
+The WASM sandbox in `src/ci_wasm.rs` is the supported execution path.
+Permissions are operator-controlled via `CiPolicy` — a `.gyt-ci/`
+script (which lives inside the cloned repo and therefore is NOT
+trusted) cannot widen the sandbox by any in-tree declaration. The
+only path to widening is a CLI flag passed to `gyt ci`.
 
-- `CI_MAX_MEMORY_BYTES = 256 MiB` — enforced by `CiLimits::memory_growing`
-- `CI_INITIAL_FUEL = 1 000 000 000` instructions — terminates infinite loops
-- `CI_MAX_FILE_BYTES = 64 MiB` per `read_file` / `write_file`
-- `CI_MAX_LOG_BYTES = 16 MiB` cumulative per run
-- `CI_MAX_WASM_STACK = 1 MiB`
-- WASI is not linked. `env`/`getenv` are not linked. Threads, SIMD,
-  reference-types, multi-memory, memory64 are disabled at the engine.
-- `.gyt/` is invisible to `read_file` (CI secrets / signing keys / index
-  must not be reachable from a workflow).
+Default caps (no flags) — sized for legitimate Android-class builds
+so legitimate work doesn't bump into them:
 
-Tests pinning these in `tests/ci_wasm_sandbox.rs`.
+- `CI_DEFAULT_MEMORY_BYTES = 8 GiB`
+- `CI_DEFAULT_FUEL = 1×10^11` wasm instructions
+- `CI_DEFAULT_WALL_TIME_SECS = 14400 (= 4 hours)`, enforced via
+  `epoch_interruption` + a 1-Hz ticker
+- `CI_MAX_FILE_BYTES = 1 GiB` per `read_file` / `write_file`
+- `CI_MAX_LOG_BYTES = 256 MiB` cumulative per run
+- `CI_MAX_WASM_STACK = 8 MiB`
+
+Default permission set (CiPolicy::default()):
+
+- read   : `repo_workdir/*` EXCEPT `.gyt/*` (always denied)
+- write  : `output_dir/*` only
+- network: NONE — no socket hostcall is linked
+- subprocess: NONE — no fork/exec hostcall is linked
+- env vars: NONE — no `getenv` hostcall is linked
+
+Operator widenings (each requires an explicit CLI flag):
+
+- `--ci-no-repo-read` / `--ci-no-output-write`  (narrow further)
+- `--ci-repo-write`                              (allow writes to repo, still excludes `.gyt/`)
+- `--ci-read <PATH>` / `--ci-write <PATH>`       (extra host paths)
+- `--ci-allow-network`                           (reserved vocabulary; currently a no-op since no network hostcall is linked)
+- `--ci-memory <SIZE>` / `--ci-fuel <N>` / `--ci-time <SECS>`  (raise/lower caps)
+
+`.gyt/*` is invisible to `read_file` and `write_file` even when an
+`--ci-read` / `--ci-write` would otherwise include it — this prevents
+a malicious repo from talking the operator into pointing the sandbox
+at its own metadata.
+
+WASI is not linked. `env`/`getenv` are not linked. Threads, SIMD,
+relaxed-SIMD, reference-types, multi-memory, memory64 are disabled
+at the engine.
+
+Tests pinning these in `tests/ci_wasm_sandbox.rs` (12 cases) and
+`tests/ci_wasm_policy.rs` (9 cases covering each policy field).
 
 ### Issues and discussions are in-repo refs
 

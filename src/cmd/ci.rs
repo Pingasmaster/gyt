@@ -7,7 +7,7 @@
 // shared state. The wasmtime sandbox in `crate::ci_wasm` is the supported
 // execution path.
 
-use crate::ci_wasm::{collect_wasm_scripts, run_ci_wasm};
+use crate::ci_wasm::{CiPolicy, collect_wasm_scripts, run_ci_wasm_with_policy};
 use crate::cmd::{ci_env, ci_secret};
 use crate::errors::{GytError, Result};
 use std::path::PathBuf;
@@ -25,6 +25,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let mut output_dir: Option<PathBuf> = None;
     let mut list_mode = false;
+    let mut policy = CiPolicy::default();
 
     if !args.is_empty() && args[0] == "--help" {
         print_help();
@@ -37,26 +38,87 @@ pub fn run(args: &[String]) -> Result<()> {
             "--list" => list_mode = true,
             "--output" => {
                 i += 1;
-                if i >= args.len() {
-                    return Err(GytError::InvalidArgument("--output needs a path".into()));
-                }
-                output_dir = Some(PathBuf::from(&args[i]));
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--output needs a path".into())
+                })?;
+                output_dir = Some(PathBuf::from(v));
+            }
+            // ── Operator-only permission grants (every flag here
+            // widens what the wasm can do; defaults are conservative).
+            "--ci-no-repo-read" => policy.repo_read = false,
+            "--ci-repo-write" => policy.repo_write = true,
+            "--ci-no-output-write" => policy.output_write = false,
+            "--ci-read" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--ci-read needs a path".into())
+                })?;
+                policy.extra_read.push(PathBuf::from(v));
+            }
+            "--ci-write" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--ci-write needs a path".into())
+                })?;
+                policy.extra_write.push(PathBuf::from(v));
+            }
+            "--ci-allow-network" => {
+                // Reserved vocabulary: no socket-style hostcall is
+                // linked even when this is true. The flag exists so
+                // future implementation has an operator-grant gate
+                // already in place and well-tested.
+                policy.network = true;
+            }
+            "--ci-memory" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--ci-memory needs a value (e.g. 4096MB)".into())
+                })?;
+                policy.memory_max = parse_byte_size(v)?;
+            }
+            "--ci-fuel" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--ci-fuel needs a value".into())
+                })?;
+                policy.fuel = v
+                    .parse::<u64>()
+                    .map_err(|_| GytError::InvalidArgument(format!("--ci-fuel: not a u64: {v}")))?;
+            }
+            "--ci-time" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("--ci-time needs seconds".into())
+                })?;
+                policy.wall_time_secs = v.parse::<u64>().map_err(|_| {
+                    GytError::InvalidArgument(format!("--ci-time: not a u64: {v}"))
+                })?;
             }
             // Reject the old --docker flag loudly so legacy CI pipelines
             // surface the migration instead of silently doing the wrong
             // thing (running unsandboxed shell).
             "--docker" => {
                 return Err(GytError::InvalidArgument(
-                    "--docker is no longer supported; convert your .sh scripts to .wasm (see docs/ci-wasm.md)".into(),
+                    "--docker is no longer supported; convert your .sh scripts to .wasm".into(),
                 ));
             }
             _ => {
                 eprintln!("gyt ci: unknown flag '{}'", args[i]);
-                eprintln!("usage: gyt ci [--list] [--output <dir>]");
+                eprintln!("usage: gyt ci [--list] [--output <dir>] [permission flags — see --help]");
                 return Ok(());
             }
         }
         i += 1;
+    }
+
+    // If the operator asked for network, currently warn loudly but
+    // continue (the run won't actually have network because no
+    // hostcall is linked; this is just to give them a clear signal
+    // that nothing magical happens).
+    if policy.network {
+        eprintln!(
+            "gyt ci: --ci-allow-network grants are reserved; no network hostcall is yet linked, so no actual network access will be permitted in this run."
+        );
     }
 
     if !gyt_dir.is_dir() {
@@ -110,10 +172,11 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     println!("Running {} WASM CI scripts...", wasms.len());
+    print_policy_summary(&policy);
     for (idx, wasm) in wasms.iter().enumerate() {
         let name = wasm.file_name().unwrap().to_string_lossy();
         println!("\n  [{}/{}] {name}", idx + 1, wasms.len());
-        match run_ci_wasm(wasm, &cwd, &out) {
+        match run_ci_wasm_with_policy(wasm, &cwd, &out, &policy) {
             Ok(()) => println!("  PASS"),
             Err(e) => {
                 println!("  FAIL: {e}");
@@ -125,10 +188,66 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn print_policy_summary(p: &CiPolicy) {
+    eprintln!(
+        "  sandbox: repo_read={}, repo_write={}, output_write={}, extra_read={}, extra_write={}, network={}",
+        p.repo_read,
+        p.repo_write,
+        p.output_write,
+        p.extra_read.len(),
+        p.extra_write.len(),
+        p.network,
+    );
+    eprintln!(
+        "  limits:  memory={} MiB, fuel={}, wall_time={}s",
+        p.memory_max / (1024 * 1024),
+        p.fuel,
+        p.wall_time_secs,
+    );
+}
+
+/// Parse "1024", "1024MB", "8GB", "512KB". Accepts decimal multipliers
+/// (MiB/GiB precision isn't worth the parser cost) — operators size
+/// in round MB / GB.
+fn parse_byte_size(s: &str) -> Result<usize> {
+    let s = s.trim();
+    let (num, mult): (&str, usize) = if let Some(n) = s.strip_suffix("GB") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n, 1024)
+    } else if let Some(n) = s.strip_suffix("B") {
+        (n, 1)
+    } else {
+        (s, 1)
+    };
+    let v: u64 = num.trim().parse().map_err(|_| {
+        GytError::InvalidArgument(format!("byte size: not a number: {s}"))
+    })?;
+    Ok((v as usize) * mult)
+}
+
 fn print_help() {
-    eprintln!("Usage: gyt ci [--list] [--output <dir>]");
+    eprintln!("Usage: gyt ci [--list] [--output <dir>] [permission flags]");
     eprintln!();
-    eprintln!("Runs sandboxed WASM CI scripts from .gyt-ci/.");
+    eprintln!("Runs sandboxed WASM CI scripts from .gyt-ci/. Defaults are");
+    eprintln!("conservative — a cloned malicious repo cannot widen them.");
+    eprintln!();
+    eprintln!("Permission flags (each WIDENS the sandbox; defaults are");
+    eprintln!("read-only-repo, write-only-output, no network):");
+    eprintln!("  --ci-no-repo-read              deny repo reads");
+    eprintln!("  --ci-repo-write                allow writes to the repo (not .gyt/)");
+    eprintln!("  --ci-no-output-write           deny output writes");
+    eprintln!("  --ci-read <PATH>               also allow reads under <PATH>");
+    eprintln!("  --ci-write <PATH>              also allow writes under <PATH>");
+    eprintln!("  --ci-allow-network             reserved; no network hostcall is");
+    eprintln!("                                 currently linked, so this is a noop");
+    eprintln!();
+    eprintln!("Limits (defaults sized for legitimate Android-class builds):");
+    eprintln!("  --ci-memory <SIZE>             memory cap (e.g. 4GB, 512MB)");
+    eprintln!("  --ci-fuel <N>                  wasm-instruction cap (default 1e11)");
+    eprintln!("  --ci-time <SECS>               wall-time cap (default 14400 = 4h)");
     eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  secret          Manage encrypted CI secrets (file storage only;");
