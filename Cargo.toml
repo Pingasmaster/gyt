@@ -17,6 +17,7 @@ webpki-roots = "=1.0.7"
 lzma-rust2 = { version = "=0.16.2", default-features = false, features = ["std", "xz", "encoder"] }
 include_dir = "=0.7.4"
 aes-gcm = "=0.10.3"
+signal-hook = { version = "=0.4.4", default-features = false, features = ["iterator"] }
 
 [profile.release]
 lto = "thin"
