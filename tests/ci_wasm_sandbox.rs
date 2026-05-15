@@ -61,23 +61,33 @@ fn infinite_loop_is_terminated_by_fuel() {
     let wasm = write_wat(&dir, "loop", LOOP_WAT);
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
+    // Use a tiny fuel + short epoch so the test terminates in <5s
+    // rather than burning through the 100B-instruction default.
+    let policy = gyt::ci_wasm::CiPolicy {
+        fuel: 100_000_000,
+        wall_time_secs: 5,
+        ..Default::default()
+    };
     let start = std::time::Instant::now();
-    let r = gyt::ci_wasm::run_ci_wasm(&wasm, &dir, &out);
+    let r = gyt::ci_wasm::run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
     let elapsed = start.elapsed();
     assert!(r.is_err(), "infinite loop must error");
     assert!(
-        elapsed < std::time::Duration::from_secs(30),
-        "fuel must terminate before 30s (was {elapsed:?})"
+        elapsed < std::time::Duration::from_secs(15),
+        "loop must terminate before 15s (was {elapsed:?})"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Trying to allocate more linear memory than the cap permits must be
-/// rejected by the ResourceLimiter.
+/// rejected by the ResourceLimiter. The default 8 GiB cap won't fire
+/// for a 512 MiB growth, so we lower it via CiPolicy to make the cap
+/// visible — this also tests that operator-supplied limits are
+/// honored.
 #[test]
 fn memory_growth_past_cap_rejected() {
-    // 256 MiB cap = 4096 pages of 64 KiB. Grow by 8192 pages → must fail.
-    // The wasm sets memory_grow's failure as -1 in the return.
+    // Grow by 8192 pages of 64 KiB = 512 MiB. With a 256 MiB cap this
+    // is refused → memory.grow returns -1 → wasm checks and returns 0.
     const BLOAT_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -93,7 +103,11 @@ fn memory_growth_past_cap_rejected() {
     let wasm = write_wat(&dir, "bloat", BLOAT_WAT);
     let out = dir.join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let r = gyt::ci_wasm::run_ci_wasm(&wasm, &dir, &out);
+    let policy = gyt::ci_wasm::CiPolicy {
+        memory_max: 256 * 1024 * 1024,
+        ..Default::default()
+    };
+    let r = gyt::ci_wasm::run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
     assert!(
         r.is_ok(),
         "wasm should run to completion (memory.grow returns -1, wasm signals success). Got: {r:?}"
@@ -218,14 +232,17 @@ fn nul_in_path_blocked() {
 #[test]
 fn published_limits_are_at_documented_values() {
     use gyt::ci_wasm::{
-        CI_INITIAL_FUEL, CI_MAX_FILE_BYTES, CI_MAX_LOG_BYTES, CI_MAX_MEMORY_BYTES,
-        CI_MAX_WASM_STACK,
+        CI_DEFAULT_FUEL, CI_DEFAULT_MEMORY_BYTES, CI_DEFAULT_WALL_TIME_SECS,
+        CI_MAX_FILE_BYTES, CI_MAX_LOG_BYTES, CI_MAX_WASM_STACK,
     };
-    assert_eq!(CI_MAX_MEMORY_BYTES, 256 * 1024 * 1024);
-    assert_eq!(CI_INITIAL_FUEL, 1_000_000_000);
-    assert_eq!(CI_MAX_FILE_BYTES, 64 * 1024 * 1024);
-    assert_eq!(CI_MAX_LOG_BYTES, 16 * 1024 * 1024);
-    assert_eq!(CI_MAX_WASM_STACK, 1024 * 1024);
+    // Bumped to "Android-build-sized" defaults so legitimate
+    // workloads don't trip an artificial cap.
+    assert_eq!(CI_DEFAULT_MEMORY_BYTES, 8 * 1024 * 1024 * 1024);
+    assert_eq!(CI_DEFAULT_FUEL, 100_000_000_000);
+    assert_eq!(CI_DEFAULT_WALL_TIME_SECS, 4 * 60 * 60);
+    assert_eq!(CI_MAX_FILE_BYTES, 1024 * 1024 * 1024);
+    assert_eq!(CI_MAX_LOG_BYTES, 256 * 1024 * 1024);
+    assert_eq!(CI_MAX_WASM_STACK, 8 * 1024 * 1024);
 }
 
 /// Loading a corrupt / non-wasm file must surface a clean error rather
