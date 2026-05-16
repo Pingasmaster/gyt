@@ -281,13 +281,47 @@ pub fn walk_and_fetch(
                 let raw = compress::decode(&entry.bytes)?;
                 let entry_id = hash::hash_bytes(&raw);
                 let (kind, payload) = store::parse_raw(&raw)?;
-                if kind == ObjectKind::Commit {
-                    crate::object::commit::decode(&payload).map_err(|e| {
-                        GytError::Net(format!(
-                            "clone: server returned non-canonical commit {entry_id}: {e}"
-                        ))
-                    })?;
-                    commit_payloads.insert(entry_id, payload);
+                // F-D3-03: mirror the server-side canonicality gate
+                // on EVERY object kind the client persists. A hostile
+                // server can otherwise plant non-canonical trees /
+                // tags (unsorted entries, mode-out-of-whitelist,
+                // unknown tag.kind) — they hash to whatever the bytes
+                // say but downstream consumers misbehave. Commits
+                // already had this check; trees and tags did not.
+                match kind {
+                    ObjectKind::Commit => {
+                        crate::object::commit::decode(&payload).map_err(|e| {
+                            GytError::Net(format!(
+                                "clone: server returned non-canonical commit {entry_id}: {e}"
+                            ))
+                        })?;
+                        commit_payloads.insert(entry_id, payload.clone());
+                    }
+                    ObjectKind::Tree => {
+                        let entries = crate::object::tree::decode(&payload).map_err(|e| {
+                            GytError::Net(format!(
+                                "clone: server returned non-canonical tree {entry_id}: {e}"
+                            ))
+                        })?;
+                        if crate::object::tree::encode(&entries) != payload {
+                            return Err(GytError::Net(format!(
+                                "clone: tree {entry_id} bytes don't round-trip through canonical encoder"
+                            )));
+                        }
+                    }
+                    ObjectKind::Tag => {
+                        let t = crate::object::tag::decode(&payload).map_err(|e| {
+                            GytError::Net(format!(
+                                "clone: server returned non-canonical tag {entry_id}: {e}"
+                            ))
+                        })?;
+                        if crate::object::tag::encode(&t) != payload {
+                            return Err(GytError::Net(format!(
+                                "clone: tag {entry_id} bytes don't round-trip through canonical encoder"
+                            )));
+                        }
+                    }
+                    ObjectKind::Blob => { /* blobs have no canonical form */ }
                 }
                 if !store::exists(&repo.gyt_dir, &entry_id) {
                     let path = store::path_for(&repo.gyt_dir, &entry_id);
