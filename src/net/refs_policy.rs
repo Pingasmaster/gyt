@@ -148,10 +148,23 @@ fn commits_new_since(
             }
         }
     }
+    // F-D4-04: a missing/unreadable PARENT was previously silent. With
+    // sign_required, that meant a pusher who uploaded only the tip
+    // commit (with `parent` set to a never-uploaded hash) got the tip
+    // signature-checked but every ancestor escaped the gate. We now
+    // distinguish two cases:
+    //   - the starting `new` itself can't be read: that's OK (it may
+    //     be a tag/blob ref; signature enforcement applies only to
+    //     commits, so an empty list is correct).
+    //   - any commit reached via a parent pointer can't be read:
+    //     return Err. The pusher must upload every ancestor or push
+    //     fails — no silent gate-bypass.
+    // `is_parent_step` tracks whether we got here from a parent
+    // pointer or from the initial seed.
     let mut out = Vec::new();
     let mut seen: HashSet<ObjectId> = HashSet::new();
-    let mut stack = vec![*new];
-    while let Some(id) = stack.pop() {
+    let mut stack: Vec<(ObjectId, bool)> = vec![(*new, false)];
+    while let Some((id, is_parent_step)) = stack.pop() {
         if excluded.contains(&id) {
             continue;
         }
@@ -163,15 +176,24 @@ fn commits_new_since(
                 "new-commit walk exceeded {MAX_WALK_COMMITS} commits"
             )));
         }
-        // If we can't read the commit, it's not actually a commit (e.g. tag,
-        // tree, blob) — skip silently rather than refusing the entire batch.
         let c = match commit::read(gyt_dir, &id) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                if is_parent_step {
+                    return Err(GytError::Repo(format!(
+                        "commit graph references missing or unreadable ancestor {}: {e}",
+                        id.to_hex()
+                    )));
+                }
+                // The seed `new` is not a commit (e.g. tag/blob ref).
+                // Empty result is correct — signature gate doesn't
+                // apply to non-commit refs.
+                continue;
+            }
         };
         out.push(id);
         for p in c.parents {
-            stack.push(p);
+            stack.push((p, true));
         }
     }
     Ok(out)
