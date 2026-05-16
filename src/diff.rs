@@ -45,6 +45,15 @@ pub fn split_lines(buf: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
+/// Max sum-of-line-counts at which we still run the proper Myers
+/// trace. Above this, the algorithm's `Vec<Vec<i32>>` `trace`
+/// allocation is Θ((n+m)²) — for two 50k-line files that's ~80 GB.
+/// Closes F-D6-03: instead of OOM-ing the process on a malicious or
+/// huge blob diff, we degrade gracefully to a coarse delete-all /
+/// insert-all diff that still renders correctly in `gyt diff/log/show`
+/// and produces a valid (if maximally-conflicted) merge3 input.
+pub const MAX_DIFF_LINES: usize = 50_000;
+
 /// Myers' diff between two slices of lines. Returns a flat ordered op list.
 #[expect(clippy::many_single_char_names, reason = "single-letter names are conventional shorthand in this algorithm")]
 #[expect(
@@ -64,6 +73,21 @@ pub fn myers<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> Vec<DiffOp<'a>> {
     }
     if m == 0 {
         return a.iter().map(|l| DiffOp::Delete(l)).collect();
+    }
+
+    // F-D6-03: degrade to a coarse delete-all / insert-all diff for
+    // inputs above MAX_DIFF_LINES. The trace allocation is the
+    // expensive part — Θ((n+m)²) — and a malicious or pathologically
+    // large blob diff would OOM the process otherwise.
+    if n.saturating_add(m) > MAX_DIFF_LINES {
+        let mut ops: Vec<DiffOp<'a>> = Vec::with_capacity(n + m);
+        for l in a {
+            ops.push(DiffOp::Delete(l));
+        }
+        for l in b {
+            ops.push(DiffOp::Insert(l));
+        }
+        return ops;
     }
 
     let max = n + m;
