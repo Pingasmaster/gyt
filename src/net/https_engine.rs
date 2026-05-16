@@ -69,15 +69,22 @@ fn rt() -> &'static Runtime {
 /// Shared rustls config for the client. ALPN advertises both h2 and
 /// http/1.1 so the server picks. webpki-roots gives us the same
 /// trust anchors the sync client already uses (see net::tls).
+///
+/// TLS 1.3 only, matching the sync client in `net::tls`. Bare
+/// `ClientConfig::builder()` would negotiate TLS 1.2 too, contradicting
+/// our stated policy and the rationale documented over there
+/// (weaker forward secrecy + legacy renegotiation surface). Pinning
+/// 1.3 here means a misconfigured peer fails fast at handshake.
 fn client_tls_config() -> Arc<rustls::ClientConfig> {
     static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     CFG.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let roots: rustls::RootCertStore =
             webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-        let mut cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut cfg =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Arc::new(cfg)
     })
