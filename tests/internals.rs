@@ -868,11 +868,11 @@ fn tree_encode_sorts_entries() {
 }
 
 #[test]
-fn tree_non_canonical_payload_blocked_by_server_gate() {
-    // The wire `objects/have` gate (server.rs) was added in the
-    // audit to reject non-canonical trees. We test the *gate logic*
-    // directly: a tree whose stored bytes don't re-encode to
-    // themselves must be detectable.
+fn tree_non_canonical_payload_blocked_by_decoder() {
+    // `tree::decode` now enforces strict-ascending sort directly, so
+    // a manually-built unsorted payload is rejected at decode time —
+    // no need for a separate wire-level gate. This closes the
+    // path-traversal-via-non-canonical-tree class at the parser.
     let entries = vec![
         tree::TreeEntry {
             mode: tree::MODE_FILE,
@@ -893,17 +893,19 @@ fn tree_non_canonical_payload_blocked_by_server_gate() {
         payload.push(0);
         payload.extend_from_slice(&e.hash.0);
     }
-    let decoded = tree::decode(&payload).unwrap();
-    let re_encoded = tree::encode(&decoded);
-    assert_ne!(payload, re_encoded, "manual unsorted payload should differ from canonical re-encode");
+    assert!(
+        tree::decode(&payload).is_err(),
+        "decode must reject non-canonical (unsorted) tree payload"
+    );
 }
 
 #[test]
-fn tree_with_duplicate_names_decodes_but_is_non_canonical() {
-    // Two entries with the same name — the encode path sort is
-    // stable, so duplicates would survive a round trip. But the
-    // canonicality re-encode test is a CHECK, not a normalization,
-    // so a malicious payload could be detected.
+fn tree_with_duplicate_names_is_rejected_by_decoder() {
+    // Two entries with the same name — `encode`'s sort is stable, so
+    // a naive parser would accept the bytes and let the duplication
+    // round-trip. `tree::decode` now enforces strict-ascending order,
+    // which subsumes uniqueness, so duplicate-name payloads are
+    // rejected at parse time.
     let payload_one = {
         let entries = vec![
             tree::TreeEntry {
@@ -919,12 +921,10 @@ fn tree_with_duplicate_names_decodes_but_is_non_canonical() {
         ];
         tree::encode(&entries)
     };
-    // Decode + re-encode round-trip is stable (the canonicality gate
-    // accepts this — there's no uniqueness check). Pin this so a
-    // future fix flips the test.
-    let decoded = tree::decode(&payload_one).unwrap();
-    let re = tree::encode(&decoded);
-    assert_eq!(payload_one, re);
+    assert!(
+        tree::decode(&payload_one).is_err(),
+        "decode must reject tree with duplicate entry names"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
