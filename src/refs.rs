@@ -23,9 +23,32 @@ pub enum Head {
 const HEAD_REF_PREFIX: &str = "ref: ";
 const HEAD_DETACHED_PREFIX: &str = "blake3:";
 
-fn validate_ref_name(name: &str) -> Result<()> {
+/// Maximum total byte length of a ref name. Below `PATH_MAX` (4096 on
+/// Linux) with room for the gyt_dir prefix in `ref_path`.
+pub const MAX_REF_NAME_LEN: usize = 255;
+
+/// Validate a ref name. Single chokepoint for the wire-side and disk-
+/// side validators alike. Made `pub` so `net::refs_policy` can call it
+/// before any `gyt_dir.join(name)` happens at request time
+/// (closes F-D1-01 path traversal and F-D1-03 audit-log injection).
+///
+/// Rejects:
+/// - empty / length > MAX_REF_NAME_LEN
+/// - leading / trailing '/'
+/// - components equal to `.`, `..`, or empty
+/// - any byte < 0x20 or == 0x7f  (closes audit-log newline injection)
+/// - backslash (Windows FUSE / NTFS path separator)
+/// - components ending in `.lock`
+/// - any `..` substring (defense in depth)
+pub fn validate_ref_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(GytError::Refs("empty ref name".into()));
+    }
+    if name.len() > MAX_REF_NAME_LEN {
+        return Err(GytError::Refs(format!(
+            "ref name length {} exceeds {MAX_REF_NAME_LEN}",
+            name.len()
+        )));
     }
     if name.starts_with('/') {
         return Err(GytError::Refs(format!(
@@ -36,6 +59,18 @@ fn validate_ref_name(name: &str) -> Result<()> {
         return Err(GytError::Refs(format!(
             "ref name must not end with '/': {name:?}"
         )));
+    }
+    for b in name.bytes() {
+        if b < 0x20 || b == 0x7f {
+            return Err(GytError::Refs(format!(
+                "ref name contains control byte {b:#x}: {name:?}"
+            )));
+        }
+        if b == b'\\' {
+            return Err(GytError::Refs(format!(
+                "ref name contains backslash: {name:?}"
+            )));
+        }
     }
     for comp in name.split('/') {
         if comp.is_empty() {
@@ -48,8 +83,10 @@ fn validate_ref_name(name: &str) -> Result<()> {
                 "ref name has '..' or '.' component: {name:?}"
             )));
         }
-        if comp.contains('\0') {
-            return Err(GytError::Refs(format!("ref name contains NUL: {name:?}")));
+        if comp.ends_with(".lock") {
+            return Err(GytError::Refs(format!(
+                "ref name component ends in .lock: {name:?}"
+            )));
         }
     }
     if name.contains("..") {

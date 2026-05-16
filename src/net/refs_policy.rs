@@ -34,6 +34,11 @@ pub enum PolicyError {
     BadSignature { commit: ObjectId },
     SignerNotAllowed { commit: ObjectId },
     MissingAllowedSigners,
+    /// The refname failed `refs::validate_ref_name` (or wasn't under
+    /// the `refs/` namespace gyt accepts over the wire). Closes
+    /// F-D1-01 (refname write outside gyt_dir) and F-D1-03 (audit-log
+    /// newline injection) at the policy layer.
+    BadRefName { refname: String, reason: String },
     Internal(String),
 }
 
@@ -57,6 +62,9 @@ impl PolicyError {
             }
             Self::MissingAllowedSigners => {
                 "sign_required is set but .gyt/allowed_signers is missing or empty".to_string()
+            }
+            Self::BadRefName { refname, reason } => {
+                format!("ref name refused: {reason} ({refname:?})")
             }
             Self::Internal(s) => format!("internal policy error: {s}"),
         }
@@ -239,6 +247,33 @@ pub fn evaluate_with_mode(
     let mut blocked = Vec::new();
 
     for u in updates {
+        // Gate every refname through the same validator the on-disk
+        // writer uses, BEFORE any code path joins it onto gyt_dir.
+        // Closes F-D1-01 (path traversal via refname) and F-D1-03
+        // (audit-log newline injection) at the policy layer — neither
+        // the FF check nor the on-disk write ever sees an unsafe
+        // name. We also require that wire-side updates land under
+        // `refs/`: HEAD and other top-level files are not pushable.
+        if let Err(e) = crate::refs::validate_ref_name(&u.name) {
+            blocked.push((
+                u.name.clone(),
+                PolicyError::BadRefName {
+                    refname: u.name.clone(),
+                    reason: e.to_string(),
+                },
+            ));
+            continue;
+        }
+        if !u.name.starts_with("refs/") {
+            blocked.push((
+                u.name.clone(),
+                PolicyError::BadRefName {
+                    refname: u.name.clone(),
+                    reason: "must begin with refs/".into(),
+                },
+            ));
+            continue;
+        }
         // Three modes have three different gate combinations. We always
         // run signature verification at the end if `sign_required`.
         let force = mode == Mode::Force;
