@@ -35,6 +35,19 @@ use std::thread;
 /// the server tries to allocate a buffer for it.
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Upper bound on how long shutdown waits for in-flight tokio tasks
+/// to finish before tearing the runtime down. Tokio's `Runtime::Drop`
+/// blocks indefinitely; that's fine for batch programs but unsafe for
+/// a server under a finite SIGTERM grace period (k8s default 30 s,
+/// systemd `TimeoutStopSec` default 90 s). A single stalled task —
+/// slow-loris peer in the middle of a body read, h2 stream awaiting
+/// a WINDOW_UPDATE that never comes — would otherwise hold shutdown
+/// until SIGKILL fires and the runtime's threads are killed without
+/// any chance to flush. 30 s is the lowest common grace period; pick
+/// the smaller of "what your orchestrator gives you" and this number
+/// at deployment time.
+const SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
 /// Number of tokio worker threads for the *async* runtime. The async
 /// runtime needs only a small handful of threads (one per CPU is the
 /// usual rule); blocking work (disk I/O, xz, BLAKE3) goes to the
@@ -532,9 +545,11 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         let _ = h.join();
     }
 
-    // Drop the runtime explicitly — gives in-flight tasks a chance
-    // to finish before the runtime's threads are torn down.
-    drop(runtime);
+    // Bounded shutdown. `Runtime::Drop` blocks indefinitely; the
+    // timeout variant gives in-flight tasks a window to drain, then
+    // returns even if a stuck task (slow peer, stalled h2 stream)
+    // would otherwise hold us forever. See SHUTDOWN_TIMEOUT_SECS.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS));
 
     // Hold the serve lock until after the workers have drained so a
     // restart can't race in mid-shutdown.
