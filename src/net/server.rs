@@ -2657,8 +2657,15 @@ fn wire_objects_have(
             );
         }
     };
+    // F-D3-02: one cumulative XZ-output budget for the whole request.
+    // The outer pack XZ + every entry's inner XZ all subtract from
+    // this AtomicU64. The per-stream MAX_DECOMPRESSED_BYTES still
+    // applies; the budget kills the multi-stream chain attack.
+    let xz_budget = std::sync::atomic::AtomicU64::new(
+        crate::compress::MAX_REQUEST_XZ_OUTPUT_BYTES,
+    );
     // Parse body as packfile format
-    let entries = match crate::net::protocol::parse_packfile(body) {
+    let entries = match crate::net::protocol::parse_packfile_with_budget(body, &xz_budget) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -2692,7 +2699,9 @@ fn wire_objects_have(
     let mut n_skipped = 0u32;
     for entry in &entries {
         // Decompress on-disk bytes to get raw: "<kind> <size>\0<payload>"
-        let Ok(raw) = crate::compress::decode(&entry.bytes) else {
+        // F-D3-02: account every per-entry decode against the same
+        // cumulative budget the outer pack XZ already debited.
+        let Ok(raw) = crate::compress::decode_with_budget(&entry.bytes, &xz_budget) else {
             n_skipped += 1;
             continue;
         };
