@@ -180,19 +180,18 @@ pub fn server_config(
             .map_err(|e| GytError::Net(format!("ticketer init: {e}")))?,
     };
 
-    // ALPN: advertise "http/1.1" explicitly. The server speaks HTTP/1.1
-    // only — there is no HTTP/2 or HTTP/3 implementation here. Without
-    // an ALPN entry, a client that prefers h2 may negotiate "no agreed
-    // protocol" then attempt h2 anyway; in the worst case we read
-    // HTTP/2's connection preface as if it were an HTTP/1.1 request
-    // line and emit a confusing 400.
+    // ALPN: advertise "http/1.1" as the safe default on this base
+    // config. The async listeners override it: net::server's main
+    // TLS path and net::h2_server's dedicated --listen-h2 path both
+    // clone this config and reset `alpn_protocols` to
+    // ["h2", "http/1.1"] before installing it on tokio-rustls. The
+    // QUIC listener (net::h3_server) builds its own ServerConfig
+    // with ["h3"].
     //
-    // HTTP/2 is intentionally out of scope: the h2 crate needs an
-    // async runtime to be useful (header frames + window updates are
-    // interleaved with bodies and have to be served concurrently per
-    // stream), and async-ification of `gyt serve` is a separate, much
-    // larger change. "http/1.1" is the only protocol we want clients
-    // to attempt until that change lands.
+    // We keep "http/1.1" here so a caller that consumes this base
+    // config without overriding ALPN (there shouldn't be one, but
+    // belt-and-suspenders) still gets a sane handshake instead of a
+    // protocol-mismatch close.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
