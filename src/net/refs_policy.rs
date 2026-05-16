@@ -71,10 +71,20 @@ impl PolicyError {
     }
 }
 
+/// Hard cap on the number of commits any single FF / signature walk
+/// is willing to visit. A pusher who locally builds a 10⁶-commit
+/// chain (cheap: one tree, N commits) and pushes it would otherwise
+/// trigger an O(N) DFS that pins refs.lock for the duration of the
+/// walk, slowing every other pusher and reader behind the lock.
+/// 1M is far above any plausible legitimate push (the kernel's git
+/// history is ~10⁶ commits TOTAL; a single push delta is orders of
+/// magnitude smaller).
+pub const MAX_WALK_COMMITS: usize = 1_000_000;
+
 /// Is `ancestor` an ancestor of `descendant` along the parent DAG?
 /// Walks all parents (not just first-parent) so merge commits are handled.
 /// Returns Ok(true) if reachable, Ok(false) otherwise, Err if a commit can't
-/// be read.
+/// be read OR if the walk exceeds MAX_WALK_COMMITS (closes F-D4-01).
 pub fn is_ancestor(
     gyt_dir: &Path,
     ancestor: &ObjectId,
@@ -88,6 +98,11 @@ pub fn is_ancestor(
     while let Some(id) = stack.pop() {
         if !seen.insert(id) {
             continue;
+        }
+        if seen.len() > MAX_WALK_COMMITS {
+            return Err(GytError::Repo(format!(
+                "commit graph walk exceeded {MAX_WALK_COMMITS} commits"
+            )));
         }
         if id == *ancestor {
             return Ok(true);
@@ -107,7 +122,8 @@ pub fn is_ancestor(
 
 /// Walk commits reachable from `new` that are NOT reachable from `old`.
 /// Returns the list of new commit ids. If `old` is None, returns every
-/// commit reachable from `new`.
+/// commit reachable from `new`. Bounded by MAX_WALK_COMMITS on both
+/// halves (excluded set and new-commits set) — closes F-D4-01.
 fn commits_new_since(
     gyt_dir: &Path,
     old: Option<&ObjectId>,
@@ -119,6 +135,11 @@ fn commits_new_since(
         while let Some(id) = stack.pop() {
             if !excluded.insert(id) {
                 continue;
+            }
+            if excluded.len() > MAX_WALK_COMMITS {
+                return Err(GytError::Repo(format!(
+                    "excluded-commit walk exceeded {MAX_WALK_COMMITS} commits"
+                )));
             }
             if let Ok(c) = commit::read(gyt_dir, &id) {
                 for p in c.parents {
@@ -136,6 +157,11 @@ fn commits_new_since(
         }
         if !seen.insert(id) {
             continue;
+        }
+        if seen.len() > MAX_WALK_COMMITS {
+            return Err(GytError::Repo(format!(
+                "new-commit walk exceeded {MAX_WALK_COMMITS} commits"
+            )));
         }
         // If we can't read the commit, it's not actually a commit (e.g. tag,
         // tree, blob) — skip silently rather than refusing the entire batch.
