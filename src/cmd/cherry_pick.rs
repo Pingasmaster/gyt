@@ -319,6 +319,7 @@ fn write_workdir_entry(gyt_dir: &Path, abs: &Path, mode: u32, hash: &ObjectId) -
         let bytes = blob::read(gyt_dir, hash)?;
         let target = std::str::from_utf8(&bytes)
             .map_err(|_| GytError::Object("symlink target is not utf-8".into()))?;
+        crate::workdir::validate_symlink_target(target)?;
         let _ = std::fs::remove_file(abs);
         #[cfg(unix)]
         {

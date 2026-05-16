@@ -44,6 +44,54 @@ const MODE_EXEC: u32 = 0o100_755;
 const MODE_SYMLINK: u32 = 0o120_000;
 const MODE_DIR: u32 = 0o040_000;
 
+/// Validate a symlink target before creating it on disk. A malicious
+/// tree object can carry a blob whose contents (the symlink target) is
+/// `/etc`, `..`, or anything else that would escape the workdir.
+/// Without this gate, a subsequent file entry under the link (e.g.
+/// `link/something`) is materialized through the link via
+/// `create_dir_all` — git's classic symlink-then-write workdir escape
+/// (CVE-2014-9390, CVE-2017-1000117, CVE-2019-1353).
+///
+/// Rules:
+/// - target is non-empty
+/// - target is not absolute (no leading `/`)
+/// - no path component equals `..`
+/// - no embedded NUL byte
+/// - length ≤ 4096 bytes (PATH_MAX on Linux)
+///
+/// We intentionally do NOT canonicalize against the workdir here: the
+/// target is a blob payload supplied by the tree object, and we want
+/// the rule to be context-free so wire-side gates and read-side
+/// materializers agree on what's safe.
+pub fn validate_symlink_target(target: &str) -> Result<()> {
+    if target.is_empty() {
+        return Err(GytError::Object("symlink: empty target".into()));
+    }
+    if target.len() > 4096 {
+        return Err(GytError::Object(format!(
+            "symlink: target length {} exceeds 4096",
+            target.len()
+        )));
+    }
+    if target.as_bytes().contains(&0) {
+        return Err(GytError::Object("symlink: NUL in target".into()));
+    }
+    let p = Path::new(target);
+    if p.is_absolute() {
+        return Err(GytError::Object(format!(
+            "symlink: absolute target {target:?} not allowed"
+        )));
+    }
+    for c in p.components() {
+        if matches!(c, std::path::Component::ParentDir) {
+            return Err(GytError::Object(format!(
+                "symlink: target {target:?} contains parent reference"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a relative path to forward-slash form and return as a String.
 fn rel_to_forward_slash(rel: &Path) -> String {
     let mut s = String::new();

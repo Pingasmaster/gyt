@@ -579,13 +579,14 @@ fn materialize_tree_to(gyt_dir: &Path, tree_id: &ObjectId, root: &Path) -> Resul
         }
         let payload = crate::object::blob::read(gyt_dir, &f.hash)?;
         if f.mode == MODE_SYMLINK {
+            let target = std::str::from_utf8(&payload).map_err(|_| {
+                crate::errors::GytError::Object("symlink target is not utf-8".into())
+            })?;
+            crate::workdir::validate_symlink_target(target)?;
             let _ = std::fs::remove_file(&abs);
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(
-                    std::ffi::OsStr::new(std::str::from_utf8(&payload).unwrap_or("")),
-                    &abs,
-                )?;
+                std::os::unix::fs::symlink(std::ffi::OsStr::new(target), &abs)?;
             }
             #[cfg(not(unix))]
             {

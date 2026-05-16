@@ -202,6 +202,7 @@ fn restore_one(repo: &Repo, entry: &IndexEntry) -> Result<()> {
     if entry.mode == tree::MODE_SYMLINK {
         let target = std::str::from_utf8(&bytes)
             .map_err(|_| GytError::Object("symlink target is not utf-8".into()))?;
+        crate::workdir::validate_symlink_target(target)?;
         let _ = std::fs::remove_file(&abs);
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, &abs)?;
