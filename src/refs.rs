@@ -139,6 +139,18 @@ pub fn delete_ref(repo_gyt_dir: &Path, name: &str) -> Result<()> {
         return Err(GytError::Refs(format!("ref {name} not found")));
     }
     std::fs::remove_file(&p)?;
+    // fsync the containing directory so the unlink survives a power
+    // loss. Without this, on ext4/xfs the ref file can re-appear after
+    // a crash even though the application observed the delete succeed.
+    // Best-effort: on platforms where opening a directory for sync
+    // fails (some non-Unix targets) we accept the weaker durability
+    // rather than fail the user's `gyt branch -d` call. Mirrors the
+    // pattern fs_util::atomic_write uses for renames.
+    if let Some(parent) = p.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
