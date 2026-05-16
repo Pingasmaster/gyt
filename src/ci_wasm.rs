@@ -93,6 +93,7 @@
 
 use crate::errors::{GytError, Result};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -303,20 +304,33 @@ pub fn run_ci_wasm_with_policy(
                 let Some(safe) = resolve_read(caller.data(), &path_str) else {
                     return -2;
                 };
-                let meta = match fs::metadata(&safe) {
+                // TOCTTOU-safe read. Calling fs::metadata then fs::read
+                // would re-stat the file and could be tricked by a
+                // concurrent writer growing the file between check and
+                // load (host or other CI runs writing to the operator-
+                // permitted root). Open once, stat the open file handle,
+                // then bound the read with Read::take so the actual
+                // byte count cannot exceed CI_MAX_FILE_BYTES no matter
+                // what happens on the filesystem after the stat.
+                let f = match fs::File::open(&safe) {
+                    Ok(f) => f,
+                    Err(_) => return -5,
+                };
+                let meta = match f.metadata() {
                     Ok(m) => m,
                     Err(_) => return -5,
                 };
                 if !meta.is_file() {
                     return -2;
                 }
-                if meta.len() as usize > CI_MAX_FILE_BYTES {
+                let cap_plus_one = (CI_MAX_FILE_BYTES as u64).saturating_add(1);
+                let mut data = Vec::new();
+                if f.take(cap_plus_one).read_to_end(&mut data).is_err() {
+                    return -5;
+                }
+                if data.len() > CI_MAX_FILE_BYTES {
                     return -6;
                 }
-                let data = match fs::read(&safe) {
-                    Ok(d) => d,
-                    Err(_) => return -5,
-                };
                 let n = data.len().min(buf_len.max(0) as usize);
                 let Some(mem) = get_caller_memory(&mut caller) else {
                     return -3;
