@@ -446,16 +446,38 @@ pub fn server_policy_with_overrides(
     override_signers: Option<&Path>,
     policy_config: Option<&Path>,
 ) -> (bool, Vec<VerifyingKey>) {
-    let sign_required = match policy_config {
-        Some(p) if p.exists() => read_sign_required_from(p),
-        _ => read_sign_required(gyt_dir),
+    // F-D4-05: if --policy-config is configured, never fall through to
+    // the per-repo flag. If the file is unreadable / parse-fails at
+    // request time (was OK at startup), conservatively fail closed —
+    // sign_required = true with an empty allowed list, which evaluates
+    // to MissingAllowedSigners and rejects the push. Falling back to
+    // the per-repo flag would let a pusher with write access flip the
+    // flag off, defeating the override.
+    let sign_required = if let Some(p) = policy_config {
+        if !p.exists() {
+            // File vanished between startup and request: fail closed.
+            return (true, Vec::new());
+        }
+        read_sign_required_from(p)
+    } else {
+        read_sign_required(gyt_dir)
     };
     if !sign_required {
         return (false, Vec::new());
     }
-    let allowed = match override_signers {
-        Some(p) if p.exists() => load_allowed_signers_at(p).unwrap_or_default(),
-        _ => load_allowed_signers(gyt_dir).unwrap_or_default(),
+    // F-D4-05: if --signers is configured, the override path is the
+    // ONLY source of trust. Never silently fall back to the in-repo
+    // .gyt/allowed_signers — that's the file a pusher could edit to
+    // bootstrap their own key. If the override file vanished or fails
+    // to load at request time, return an empty allowed list so the
+    // policy evaluator emits MissingAllowedSigners and rejects.
+    let allowed = if let Some(p) = override_signers {
+        if !p.exists() {
+            return (true, Vec::new());
+        }
+        load_allowed_signers_at(p).unwrap_or_default()
+    } else {
+        load_allowed_signers(gyt_dir).unwrap_or_default()
     };
     (true, allowed)
 }
