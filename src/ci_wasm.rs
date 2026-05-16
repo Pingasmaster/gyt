@@ -548,7 +548,10 @@ fn read_bytes(slice: &[u8], ptr: i32, len: i32) -> Vec<u8> {
 /// Resolve a relative path against the read-allowed roots. Walks the
 /// roots in order; the first whose canonical form contains the
 /// candidate wins. `.gyt/` is always denied even if a permissive
-/// `--ci-read` would otherwise include it.
+/// `--ci-read` would otherwise include it — and that ban applies to
+/// the `.gyt/` of *every* read root, not just the primary repo.
+/// Otherwise an operator who pointed `--ci-read` at a second repo
+/// would silently expose that repo's `.gyt/` metadata.
 fn resolve_read(s: &Sandbox, rel: &str) -> Option<PathBuf> {
     if rel.contains('\0') || Path::new(rel).is_absolute() {
         return None;
@@ -565,6 +568,11 @@ fn resolve_read(s: &Sandbox, rel: &str) -> Option<PathBuf> {
             // never exposed even from a permissive flag.
             return None;
         }
+        if canonical.starts_with(root.join(".gyt")) {
+            // Same ban for any extra --ci-read root that happens to
+            // contain its own .gyt metadata directory.
+            return None;
+        }
         return Some(canonical);
     }
     None
@@ -575,7 +583,8 @@ fn resolve_read(s: &Sandbox, rel: &str) -> Option<PathBuf> {
 /// candidate wins. Refuses any path component of `..` regardless of
 /// canonicalization (which is needed because the destination usually
 /// doesn't exist yet, so canonicalize would fail). Denies anything
-/// under `.gyt/` even with a permissive grant.
+/// under `.gyt/` even with a permissive grant — for every write root,
+/// not just the primary repo's metadata.
 fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
     if rel.contains('\0') || Path::new(rel).is_absolute() {
         return None;
@@ -587,6 +596,7 @@ fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
     }
     for root in &s.write_roots {
         let cand = root.join(rel);
+        let root_gyt = root.join(".gyt");
         // If a parent of cand exists, canonicalize it for symlink check.
         if let Some(parent) = cand.parent()
             && parent.exists()
@@ -597,7 +607,9 @@ fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
             if !canon_parent.starts_with(root) {
                 continue;
             }
-            if canon_parent.starts_with(&s.repo_gyt_meta) {
+            if canon_parent.starts_with(&s.repo_gyt_meta)
+                || canon_parent.starts_with(&root_gyt)
+            {
                 return None;
             }
             // Lexical containment for the unresolved leaf.
@@ -608,7 +620,7 @@ fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
         }
         if cand.starts_with(root) {
             // Lexical-only fallback (parent doesn't exist yet).
-            if cand.starts_with(&s.repo_gyt_meta) {
+            if cand.starts_with(&s.repo_gyt_meta) || cand.starts_with(&root_gyt) {
                 return None;
             }
             return Some((cand, rel.to_string()));
