@@ -373,7 +373,11 @@ pub fn run_ci_wasm_with_policy(
                 };
                 let slice = mem.data(&caller);
                 let data = read_bytes(slice, data_ptr, data_len);
-                match fs::write(&safe_path, &data) {
+                // atomic_write (tmp + sync_all + rename + parent fsync)
+                // so a script that fuel-exhausts or epoch-traps mid-
+                // write doesn't leave half-written output for whichever
+                // downstream consumer picks the artifact up next.
+                match crate::fs_util::atomic_write(&safe_path, &data) {
                     Ok(()) => {
                         println!("[wasm-ci] wrote {relative}");
                         0
