@@ -127,6 +127,14 @@ pub fn encode_pack(entries: &[PackEntry]) -> Vec<u8> {
     out
 }
 
+/// Maximum number of PackEntry records `parse_pack` is willing to
+/// produce. Each entry costs ~56 bytes resident even before its
+/// `bytes` is allocated, so a 1 GiB decompressed body filled with
+/// zero-length entries would otherwise spawn ~268 M records and
+/// allocate ~15 GiB of RAM. 1M is far above any legitimate push
+/// (an entire mid-sized monorepo cold-clones with <1M objects).
+pub const MAX_PACK_ENTRIES: usize = 1_000_000;
+
 #[expect(
     clippy::indexing_slicing,
     clippy::expect_used,
@@ -145,6 +153,19 @@ pub fn parse_pack(body: &[u8]) -> Result<Vec<PackEntry>> {
         let len_bytes: [u8; 4] = body[pos..pos + 4].try_into().expect("checked above");
         let len = u32::from_le_bytes(len_bytes) as usize;
         pos += 4;
+        // F-D3-01: reject zero-length entries. A malicious packfile
+        // whose decompressed body is 1 GiB of all-zero u32 length
+        // prefixes would otherwise produce ~268 M PackEntry records
+        // with empty `bytes` vecs — ~15 GiB resident before the
+        // caller even started processing. A legitimate gyt object
+        // always has at least a "<kind> <size>\0" header so a 0-byte
+        // entry is provably bogus.
+        if len == 0 {
+            return Err(GytError::Parse(format!(
+                "pack: zero-length entry at offset {}",
+                pos - 4
+            )));
+        }
         if body.len() - pos < len {
             return Err(GytError::Parse(format!(
                 "pack: declared length {len} exceeds remaining {}",
@@ -153,6 +174,12 @@ pub fn parse_pack(body: &[u8]) -> Result<Vec<PackEntry>> {
         }
         let bytes = body[pos..pos + len].to_vec();
         pos += len;
+        // F-D3-01: cap entry count.
+        if out.len() >= MAX_PACK_ENTRIES {
+            return Err(GytError::Parse(format!(
+                "pack: entry count exceeds MAX_PACK_ENTRIES={MAX_PACK_ENTRIES}"
+            )));
+        }
         // The codec doesn't decompress or verify — those are the caller's job.
         // We can however hash the *raw on-disk* bytes to fill in `id`. But the
         // protocol carries the id implicitly — it's the hash of the *decoded*
