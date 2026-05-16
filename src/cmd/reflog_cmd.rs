@@ -92,18 +92,19 @@ fn print_entries(entries: &[reflog::Entry], max: Option<usize>) {
     for (i, e) in entries.iter().rev().take(take).enumerate() {
         let short_new = &e.new.to_hex()[..8];
         let short_old = e.old.map(|o| o.to_hex()[..8].to_string());
+        // F-D10-01: `who` and `msg` are attacker-controllable
+        // (they're written by ref-update callers including remote
+        // pushes); sanitize before terminal output.
+        let who_safe = crate::term::s(&e.who);
+        let msg_safe = crate::term::s(&e.message);
         match short_old {
             Some(s) => println!(
-                "{short_new} {s}..{short_new} {ts} {who}\t{msg}",
+                "{short_new} {s}..{short_new} {ts} {who_safe}\t{msg_safe}",
                 ts = e.timestamp,
-                who = e.who,
-                msg = e.message
             ),
             None => println!(
-                "{short_new} (create) {ts} {who}\t{msg}",
+                "{short_new} (create) {ts} {who_safe}\t{msg_safe}",
                 ts = e.timestamp,
-                who = e.who,
-                msg = e.message
             ),
         }
         let _ = i;

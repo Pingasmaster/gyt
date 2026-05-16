@@ -106,12 +106,16 @@ fn list(repo: &Repo) -> Result<()> {
             .strip_prefix("refs/heads/")
             .unwrap_or(full.as_str())
             .to_string();
+        // F-D10-01: refnames from disk can contain bytes that bypass
+        // the wire-side validator if the server's refs/* directory
+        // was edited out-of-band; sanitize before terminal output.
+        let short_safe = term::s(&short);
         let is_current = current.as_deref() == Some(short.as_str());
         if is_current {
-            let line = format!("* {short}");
+            let line = format!("* {short_safe}");
             println!("{}", term::paint_when(use_color, term::GREEN, &line));
         } else {
-            println!("  {short}");
+            println!("  {short_safe}");
         }
     }
     Ok(())

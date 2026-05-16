@@ -128,7 +128,10 @@ fn list(repo: &Repo) -> Result<()> {
     let tags = refs::list_refs(&repo.gyt_dir, "refs/tags")?;
     for (full, _id) in tags {
         let short = full.strip_prefix("refs/tags/").unwrap_or(full.as_str());
-        println!("{short}");
+        // F-D10-01: sanitize before terminal output in case a tag
+        // name landed on disk via a path that pre-dates the wire
+        // refname validator.
+        println!("{}", crate::term::s(short));
     }
     Ok(())
 }

@@ -64,21 +64,26 @@ fn show(repo: &Repo, id: &ObjectId, show_sig: bool) -> Result<()> {
             for p in &c.parents {
                 println!("parent {p}");
             }
+            // F-D10-01: every attacker-controlled string field is
+            // routed through `term::s` (a wrapper for safe_display)
+            // before output. Otherwise a commit message / author
+            // containing `\x1b]0;PWNED\x07` rewrites the operator's
+            // terminal title on every `gyt show`.
             for a in &c.authors {
-                println!("author {a}");
+                println!("author {}", term::s(a));
             }
-            println!("committer {}", c.committer);
+            println!("committer {}", term::s(&c.committer));
             for ai in &c.ai_assists {
-                println!("ai {ai}");
+                println!("ai {}", term::s(ai));
             }
             for r in &c.reviewers {
-                println!("reviewer {r}");
+                println!("reviewer {}", term::s(r));
             }
             if show_sig {
                 print_signature_status(&c, use_color);
             }
             println!();
-            print!("{}", c.message);
+            print!("{}", term::s(&c.message));
             if !c.message.ends_with('\n') {
                 println!();
             }
@@ -97,11 +102,11 @@ fn show(repo: &Repo, id: &ObjectId, show_sig: bool) -> Result<()> {
         }
         ObjectKind::Tag => {
             let t = tag::decode(&obj.payload)?;
-            println!("tag {}", t.name);
-            println!("Tagger: {}", t.tagger);
+            println!("tag {}", term::s(&t.name));
+            println!("Tagger: {}", term::s(&t.tagger));
             println!("target {} ({})", t.target, t.kind.as_str());
             println!();
-            print!("{}", t.message);
+            print!("{}", term::s(&t.message));
             if !t.message.ends_with('\n') {
                 println!();
             }

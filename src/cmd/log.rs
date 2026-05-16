@@ -506,7 +506,9 @@ fn compact_lanes(lanes: &[Option<ObjectId>]) -> Vec<Option<ObjectId>> {
 fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
-    let first_line = n.message.lines().next().unwrap_or("");
+    // F-D10-01: every attacker-controlled string field is routed
+    // through `term::safe_display` (= `term::s(_)`) before output.
+    let first_line = crate::term::s(n.message.lines().next().unwrap_or(""));
     if opts.oneline {
         if opts.show_signature {
             let _ = writeln!(out, "{short} [{}] {first_line}", short_sig_status(n));
@@ -515,7 +517,7 @@ fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options)
         }
     } else {
         let _ = writeln!(out, "commit {hex}");
-        let _ = writeln!(out, "Author: {}", primary_author_name(&n.author));
+        let _ = writeln!(out, "Author: {}", crate::term::s(&primary_author_name(&n.author)));
         if n.timestamp > 0 {
             let _ = writeln!(out, "Date:   {}", format_iso8601(n.timestamp, &n.tz_offset));
         }
@@ -524,7 +526,7 @@ fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options)
         }
         out.push('\n');
         for line in n.message.lines() {
-            let _ = writeln!(out, "    {line}");
+            let _ = writeln!(out, "    {}", crate::term::s(line));
         }
         out.push('\n');
     }
@@ -536,7 +538,7 @@ fn write_commit_oneline_after_marker(out: &mut String, n: &Node, opts: &Options)
 fn write_commit(out: &mut String, n: &Node, opts: &Options, prefix: &str) {
     let hex = n.id.to_hex();
     let short = &hex[..hex.len().min(8)];
-    let first_line = n.message.lines().next().unwrap_or("");
+    let first_line = crate::term::s(n.message.lines().next().unwrap_or(""));
     if opts.oneline {
         if opts.show_signature {
             let _ = writeln!(
@@ -549,7 +551,7 @@ fn write_commit(out: &mut String, n: &Node, opts: &Options, prefix: &str) {
         }
     } else {
         let _ = writeln!(out, "{prefix}commit {hex}");
-        let _ = writeln!(out, "{prefix}Author: {}", primary_author_name(&n.author));
+        let _ = writeln!(out, "{prefix}Author: {}", crate::term::s(&primary_author_name(&n.author)));
         if n.timestamp > 0 {
             let _ = writeln!(
                 out,
@@ -562,7 +564,7 @@ fn write_commit(out: &mut String, n: &Node, opts: &Options, prefix: &str) {
         }
         out.push('\n');
         for line in n.message.lines() {
-            let _ = writeln!(out, "{prefix}    {line}");
+            let _ = writeln!(out, "{prefix}    {}", crate::term::s(line));
         }
         out.push('\n');
     }

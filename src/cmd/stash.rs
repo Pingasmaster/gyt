@@ -212,7 +212,10 @@ fn do_list(repo: &Repo, args: &[String]) -> Result<()> {
         } else {
             format!("WIP on {branch_label}: {subject}")
         };
-        println!("stash@{{{i}}}: {line}");
+        // F-D10-01: stash subjects are commit message first lines —
+        // attacker-controlled if the stash was created from a hostile
+        // tree. Sanitize before terminal output.
+        println!("stash@{{{i}}}: {}", crate::term::s(&line));
     }
     Ok(())
 }
