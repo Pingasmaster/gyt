@@ -319,6 +319,18 @@ fn build_quic_server_config(
         quinn::IdleTimeout::try_from(std::time::Duration::from_mins(1))
             .expect("60s within QUIC limits"),
     ));
+    // Refuse incoming QUIC datagrams. gyt's HTTP/3 path is streams-
+    // only; leaving datagram support at the quinn default exposes
+    // an unused frame parser to every connection. None denies them
+    // entirely (the peer's DATAGRAM frames are dropped at the
+    // transport layer).
+    tp.datagram_receive_buffer_size(None);
+    // Pin the congestion controller explicitly. quinn's default is
+    // CUBIC today but undocumented and may shift between 0.11.x
+    // patch releases; an unannounced switch to e.g. BBRv2 could
+    // change our pack-response latency profile under load. Lock it
+    // in.
+    tp.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
     quic_cfg.transport_config(Arc::new(tp));
     Ok(quic_cfg)
 }
