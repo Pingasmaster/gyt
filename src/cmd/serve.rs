@@ -212,6 +212,27 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         ));
     }
 
+    // F-D9-03: refuse to start an open server bound to a non-loopback
+    // address. With neither --auth-token nor --auth-tokens, every
+    // request is authorized — that's only safe on a loopback bind. An
+    // operator typo (forgetting --auth-tokens after copy/paste) must
+    // not silently expose anonymous push/pull to the network.
+    if auth_token.is_none() && auth_tokens_file.is_none() {
+        for addr in std::iter::once(listen.as_str())
+            .chain(h2_listen.as_deref())
+            .chain(h3_listen.as_deref())
+        {
+            if !is_loopback_listen_addr(addr) {
+                return Err(crate::errors::GytError::InvalidArgument(format!(
+                    "--listen {addr:?} binds a non-loopback address but no \
+                     --auth-token / --auth-tokens is set — refusing to start \
+                     an open server. Either bind to 127.0.0.1 / [::1], or \
+                     configure auth."
+                )));
+            }
+        }
+    }
+
     Ok(ServeConfig {
         listen_addr: listen,
         h2_listen_addr: h2_listen,
@@ -232,6 +253,40 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
 pub fn run(args: &[String]) -> Result<()> {
     let config = parse_args(args)?;
     serve(&config)
+}
+
+/// Is the given `host:port` string a loopback bind? Used by parse_args
+/// to refuse open (unauthenticated) servers on non-loopback addresses.
+///
+/// Accepts:
+/// - `127.0.0.0/8` (the IPv4 loopback block)
+/// - `::1`
+/// - `localhost`
+///
+/// Rejects everything else, including `0.0.0.0` (any-IPv4) and `::`
+/// (any-IPv6).
+fn is_loopback_listen_addr(addr: &str) -> bool {
+    // Strip the trailing `:port` (works for both IPv4 host:port and
+    // bracketed `[ipv6]:port`). Empty / malformed → not loopback.
+    let host = if let Some(stripped) = addr.strip_prefix('[')
+        && let Some(end) = stripped.find(']')
+    {
+        &stripped[..end]
+    } else if let Some(idx) = addr.rfind(':') {
+        &addr[..idx]
+    } else {
+        addr
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
 }
 
 #[cfg(test)]
