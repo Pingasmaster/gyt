@@ -256,18 +256,33 @@ pub fn run_ci_wasm_with_policy(
         .func_wrap(
             "gyt_ci",
             "log",
-            |mut caller: Caller<'_, Sandbox>, ptr: i32, len: i32| {
+            // Returning Result<(), wasmtime::Error> keeps the wasm-facing
+            // import signature unchanged (still `(i32, i32)` → no
+            // results) while letting us trap on the cap-overflow path.
+            // Silent truncation here would let a misbehaving module
+            // fill the log up to the cap with innocuous content and
+            // then hide its evidence past it; trapping makes the
+            // attempt loud — the run fails with a recordable error.
+            |mut caller: Caller<'_, Sandbox>,
+             ptr: i32,
+             len: i32|
+             -> std::result::Result<(), wasmtime::Error> {
                 let len_us = len.max(0) as usize;
                 let already = caller.data().log_used;
                 if already.saturating_add(len_us) > CI_MAX_LOG_BYTES {
-                    return;
+                    return Err(wasmtime::Error::msg(format!(
+                        "ci log output exceeds {CI_MAX_LOG_BYTES}-byte cap"
+                    )));
                 }
                 caller.data_mut().log_used = already + len_us;
                 let Some(msg) = read_caller_string(&mut caller, ptr, len) else {
-                    return;
+                    // Invalid pointer/length is a guest bug, not a cap
+                    // evasion — quietly skip the print and keep going.
+                    return Ok(());
                 };
                 print!("[wasm-ci] {msg}");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
+                Ok(())
             },
         )
         .map_err(|e| GytError::Ci(format!("linker log: {e}")))?;
