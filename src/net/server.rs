@@ -659,6 +659,14 @@ async fn serve_conn_tls(
 ///   resets we send back. Both numbers are conservative for legitimate
 ///   clients (a parallel-clone can hit ~10 inflight; 30/100 leaves
 ///   headroom for jitter).
+/// - `max_header_list_size = 256 KiB`. hyper-util's auto::Builder
+///   inherits hyper's permissive default for incoming header frames;
+///   without an explicit cap a peer can fragment a single oversized
+///   header list across many CONTINUATION frames (CVE-2024-27316
+///   class) and force the server to allocate megabytes of HPACK state
+///   *before* the 256 MiB body cap can apply. Real gyt requests carry
+///   a handful of small headers (Authorization, Content-Type, a
+///   user-agent), so 256 KiB is a tight cap with comfortable headroom.
 pub(crate) fn configure_h2(
     mut b: hyper_util::server::conn::auto::Http2Builder<'_, hyper_util::rt::TokioExecutor>,
 ) {
@@ -669,6 +677,7 @@ pub(crate) fn configure_h2(
         .max_concurrent_streams(200)
         .max_pending_accept_reset_streams(Some(30))
         .max_local_error_reset_streams(Some(100))
+        .max_header_list_size(256 * 1024)
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
         .keep_alive_timeout(std::time::Duration::from_secs(30))
         .enable_connect_protocol();
