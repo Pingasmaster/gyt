@@ -1001,13 +1001,53 @@ impl AclEntry {
     }
 }
 
+/// Validate an ACL repo-pattern at load time. F-D4-02: previously
+/// `prefix*` was treated as an unanchored prefix match, so `alice*`
+/// silently matched `alice-evil/secret`. We now require any `*` to
+/// be in the final position AND the character immediately before it
+/// to be `/` — so the only valid patterns are `*` (global), an exact
+/// repo name, or `<segment>/*` / `<segment>/<segment>/*` / … (any
+/// path with a trailing `/*`).
+fn validate_acl_pattern(pattern: &str) -> std::result::Result<(), String> {
+    if pattern.is_empty() {
+        return Err("pattern must be non-empty".into());
+    }
+    if pattern == "*" {
+        return Ok(());
+    }
+    let star_count = pattern.bytes().filter(|&b| b == b'*').count();
+    if star_count == 0 {
+        return Ok(());
+    }
+    if star_count > 1 {
+        return Err(format!(
+            "pattern {pattern:?} contains {star_count} '*' characters (at most one allowed, in final position)"
+        ));
+    }
+    if !pattern.ends_with('*') {
+        return Err(format!(
+            "'*' must be the final character of {pattern:?}"
+        ));
+    }
+    // Strip the trailing '*' and require the remaining prefix to end
+    // with '/'. This is what segment-anchoring means.
+    let prefix = &pattern[..pattern.len() - 1];
+    if !prefix.ends_with('/') {
+        return Err(format!(
+            "trailing '*' must follow '/'; {pattern:?} is not segment-anchored"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a `--auth-tokens` file. Lines that are blank or start with `#`
 /// are ignored. Other lines must have exactly three TAB-separated
 /// fields: `token`, `pattern`, `rw|ro`. Anything else is a hard error
 /// because silently dropping a malformed line could downgrade trust.
 #[expect(
     clippy::indexing_slicing,
-    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    clippy::string_slice,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line; the validate_acl_pattern slice is by ASCII-only '*' position which is also a UTF-8 char boundary"
 )]
 fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
     let text = std::fs::read_to_string(path).map_err(|e| {
@@ -1044,6 +1084,13 @@ fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
         if token.is_empty() || pattern.is_empty() {
             return Err(crate::errors::GytError::InvalidArgument(format!(
                 "{}: line {}: token and pattern must be non-empty",
+                path.display(),
+                i + 1
+            )));
+        }
+        if let Err(reason) = validate_acl_pattern(&pattern) {
+            return Err(crate::errors::GytError::InvalidArgument(format!(
+                "{}: line {}: {reason}",
                 path.display(),
                 i + 1
             )));
