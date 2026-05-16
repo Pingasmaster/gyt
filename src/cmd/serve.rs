@@ -19,6 +19,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut signers_file: Option<PathBuf> = None;
     let mut policy_config: Option<PathBuf> = None;
     let mut allow_multiprocess = false;
+    let mut allow_force = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -61,6 +62,11 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                      \x20                      accepts). On-disk locks keep data correct; per-process\n\
                      \x20                      caches and rate-limit buckets diverge per replica."
                 );
+                println!(
+                    "  --allow-force         Accept `?force=1` and `?force-with-lease=1` on\n\
+                     \x20                      /refs/update. Default off: any `rw` token would\n\
+                     \x20                      otherwise be able to rewind every ref it can write."
+                );
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     h2_listen_addr: h2_listen,
@@ -75,6 +81,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     signers_file,
                     policy_config,
                     allow_multiprocess,
+                    allow_force,
                 });
             }
             "--listen" => {
@@ -179,6 +186,9 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
             "--allow-multiprocess" => {
                 allow_multiprocess = true;
             }
+            "--allow-force" => {
+                allow_force = true;
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -246,6 +256,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         auth_tokens_file,
         signers_file,
         policy_config,
+        allow_force,
         allow_multiprocess,
     })
 }

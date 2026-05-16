@@ -195,6 +195,16 @@ pub struct ServeConfig {
     /// per replica — the file-level locks (refs.lock, objects.lock,
     /// audit-rotate.lock) keep the on-disk data correct.
     pub allow_multiprocess: bool,
+    /// When true, accept the `?force=1` and `?force-with-lease=1`
+    /// query parameters on `/refs/update`. When false (default), both
+    /// query parameters are ignored — every push runs in strict
+    /// FastForward mode regardless of what the client requests.
+    ///
+    /// F-D4-03: previously every `rw` token implicitly carried force-
+    /// push capability across every ref it could write. The ACL had
+    /// no `force` bit. Operators who want to keep that behavior must
+    /// now opt in by passing `--allow-force` to `gyt serve`.
+    pub allow_force: bool,
 }
 #[expect(
     clippy::expect_used,
@@ -335,6 +345,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         auth_acl,
         signers_file: config.signers_file.clone(),
         policy_config: config.policy_config.clone(),
+        allow_force: config.allow_force,
         shutdown: Mutex::new(false),
         metrics: Metrics::default(),
         listen_addr: addr,
@@ -926,6 +937,10 @@ pub(crate) struct ServerState {
     auth_acl: Option<Vec<AclEntry>>,
     signers_file: Option<PathBuf>,
     policy_config: Option<PathBuf>,
+    /// Mirrors `ServeConfig::allow_force`. When false (default),
+    /// `?force=1` / `?force-with-lease=1` on `/refs/update` are
+    /// ignored — every push runs in strict FastForward mode.
+    allow_force: bool,
     pub(crate) shutdown: Mutex<bool>,
     metrics: Metrics,
     /// Bound local address. Stored so the admin-shutdown handler can
@@ -2705,10 +2720,14 @@ fn wire_refs_update(
         }
     };
 
-    let force = raw_query
-        .is_some_and(|q| q.split('&').any(|p| p == "force=1"));
-    let force_with_lease = raw_query
-        .is_some_and(|q| q.split('&').any(|p| p == "force-with-lease=1"));
+    // F-D4-03: query-string force flags are now gated behind a server-
+    // wide opt-in. Default off — any `rw` token could otherwise rewind
+    // every ref it could write. Operators who want git-style "rw
+    // implies force" must pass `--allow-force` to `gyt serve`.
+    let force = state.allow_force
+        && raw_query.is_some_and(|q| q.split('&').any(|p| p == "force=1"));
+    let force_with_lease = state.allow_force
+        && raw_query.is_some_and(|q| q.split('&').any(|p| p == "force-with-lease=1"));
 
     // Per-repo lock: hold for the entire evaluate+write sequence to
     // prevent two concurrent pushes from both passing the FF check (which
