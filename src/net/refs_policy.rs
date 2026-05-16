@@ -322,6 +322,25 @@ pub fn evaluate_with_mode(
             ));
             continue;
         }
+        // F-D8-01: issue/PR refs back blob objects (canonical TOML),
+        // not commits. The FF / ancestry check below would invoke
+        // `is_ancestor` which calls `commit::read` on the blob hash —
+        // that fails for every non-commit object, so `is_ancestor`
+        // returned `Ok(false)` and EVERY second push of an issue or
+        // PR was rejected with 409. Skip the commit-DAG FF gate for
+        // these refs; the canonical-TOML monotonic-append check is
+        // applied separately at `wire_objects_have` (F-D8-02).
+        //
+        // Signature enforcement also doesn't apply to issue/PR blobs
+        // — `commits_new_since` on a blob seed returns an empty list
+        // (now that F-D4-04 distinguishes seed-vs-parent reads), so
+        // the signature block falls through harmlessly. We special-
+        // case here to make the intent obvious.
+        let is_metadata_ref =
+            u.name.starts_with("refs/issues/") || u.name.starts_with("refs/prs/");
+        if is_metadata_ref {
+            continue;
+        }
         // Three modes have three different gate combinations. We always
         // run signature verification at the end if `sign_required`.
         let force = mode == Mode::Force;
