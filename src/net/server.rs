@@ -594,7 +594,11 @@ async fn serve_conn_plain(
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_mins(1))
         .max_buf_size(64 * 1024);
-    if let Err(e) = builder.serve_connection(io, service).with_upgrades().await {
+    // No `.with_upgrades()` — gyt's git wire protocol does not use
+    // HTTP Upgrade (no WebSocket, no h2c, no CONNECT). The matching
+    // TLS path already omits it; the plain listener carried it for
+    // no reason and only added Upgrade-header parser surface.
+    if let Err(e) = builder.serve_connection(io, service).await {
         let _ = e; // peer reset / slow-loris not actionable
     }
 }
