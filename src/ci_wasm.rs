@@ -408,8 +408,15 @@ pub fn run_ci_wasm_with_policy(
     // The thread exits when the engine is dropped — engine is cloned
     // (Arc internally), so the ticker holds a clone and the store
     // holds another; when both go out of scope, the engine drops.
-    let ticker_engine = engine.clone();
     let deadline_secs = policy.wall_time_secs.max(1);
+    // Set the deadline BEFORE spawning the ticker. The ticker has a
+    // 1 s pre-sleep so in practice it can't increment the epoch
+    // before set_epoch_deadline runs anyway, but the explicit order
+    // here removes the dependency on that ordering — a future
+    // refactor that drops the pre-sleep can't accidentally trap the
+    // store on its very first instruction.
+    store.set_epoch_deadline(deadline_secs);
+    let ticker_engine = engine.clone();
     let ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ticker_stop_clone = ticker_stop.clone();
     let ticker = std::thread::spawn(move || {
@@ -421,7 +428,6 @@ pub fn run_ci_wasm_with_policy(
             ticker_engine.increment_epoch();
         }
     });
-    store.set_epoch_deadline(deadline_secs);
 
     // 4. Instantiate. If the module imports anything outside our
     //    `gyt_ci` namespace, this fails — by design.
