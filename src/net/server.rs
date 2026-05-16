@@ -34,6 +34,12 @@ use std::thread;
 /// Hard cap on request body size. Anything over this is refused before
 /// the server tries to allocate a buffer for it.
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// End-to-end wall-clock budget for receiving a request body. Closes
+/// F-D1-02: MAX_BODY_BYTES bounds bytes, this bounds *time*, so a
+/// slow-body slowloris cannot pin a worker indefinitely. 120 s is
+/// generous for legitimate ~hundreds-of-megabyte pushes over slow
+/// links while making the slowloris-on-body class non-viable.
+pub(crate) const BODY_READ_TIMEOUT_SECS: u64 = 120;
 
 /// Upper bound on how long shutdown waits for in-flight tokio tasks
 /// to finish before tearing the runtime down. Tokio's `Runtime::Drop`
@@ -748,12 +754,36 @@ async fn handle_async_request(
     // `&body_bytes` and let Bytes::deref handle the slice view.
     let body_bytes: bytes::Bytes = {
         let limited = Limited::new(req.into_body(), MAX_BODY_BYTES);
-        match limited.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
+        // F-D1-02: bound the body-read by wall-clock time, not just
+        // byte count. The MAX_BODY_BYTES cap stops a 1 GiB request,
+        // but a client that drips 1 byte every 30 s of a 100 MiB body
+        // pins a tokio task and an inflight permit indefinitely. With
+        // 10 k inflight permits, ~10 k slow-body sockets DoS the
+        // whole listener — neither MAX_WORKERS, MAX_INFLIGHT, nor
+        // the per-IP rate-limit fire (rate-limit only sees completed
+        // requests). 120 s is generous for legitimate large pushes
+        // while killing the slowloris-on-body class outright.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(BODY_READ_TIMEOUT_SECS),
+            limited.collect(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c.to_bytes(),
+            Ok(Err(e)) => {
                 let mut resp = build_response(
                     413,
                     format!("body too large or read error: {e}").into_bytes(),
+                    "text/plain",
+                );
+                apply_protocol_headers(resp.headers_mut(), &state);
+                return Ok(resp);
+            }
+            Err(_) => {
+                let mut resp = build_response(
+                    408,
+                    format!("request body read exceeded {BODY_READ_TIMEOUT_SECS}s")
+                        .into_bytes(),
                     "text/plain",
                 );
                 apply_protocol_headers(resp.headers_mut(), &state);

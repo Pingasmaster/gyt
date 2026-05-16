@@ -140,14 +140,36 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    // Drain body with a size cap.
-    let body_bytes = match buffer_body(req.into_body()).await {
-        Ok(b) => b,
-        Err(msg) => {
+    // Drain body with a size cap AND a wall-clock deadline.
+    // F-D1-02: slowloris-on-body would otherwise pin tokio tasks
+    // indefinitely under the byte cap. Mirrors the timeout used by
+    // the HTTP/1.1 path in net::server.
+    let body_bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::net::server::BODY_READ_TIMEOUT_SECS),
+        buffer_body(req.into_body()),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(msg)) => {
             let mut resp = build_response(
                 413,
                 "Payload Too Large",
                 msg.into_bytes(),
+                "text/plain",
+            );
+            crate::net::server::apply_protocol_headers(resp.headers_mut(), &state);
+            return Ok(resp);
+        }
+        Err(_) => {
+            let mut resp = build_response(
+                408,
+                "Request Timeout",
+                format!(
+                    "h2 body read exceeded {}s",
+                    crate::net::server::BODY_READ_TIMEOUT_SECS
+                )
+                .into_bytes(),
                 "text/plain",
             );
             crate::net::server::apply_protocol_headers(resp.headers_mut(), &state);

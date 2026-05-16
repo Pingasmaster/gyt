@@ -142,40 +142,57 @@ async fn handle_h3_request(
 
     // Drain request body. h3 streams the body as a sequence of Bytes
     // chunks; we buffer with a hard size cap matching the HTTP/1.1
-    // and HTTP/2 paths.
-    let mut body_buf: Vec<u8> = Vec::new();
-    let recv_ok = loop {
-        match stream.recv_data().await {
-            Ok(Some(mut chunk)) => {
-                use bytes::Buf as _;
-                while chunk.has_remaining() {
-                    let next = chunk.chunk();
-                    if body_buf.len() + next.len() > H3_MAX_BODY_BYTES {
-                        let _ = write_h3_simple(
-                            &mut stream,
-                            413,
-                            b"body too large",
-                            "text/plain",
-                            &state,
-                        )
-                        .await;
-                        return;
+    // and HTTP/2 paths, AND a wall-clock deadline matching them
+    // (F-D1-02: slowloris-on-body would otherwise pin a QUIC stream
+    // task indefinitely under the byte cap — quinn's 60 s idle
+    // timeout resets on every single byte).
+    let body_buf: Vec<u8> = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::net::server::BODY_READ_TIMEOUT_SECS),
+        async {
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(mut chunk)) => {
+                        use bytes::Buf as _;
+                        while chunk.has_remaining() {
+                            let next = chunk.chunk();
+                            if buf.len() + next.len() > H3_MAX_BODY_BYTES {
+                                return Err("body too large");
+                            }
+                            buf.extend_from_slice(next);
+                            let n = next.len();
+                            chunk.advance(n);
+                        }
                     }
-                    body_buf.extend_from_slice(next);
-                    let n = next.len();
-                    chunk.advance(n);
+                    Ok(None) => return Ok(buf),
+                    Err(e) => {
+                        eprintln!("gyt serve: h3 body recv: {e}");
+                        return Err("h3 body recv");
+                    }
                 }
             }
-            Ok(None) => break true,
-            Err(e) => {
-                eprintln!("gyt serve: h3 body recv: {e}");
-                break false;
-            }
+        },
+    )
+    .await
+    {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(msg)) => {
+            let status = if msg == "body too large" { 413 } else { 400 };
+            let _ = write_h3_simple(&mut stream, status, msg.as_bytes(), "text/plain", &state).await;
+            return;
+        }
+        Err(_) => {
+            let _ = write_h3_simple(
+                &mut stream,
+                408,
+                b"h3 body read timeout",
+                "text/plain",
+                &state,
+            )
+            .await;
+            return;
         }
     };
-    if !recv_ok {
-        return;
-    }
 
     let st_blocking = state.clone();
     let auth_clone = auth_header.clone();
