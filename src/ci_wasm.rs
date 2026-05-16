@@ -96,7 +96,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, ResourceLimiter, Store};
+use wasmtime::{
+    Caller, Config, Engine, Linker, Memory, Module, ResourceLimiter, Store, WasmBacktraceDetails,
+};
 
 // ─── Public limit constants ──────────────────────────────────────────
 //
@@ -187,6 +189,20 @@ pub fn run_ci_wasm_with_policy(
         .wasm_multi_value(true)
         .wasm_multi_memory(false)
         .wasm_memory64(false)
+        // Deny backtrace details on trap. wasmtime's default includes
+        // module + function-name strings in the trap context, which a
+        // malicious CI module observes through the error it surfaces.
+        // We never propagate these strings to the WASM caller (we only
+        // print them locally), but ::Disable keeps the host's symbol
+        // table out of any future error path that might.
+        .wasm_backtrace_details(WasmBacktraceDetails::Disable)
+        // Canonicalize NaN bits on floating-point ops. Defaults leave
+        // platform-dependent NaN payloads visible to the guest, which
+        // is a microarchitectural side channel (the guest can fingerprint
+        // the host CPU, and on some workloads extract bits of internal
+        // state via NaN-payload branching). Cost is a small per-op mask;
+        // nothing in our CI workload is float-heavy enough to notice.
+        .cranelift_nan_canonicalization(true)
         .max_wasm_stack(CI_MAX_WASM_STACK)
         // wasmtime ≥ 44 validates `max_wasm_stack ≤ async_stack_size` even when
         // async isn't used; default async_stack_size (2 MiB) is below our 8 MiB
