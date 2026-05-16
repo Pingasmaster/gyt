@@ -51,6 +51,13 @@ pub fn run(args: &[String]) -> Result<()> {
     let repo = Repo::open(&std::env::current_dir()?)?;
     let cwd = repo.workdir.clone();
 
+    // F-D9-02: hold the repo lock across the *entire* destructive
+    // walk + write. A concurrent `gyt commit`, `gyt push`, or
+    // `gyt fetch` racing this rewrite would leave ref pointers
+    // inconsistent with rewritten content. The lock auto-drops at
+    // end of scope.
+    let _repo_lock = repo.lock()?;
+
     let mut resolved: Vec<PathBuf> = Vec::new();
     for p in &paths {
         let abs = cwd.join(p);
@@ -212,15 +219,27 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
+    // F-D9-01: refuse to update refs unless the rewrite walk
+    // completes. The previous code silently broke out at
+    // `max_depth = 10000`, leaving the refs partially rewritten —
+    // unrewritten ancestors retained the secret-bearing blobs and
+    // were still reachable through parent pointers. The whole
+    // *purpose* of this command is to purge secrets from history;
+    // a partial rewrite defeats it.
+    //
+    // We size the walk against the total visited commits (computed
+    // above) plus a generous safety margin; if we somehow visit far
+    // more, that's a graph-cycle bug and we should abort hard.
     let mut seen: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut stack: Vec<ObjectId> = commits.keys().copied().collect();
-    let mut depth = 0;
-    let max_depth = 10000;
+    let walk_budget = commits.len().saturating_mul(2).saturating_add(16);
+    let mut visited_count: usize = 0;
+    let mut walk_complete = true;
 
     while let Some(oid) = stack.pop() {
-        depth += 1;
-        if depth > max_depth {
-            eprintln!("warning: hit max rewrite depth, stopping");
+        visited_count += 1;
+        if visited_count > walk_budget {
+            walk_complete = false;
             break;
         }
         if seen.contains_key(&oid) {
@@ -257,9 +276,30 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
+    if !walk_complete {
+        return Err(GytError::Repo(format!(
+            "history rewrite did not complete (visited {visited_count} of \
+             at least {} commits before exceeding the walk budget). Refusing \
+             to update refs — a partial rewrite would leave the targeted \
+             content reachable through unrewritten ancestors.",
+            commits.len()
+        )));
+    }
+
+    // F-D9-02: every ref movement gets a reflog entry so the operator
+    // has an undo breadcrumb (the previous tip is still in the
+    // reflog even though we've torn the commit graph apart).
     for (name, old_oid) in &head_refs {
         if let Some(&new_oid) = seen.get(old_oid) {
             refs::write_ref(&repo.gyt_dir, name, &new_oid)?;
+            crate::reflog::record(
+                &repo.gyt_dir,
+                name,
+                Some(old_oid),
+                &new_oid,
+                "getthefuckoutofmyrepo",
+                "history rewrite",
+            );
             eprintln!("updated ref {name}: {old_oid} -> {new_oid}");
         }
     }
