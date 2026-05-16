@@ -1135,16 +1135,35 @@ fn authorize_with_metric(
     ok
 }
 
-/// Derive an audit-log actor identifier for the request. We fingerprint
-/// the presented bearer token with full-strength BLAKE3 (32 bytes →
-/// 64 hex chars) so two distinct tokens are distinguishable AND a
-/// forensic adversary can't feasibly brute-force a target fingerprint
-/// to forge audit entries. Anonymous requests get None → the audit
-/// path records "anon".
+/// Per-process key for audit-log token fingerprinting. Random,
+/// initialized once on first use, never persisted. Same token gives
+/// the same fingerprint within one server lifetime; across restarts
+/// the fingerprint changes — that's acceptable for incident-scoped
+/// forensic correlation and removes the offline brute force vector
+/// that an unkeyed BLAKE3 of a short token would have allowed.
+fn audit_fingerprint_key() -> &'static [u8; 32] {
+    use rand::RngCore as _;
+    static K: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        buf
+    })
+}
+
+/// Derive an audit-log actor identifier for the request. We
+/// fingerprint the presented bearer token with **keyed** BLAKE3 so an
+/// attacker who later reads the audit log cannot precompute
+/// blake3(candidate) over the plausible token space to recover the
+/// raw token. The 32-byte key is per-process (see
+/// audit_fingerprint_key) — log entries are correlatable within one
+/// server lifetime and shed forensic value across restarts; that's
+/// the right tradeoff vs. the offline brute force risk of an unkeyed
+/// hash on short tokens.
 fn actor_for(auth_header: Option<&str>) -> Option<String> {
     let header = auth_header?;
     let token = header.strip_prefix("Bearer ")?;
-    let h = blake3::hash(token.as_bytes());
+    let h = blake3::keyed_hash(audit_fingerprint_key(), token.as_bytes());
     let bytes = h.as_bytes();
     let mut hex = String::with_capacity(64);
     for &b in bytes {
