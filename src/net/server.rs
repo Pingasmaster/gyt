@@ -649,6 +649,16 @@ async fn serve_conn_tls(
 ///   meaningfully is scheduling, not bandwidth.
 /// - Explicit `enable_connect_protocol` — future-proofs against
 ///   CONNECT-method clients (h2 RFC 8441). Cheap to set.
+/// - `max_pending_accept_reset_streams = 30` + `max_local_error_reset_streams
+///   = 100`. CVE-2023-44487 ("HTTP/2 Rapid Reset") lets a peer open and
+///   immediately RST_STREAM each stream so the per-stream cap above
+///   becomes irrelevant — work proceeds out-of-order on streams the
+///   peer has already cancelled. The pending-accept cap triggers a
+///   GOAWAY once a peer queues more than 30 freshly-reset streams
+///   awaiting our accept; the local-error cap bounds protocol-error
+///   resets we send back. Both numbers are conservative for legitimate
+///   clients (a parallel-clone can hit ~10 inflight; 30/100 leaves
+///   headroom for jitter).
 pub(crate) fn configure_h2(
     mut b: hyper_util::server::conn::auto::Http2Builder<'_, hyper_util::rt::TokioExecutor>,
 ) {
@@ -657,6 +667,8 @@ pub(crate) fn configure_h2(
         .initial_connection_window_size(16 * 1024 * 1024)
         .max_frame_size(32 * 1024)
         .max_concurrent_streams(200)
+        .max_pending_accept_reset_streams(Some(30))
+        .max_local_error_reset_streams(Some(100))
         .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
         .keep_alive_timeout(std::time::Duration::from_secs(30))
         .enable_connect_protocol();
