@@ -33,13 +33,19 @@ socket2 = { version = "=0.6.3", features = ["all"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-# F-D11-03: `strip = "symbols"` left DWARF debug sections in place,
-# which embed the build machine's absolute source paths
-# (/home/<user>/temp/gyt/src/..., ~/.cargo/registry/...). `strip =
-# true` strips both the symbol table AND DWARF. `panic = "unwind"`
-# is intentionally kept (not the default `abort`) because
-# src/fuzz.rs uses std::panic::catch_unwind.
+# `strip = true` removes the symbol table AND DWARF so build-machine
+# paths (/home/<user>/..., ~/.cargo/registry/...) don't leak.
 strip = true
+# `panic = "abort"` drops unwinding tables — smaller release binary
+# and slightly faster. Safe because the production binary does NOT
+# use `std::panic::catch_unwind`: every catch_unwind site is in
+# `src/fuzz.rs`, which is only exercised through external cargo-fuzz
+# harnesses under the dev/test profile (where panic stays at the
+# default "unwind"). Tests also run under dev profile. The strict
+# clippy regime (deny unwrap/expect/panic/indexing_slicing/...)
+# makes a release panic effectively unreachable; if one ever did
+# fire, aborting beats silently continuing in a server.
+panic = "abort"
 
 # === STRICT CLIPPY HARNESSES ===
 #

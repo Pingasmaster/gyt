@@ -424,8 +424,31 @@ mod tests {
     #[test]
     fn serve_custom_listen_addr() {
         let _g = lock();
-        let config = parse_args(&["--listen".into(), "0.0.0.0:3000".into()]).unwrap();
+        // F-D9-03 added: a non-loopback bind without auth is refused.
+        // Pair the listen with --auth-token so the config parses.
+        let config = parse_args(&[
+            "--listen".into(),
+            "0.0.0.0:3000".into(),
+            "--auth-token".into(),
+            "secret".into(),
+        ])
+        .unwrap();
         assert_eq!(config.listen_addr, "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn serve_non_loopback_without_auth_refused() {
+        let _g = lock();
+        // F-D9-03: refuse open server on non-loopback.
+        let res = parse_args(&["--listen".into(), "0.0.0.0:3000".into()]);
+        let msg = match res {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("non-loopback") && msg.contains("refusing to start"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

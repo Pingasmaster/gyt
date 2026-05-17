@@ -388,10 +388,13 @@ mod tests {
 
     #[test]
     fn round_trip_pack() {
+        // F-D3-01 now rejects zero-length entries (every legitimate
+        // gyt object has at least a `<kind> <size>\0` header). The
+        // round-trip test was updated to use only non-empty entries.
         let entries = vec![
             PackEntry {
                 id: ObjectId([0u8; 32]),
-                bytes: vec![],
+                bytes: b"x".to_vec(),
             },
             PackEntry {
                 id: ObjectId([0u8; 32]),
@@ -411,6 +414,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_pack_rejects_zero_length_entry() {
+        // F-D3-01: a u32(0) prefix on its own would otherwise let an
+        // attacker spawn ~268 M empty PackEntry records from 1 GiB of
+        // decompressed zeros.
+        let bytes = 0u32.to_le_bytes().to_vec();
+        assert!(parse_pack(&bytes).is_err());
+    }
+
+    #[test]
     fn parse_pack_rejects_truncated_length() {
         // 3 bytes — not enough for the u32 length.
         assert!(parse_pack(&[0u8; 3]).is_err());
@@ -427,10 +439,11 @@ mod tests {
 
     #[test]
     fn round_trip_packfile() {
+        // F-D3-01 rejects zero-length entries — use non-empty ones.
         let entries = vec![
             PackEntry {
                 id: ObjectId([0u8; 32]),
-                bytes: vec![],
+                bytes: b"x".to_vec(),
             },
             PackEntry {
                 id: ObjectId([0u8; 32]),

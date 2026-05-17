@@ -3362,10 +3362,15 @@ fn acl_ro_token_cannot_push_even_after_many_attempts() {
 }
 
 #[test]
-fn acl_pattern_matches_prefix_only_not_suffix() {
+fn acl_exact_pattern_matches_named_repo_only() {
+    // F-D4-02 (May 2026): ACL patterns must now be exact, the global
+    // `*`, or segment-anchored `<seg>/*`. Unanchored prefixes like
+    // `team-*` are refused at config load. This test pins the
+    // post-F-D4-02 contract: an exact pattern grants access to that
+    // repo and to no other, even one with a longer name.
     let mut e = Env::new("acl-pattern");
     let acl = e.path("acl.tsv");
-    std::fs::write(&acl, b"team-tok\tteam-*\trw\n").unwrap();
+    std::fs::write(&acl, b"team-tok\tteam-alpha\trw\n").unwrap();
     let (_url, repos) = e.start_server(&["--auth-tokens", acl.to_str().unwrap()]);
     let team_repo = repos.join("team-alpha");
     let other_repo = repos.join("other");

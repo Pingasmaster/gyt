@@ -3019,6 +3019,8 @@ mod tests {
             auth_acl: None,
             signers_file: None,
             policy_config: None,
+            allow_force: true,
+            heavy_decompression_log: None,
             shutdown: Mutex::new(false),
             metrics: Metrics::default(),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
