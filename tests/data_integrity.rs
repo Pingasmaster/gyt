@@ -15,11 +15,12 @@
 // returns wrong data, never panics on malformed input, never partially
 // applies state-changing operations, and never loses committed history.
 //
-// All tests serialise (`--test-threads=1`) because some spawn servers on
-// fixed ports and several manipulate the shared filesystem under /tmp.
+// Tests are parallel-safe: each `Env::new` picks a unique tmpdir
+// (atomic NEXT_ID + pid + nanos) and each server bind is ephemeral
+// (`127.0.0.1:0`). The pre-fix `--test-threads=1` constraint is gone.
 //
-//   cargo test --test data_integrity -- --test-threads=1
-//   cargo test --test data_integrity -- --ignored --test-threads=1  # soak
+//   cargo test --test data_integrity
+//   cargo test --test data_integrity -- --ignored  # soak
 //
 // Test groups:
 //   1. Loose-object integrity      (bit flips, truncation, hash checks)

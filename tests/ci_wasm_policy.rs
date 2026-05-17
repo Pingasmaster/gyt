@@ -23,12 +23,19 @@
 
 use gyt::ci_wasm::{run_ci_wasm_with_policy, CiPolicy};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn unique_tmp(name: &str) -> PathBuf {
+    // Atomic counter + pid + nanos: see ci_wasm_sandbox.rs for the
+    // rationale (nanosecond collision under --test-threads=16).
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!(
-        "gyt-policy-{}-{}-{}",
+        "gyt-policy-{}-{}-{}-{}",
         name,
         std::process::id(),
+        id,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

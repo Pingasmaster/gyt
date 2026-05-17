@@ -20,7 +20,17 @@ gyt (pronounced "gift" but with a 'g') is a modern version control system design
 
 ## Testing
 
-- Always run `cargo test --all-features -- --test-threads=1` before committing
+- Always run `cargo test --all-features -- --test-threads=16` before
+  committing. **Run on the DEBUG profile, NEVER `--release`** —
+  `[profile.release]` sets `panic = "abort"` and the `catch_unwind`
+  based fuzz harnesses in `src/fuzz.rs` silently become no-ops.
+  Tests are parallel-safe: every integration suite uses an atomic
+  counter + pid + nanos for tempdir uniqueness, every server bind is
+  ephemeral (`127.0.0.1:0`), and the inline `src/cmd/*` tests that
+  mutate process cwd serialize on `cmd::util::test_helpers::lock()`
+  (a single `Mutex<()>`). If a test passes at `--test-threads=1` but
+  fails at `--test-threads=16`, that's a real isolation bug in the
+  test — fix it rather than dropping the parallelism.
 - Run `timeout 30 bash tests/smoke_comprehensive.sh` for end-to-end smoke test
 - Wire protocol integration tests are in `tests/wire_integration.rs`
 
@@ -55,7 +65,7 @@ Rules for contributors:
   unrelated PR.
 - **CI gates this.** `cargo clippy --all-features --all-targets -- -D
   warnings` must be clean on every push, and so must `cargo test
-  --all-features -- --test-threads=1`.
+  --all-features -- --test-threads=16`.
 
 The reasoning behind such a strict policy: this is a version-control
 tool that handles user history. Subtle correctness bugs (loop counters

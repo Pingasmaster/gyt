@@ -14,15 +14,21 @@
 //   - Verify objects and refs on disk
 //   - Clean up the server process
 //
-// Run:  cargo test --test wire_integration -- --test-threads=1
-//   or:  GYT_BIN=target/release/gyt cargo test --test wire_integration -- --test-threads=1
+// Run:  cargo test --test wire_integration
+//   or:  GYT_BIN=target/release/gyt cargo test --test wire_integration
 //
-// NOTE: the binary must be built first (cargo build).
+// NOTE: the binary must be built first (cargo build). Tests are
+// parallel-safe — each GytTest::new() picks a unique work dir via
+// atomic counter + pid + nanos, and binds to an ephemeral port via
+// pick_port().
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -58,10 +64,19 @@ struct GytTest {
 impl GytTest {
     fn new() -> Self {
         let bin = find_binary();
-        // Use a temp dir that persists for the test lifetime
-        let mut work = std::env::temp_dir();
-        work.push(format!("gyt_integration_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&work);
+        // Parallel-safe unique work dir: atomic counter + pid + nanos,
+        // matching the pattern used in tests/{data_integrity,e2e,issues,
+        // prs,gc_race,server_hardening,internals}.rs. The previous
+        // pid-only `gyt_integration_<pid>` path, combined with the
+        // `remove_dir_all` that ran here at startup, would have wiped a
+        // peer test's just-created work dir under `--test-threads=16`.
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let work = std::env::temp_dir()
+            .join(format!("gyt-integration-{pid}-{id}-{nanos}"));
         std::fs::create_dir_all(&work).unwrap();
         Self {
             bin,

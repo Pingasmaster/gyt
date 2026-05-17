@@ -15,24 +15,50 @@ in `Cargo.toml`, not by avoiding beta.
 If you see beta and think "I should pin this to a stable release",
 that is wrong. Leave it alone.
 
+### Tests run on the DEBUG profile, never `--release`
+
+`[profile.release]` sets `panic = "abort"`. `src/fuzz.rs` ships
+test-mode harnesses (`fuzz_round_trip_objects`, `fuzz_malformed_index`,
+…) that use `std::panic::catch_unwind` to assert "no panic on
+adversarial input". Under `panic = "abort"` those harnesses become
+no-ops: any panic kills the whole test binary instead of being
+caught, silently destroying the safety net those tests are supposed
+to provide. So:
+
+- ✅ `cargo test --all-features -- --test-threads=16`
+- ❌ `cargo test --release --all-features -- --test-threads=16`
+
+If a contributor sees a CI step doing `cargo test --release`, that's
+a bug — change it. The release profile is for the shipped binary
+only.
+
 ### Tests are expensive — run them only at the end of a batch of fixes
 
-`cargo test --all-features -- --test-threads=1` takes ~5 minutes on this
-project. Do **not** run it after every single edit. The expected workflow
+`cargo test --all-features -- --test-threads=16` takes a couple of
+minutes on this project (down from ~5 minutes at `--test-threads=1`).
+Do **not** run it after every single edit. The expected workflow
 inside a multi-fix session:
 
 1. Make a change.
-2. Verify it compiles with `cargo build --release` (or `cargo check` —
-   much faster) per worktree.
+2. Verify it compiles with `cargo build` (debug, fast) or
+   `cargo check` per worktree.
 3. Commit.
 4. Move on to the next fix.
 5. **Only at the very end**, after every fix has been committed, run
-   the full `cargo test --all-features -- --test-threads=1` once to
+   the full `cargo test --all-features -- --test-threads=16` once to
    catch regressions across the whole batch.
 
 If a fix is structurally risky (e.g. it changes a parser contract that
 many tests depend on) you may run a narrowly-scoped `cargo test
 --test <name>` for that one suite, but never the whole tree mid-batch.
+
+Test parallelism: every integration suite uses an atomic counter +
+pid + nanos for tempdir uniqueness, every server bind is ephemeral
+(`127.0.0.1:0`), and the inline `src/cmd/*` tests that mutate
+process cwd serialize on `cmd::util::test_helpers::lock()` (one
+shared `Mutex<()>`). A test that fails at `--test-threads=16` but
+passes at `--test-threads=1` is a real isolation bug in the test
+harness — fix it rather than dropping the parallelism.
 
 ### Never drop or weaken XZ compression
 

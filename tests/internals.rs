@@ -16,11 +16,12 @@
 // whose body_len overflows a u32, decompression bombs synthesised
 // directly with XZ, and similar.
 //
-// Run with:  cargo test --test internals -- --test-threads=1
+// Run with:  cargo test --test internals
 //
 // Tests are grouped to mirror the data-integrity test plan, with
 // numbers (#1..#78) cross-referenced in comments where they come
-// from the plan.
+// from the plan. Each test takes a fresh tmpdir (atomic NEXT_ID +
+// pid + nanos), so they are safe under `--test-threads=16`.
 
 #![expect(clippy::cast_possible_truncation, reason = "intentional in test scaffolding")]
 #![expect(clippy::assertions_on_constants, reason = "intentional in test scaffolding")]

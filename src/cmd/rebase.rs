@@ -684,9 +684,15 @@ mod tests {
     )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
+    use crate::cmd::util::test_helpers::lock;
 
     #[test]
     fn rebase_ff_only_works() {
+        // These tests mutate process-global cwd via
+        // `env::set_current_dir`; serialize with peers that do the
+        // same so `--test-threads=16` doesn't observe a swapped cwd
+        // mid-test.
+        let _g = lock();
         let r = TestRepo::new("gyt-rebase-ff");
         let mut repo = r.open();
         let main_id = refs::read_ref(&repo.gyt_dir, "refs/heads/main").unwrap();
@@ -705,6 +711,7 @@ mod tests {
 
     #[test]
     fn rebase_replays_commits_on_divergent_history() {
+        let _g = lock();
         let r = TestRepo::new("gyt-rebase-replay");
         let repo = r.open();
         let cfg = crate::config::Config {

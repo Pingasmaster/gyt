@@ -12,12 +12,20 @@
 // privilege-escalation bug and should fail loudly.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn unique_tmp(name: &str) -> PathBuf {
+    // Atomic counter + pid + nanos: two callers in the same
+    // nanosecond on different cores would otherwise collide on the
+    // `as_nanos()` value under `--test-threads=16`.
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let p = std::env::temp_dir().join(format!(
-        "gyt-ci-sandbox-{}-{}-{}",
+        "gyt-ci-sandbox-{}-{}-{}-{}",
         name,
         std::process::id(),
+        id,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

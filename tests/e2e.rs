@@ -17,12 +17,11 @@
 // trips, signed-commit policies, shallow clone behavior, pack-file
 // transparency, ACLs, and so on.
 //
-// Run with:  cargo test --test e2e -- --test-threads=1
+// Run with:  cargo test --test e2e
 //
-// Tests are written to be self-contained; they each create a unique
-// tmpdir, and clean it up on Drop. They serialize via --test-threads=1
-// because some exercise port binding and shared state in
-// /tmp.
+// Tests are self-contained: each creates a unique tmpdir via atomic
+// NEXT_ID + pid + nanos and cleans it up on Drop; each server bind
+// is ephemeral (`127.0.0.1:0`). Safe under `--test-threads=16`.
 
 // Test-code clippy allowances: these lints make production code clearer
 // but pile up noise in long, sequential, intentionally-redundant test

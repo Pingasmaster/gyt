@@ -364,6 +364,7 @@ mod tests {
     )]
     use super::*;
     use crate::cmd::test_support::TestRepo;
+    use crate::cmd::util::test_helpers::lock;
     use crate::config::Config;
     use std::fs;
     use std::path::Path;
@@ -379,6 +380,9 @@ mod tests {
 
     #[test]
     fn cherry_pick_adds_disjoint_file_cleanly() {
+        // Serializes with every other inline cwd-mutating cmd test
+        // under `--test-threads=16`.
+        let _g = lock();
         let r = TestRepo::new("gyt-cherry-pick-disjoint");
         write_identity_config(&r.gyt_dir());
         let repo = r.open();
