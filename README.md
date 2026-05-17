@@ -129,12 +129,51 @@ gyt serve --listen 0.0.0.0:443 --repos /srv/gyt \
 gyt serve --listen 127.0.0.1:8080 --repos /srv/gyt \
   --auth-token my-secret-token
 
+# Production HTTPS with HTTP/2 + HTTP/3 + cross-replica TLS session resumption
+gyt serve --listen 0.0.0.0:443 --repos /srv/gyt \
+  --cert /etc/certs/cert.pem --key /etc/certs/key.pem \
+  --listen-h2 0.0.0.0:443 \
+  --listen-h3 0.0.0.0:443 \
+  --tls-ticket-key /etc/gyt/ticket-key
+
 # Clone from a server
 gyt clone --insecure http://127.0.0.1:8080/myrepo.gyt/
 
 # Push to a remote
 gyt push --insecure origin
 ```
+
+#### HTTP/2 and HTTP/3
+
+- `--listen-h2 <addr>` enables HTTP/2 on the given address. ALPN
+  negotiates h2 with clients that ask for it; HTTP/1.1 clients keep
+  working on `--listen`.
+- `--listen-h3 <addr>` enables HTTP/3 over QUIC. The server emits
+  `Alt-Svc: h3=":<port>"; ma=86400` on every HTTPS response, so
+  clients that already speak HTTP/1.1 or HTTP/2 discover h3 and
+  upgrade on the next visit.
+- For first-visit HTTP/3 (no Alt-Svc dance), advertise an HTTPS
+  DNS resource record. BIND zone-file syntax:
+
+  ```
+  repo.example.com.  3600  IN  HTTPS  1 . alpn="h3,h2" port=443
+  ```
+
+  Equivalent records exist in Cloudflare, Route 53, etc.
+
+#### TLS session-ticket key rotation
+
+- `--tls-ticket-key <file>` loads a shared ticket key so a ticket
+  issued by replica A can be decrypted by replica B (without it,
+  every replica generates its own per-process key and clients pay
+  the full handshake on retry).
+- File format is hex, one key per line: line 1 is the current key
+  (32 bytes / 64 hex chars), line 2 is an optional previous key
+  decrypted on the way down.
+- Rotation: push a new file with the new key on line 1 and the old
+  key on line 2 to every replica, then restart each one. After the
+  12-hour ticket lifetime has expired, push again with only the new
+  key on line 1.
 
 ### CI
 
@@ -237,7 +276,7 @@ Refs are stored as plain text files in `.gyt/refs/heads/` and `.gyt/refs/tags/`.
 | `issue {new\|list\|show\|comment\|close\|reopen\|label\|assign}` | Manage in-repo issues (`refs/issues/<N>`) |
 | `discussion <subcommand>` | Same surface as `issue`, `kind=discussion` |
 | `pr {new\|list\|show\|comment\|close\|reopen\|merge\|ci-run\|label\|assign}` | Manage in-repo pull requests (`refs/prs/<N>`) |
-| `serve [--listen <a>] [--repos <d>] [--webroot <d>] [--cert/--key] [--auth-token/--auth-tokens] [--signers] [--policy-config]` | Start the production HTTP/TLS server |
+| `serve [--listen <a>] [--listen-h2 <a>] [--listen-h3 <a>] [--repos <d>] [--webroot <d>] [--cert/--key] [--tls-ticket-key <file>] [--auth-token/--auth-tokens] [--signers] [--policy-config]` | Start the production HTTP/TLS server (HTTP/1.1, HTTP/2, HTTP/3) |
 | `ci [--list] [--output <dir>] [policy flags]` | Run sandboxed `.gyt-ci/*.wasm` workflows |
 | `ci secret {init\|set <name>\|list\|remove <name>}` | Encrypted CI secret store |
 | `ci env {set <name> <val>\|list\|remove <name>}` | Plaintext CI env vars |
