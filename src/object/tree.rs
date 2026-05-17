@@ -138,12 +138,12 @@ pub fn decode(payload: &[u8]) -> Result<Vec<TreeEntry>> {
         // Strict-ascending sort + uniqueness. encode() sorts but is
         // stable, so duplicates would round-trip; checking here makes
         // canonicality bidirectional.
-        if let Some(prev) = &prev_name {
-            if name <= *prev {
-                return Err(GytError::Object(
-                    "tree: entries not strictly ascending by name (unsorted or duplicate)".into(),
-                ));
-            }
+        if let Some(prev) = &prev_name
+            && name <= *prev
+        {
+            return Err(GytError::Object(
+                "tree: entries not strictly ascending by name (unsorted or duplicate)".into(),
+            ));
         }
         prev_name = Some(name.clone());
         i += nul + 1;

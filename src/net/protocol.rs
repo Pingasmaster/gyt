@@ -301,6 +301,10 @@ pub fn parse_packfile(body: &[u8]) -> Result<Vec<PackEntry>> {
 /// the raw size of v1 bodies). Used by `wire_objects_have` for the
 /// optional heavy-decompression operator log — the counter is
 /// observational only, never used to reject legitimate large pushes.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "body[0] and body[1..] are gated by the `body.is_empty()` early-return immediately above"
+)]
 pub fn parse_packfile_accumulating(
     body: &[u8],
     accumulator: &std::sync::atomic::AtomicU64,

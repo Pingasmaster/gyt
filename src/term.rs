@@ -22,9 +22,9 @@ pub fn safe_display(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         let v = c as u32;
-        if v >= 0x80 {
-            out.push(c);
-        } else if c == '\t' || c == '\n' || (0x20..=0x7e).contains(&v) {
+        // Keep printable ASCII, TAB, LF, and any multi-byte UTF-8.
+        // Drop the rest visibly so escape sequences can't leak through.
+        if v >= 0x80 || c == '\t' || c == '\n' || (0x20..=0x7e).contains(&v) {
             out.push(c);
         } else {
             // CR / FF / ESC / BEL / DEL / other C0 → drop visibly.

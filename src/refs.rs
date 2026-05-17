@@ -83,7 +83,15 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
                 "ref name has '..' or '.' component: {name:?}"
             )));
         }
-        if comp.ends_with(".lock") {
+        // Case-insensitive: case-insensitive filesystems (e.g. APFS,
+        // exFAT, Windows NTFS by default) treat `.LOCK` and `.lock` as
+        // the same file, so a `.LOCK`-suffixed refname would still
+        // shadow a real lockfile.
+        let cb = comp.as_bytes();
+        if let Some(tail) = cb.get(cb.len().saturating_sub(5)..)
+            && tail.eq_ignore_ascii_case(b".lock")
+            && cb.len() >= 5
+        {
             return Err(GytError::Refs(format!(
                 "ref name component ends in .lock: {name:?}"
             )));

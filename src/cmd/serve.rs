@@ -310,6 +310,10 @@ pub fn run(args: &[String]) -> Result<()> {
 ///
 /// Rejects everything else, including `0.0.0.0` (any-IPv4) and `::`
 /// (any-IPv6).
+#[expect(
+    clippy::string_slice,
+    reason = "end / idx are byte offsets of ASCII `]` / `:` characters, both of which are guaranteed UTF-8 char boundaries"
+)]
 fn is_loopback_listen_addr(addr: &str) -> bool {
     // Strip the trailing `:port` (works for both IPv4 host:port and
     // bracketed `[ipv6]:port`). Empty / malformed → not loopback.
