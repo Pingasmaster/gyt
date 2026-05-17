@@ -1,5 +1,6 @@
 use crate::errors::Result;
 use crate::net::server::{ServeConfig, serve};
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 #[expect(
     clippy::indexing_slicing,
@@ -358,14 +359,22 @@ fn is_loopback_listen_addr(addr: &str) -> bool {
     } else {
         addr
     };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
     if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
         return v4.is_loopback();
     }
     if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
         return v6.is_loopback();
+    }
+    // L5: for hostnames (e.g. "localhost"), resolve via the OS
+    // resolver and require EVERY resolved address to be loopback.
+    // Previously "localhost" was accepted by string match, so an
+    // operator with `/etc/hosts` pointing localhost at a non-loopback
+    // IP could bind publicly while the gate passed.
+    if let Ok(addrs) = (host, 0u16).to_socket_addrs() {
+        let v: Vec<_> = addrs.collect();
+        if !v.is_empty() && v.iter().all(|a| a.ip().is_loopback()) {
+            return true;
+        }
     }
     false
 }

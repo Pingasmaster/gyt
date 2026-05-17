@@ -59,6 +59,11 @@ pub fn parse_info_refs(body: &[u8]) -> Result<Vec<RefEntry>> {
     let s = std::str::from_utf8(body)
         .map_err(|_| GytError::Parse("info/refs: not valid utf-8".into()))?;
     let mut out = Vec::new();
+    // L18: reject duplicate refnames. Without this the on-disk
+    // last-write-wins semantics could disagree with `pick_head` which
+    // takes the first occurrence — clone resolves HEAD against the
+    // first while writing the last.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, line) in s.split_inclusive('\n').enumerate() {
         if out.len() >= MAX_INFO_REFS_ENTRIES {
             return Err(GytError::Parse(format!(
@@ -81,6 +86,11 @@ pub fn parse_info_refs(body: &[u8]) -> Result<Vec<RefEntry>> {
             return Err(GytError::Parse(format!(
                 "info/refs line {i}: refname length {} exceeds {MAX_INFO_REF_NAME_LEN}",
                 name.len()
+            )));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(GytError::Parse(format!(
+                "info/refs line {i}: duplicate refname {name:?}"
             )));
         }
         let id = ObjectId::from_hex(hex)?;

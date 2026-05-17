@@ -415,7 +415,11 @@ pub fn next_number_locked(repo: &Repo) -> Result<u64> {
     } else {
         1
     };
-    fs_util::atomic_write(&p, format!("{}\n", next + 1).as_bytes())?;
+    // L16: checked_add for the same overflow safety.
+    let bumped = next.checked_add(1).ok_or_else(|| {
+        GytError::Refs("prs_next counter overflow (u64::MAX)".into())
+    })?;
+    fs_util::atomic_write(&p, format!("{bumped}\n").as_bytes())?;
     Ok(next)
 }
 
@@ -505,7 +509,14 @@ pub fn read(repo: &Repo, n: u64) -> Result<Pr> {
         Err(GytError::Refs(_)) => return Err(GytError::NotFound(format!("pr #{n}"))),
         Err(e) => return Err(e),
     };
-    read_blob(&repo.gyt_dir, &id)
+    let pr = read_blob(&repo.gyt_dir, &id)?;
+    // L17: cross-check on-disk number with the ref's N.
+    if pr.number != n {
+        return Err(GytError::Refs(format!(
+            "pr blob at refs/prs/{n} claims number={}", pr.number
+        )));
+    }
+    Ok(pr)
 }
 
 fn read_blob(repo_gyt: &Path, id: &ObjectId) -> Result<Pr> {

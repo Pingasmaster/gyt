@@ -117,6 +117,17 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> R
     // already pointing at the URL) is left behind and the user has
     // to manually `rm -rf` to retry.
     let we_created = !dir.exists();
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && meta.file_type().is_symlink()
+    {
+        // L20: refuse a symlink target — `dir.exists()` follows
+        // the symlink; if it points at an empty dir somewhere
+        // sensitive (`$HOME/...`), clone would write into it.
+        return Err(GytError::Repo(format!(
+            "clone: target {} is a symlink; refusing",
+            dir.display()
+        )));
+    }
     if dir.exists() {
         let mut iter = std::fs::read_dir(dir)?;
         if iter.next().is_some() {

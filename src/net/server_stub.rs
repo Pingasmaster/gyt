@@ -32,6 +32,10 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// L10: hard cap on body for the test stub so a malicious
+/// Content-Length doesn't OOM the test process.
+const STUB_MAX_BODY: usize = 64 * 1024 * 1024;
+
 #[derive(Default)]
 pub struct ServerState {
     pub refs: Vec<RefEntry>,
@@ -350,6 +354,15 @@ fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<Request> {
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+    }
+    // L10: cap the body so a malicious Content-Length doesn't OOM
+    // even in this test stub. The stub is test-only but mirrors a
+    // production pattern; the cap keeps the pattern safe if copied.
+    if content_length > STUB_MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Content-Length {content_length} exceeds stub cap"),
+        ));
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body)?;

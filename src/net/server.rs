@@ -1278,9 +1278,24 @@ fn audit_fingerprint_key() -> &'static [u8; 32] {
 /// server lifetime and shed forensic value across restarts; that's
 /// the right tradeoff vs. the offline brute force risk of an unkeyed
 /// hash on short tokens.
+/// L6: parse the `Authorization: Bearer <token>` header per RFC 7235
+/// — case-insensitive scheme, BWS (bad whitespace) tolerated between
+/// scheme and credential. The previous `strip_prefix("Bearer ")`
+/// rejected spec-compliant clients that send `bearer\tTOK` or
+/// `Bearer  TOK` (double space).
+fn strip_bearer_scheme(header: &str) -> Option<&str> {
+    let scheme_end = header.find(|c: char| c.is_ascii_whitespace())?;
+    let scheme = header.get(..scheme_end)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let rest = header.get(scheme_end..)?;
+    Some(rest.trim_start_matches(|c: char| c.is_ascii_whitespace()))
+}
+
 fn actor_for(auth_header: Option<&str>) -> Option<String> {
     let header = auth_header?;
-    let token = header.strip_prefix("Bearer ")?;
+    let token = strip_bearer_scheme(header)?;
     let h = blake3::keyed_hash(audit_fingerprint_key(), token.as_bytes());
     let bytes = h.as_bytes();
     let mut hex = String::with_capacity(64);
@@ -1309,7 +1324,7 @@ fn authorize(
         return true;
     }
     if let Some(acl) = &state.auth_acl {
-        let Some(token) = auth_header.and_then(|h| h.strip_prefix("Bearer ")) else {
+        let Some(token) = auth_header.and_then(strip_bearer_scheme) else {
             return false;
         };
         let needs_write = route_needs_write(route);
@@ -1395,8 +1410,8 @@ fn wire_repo_name(route: &router::RouteMatch) -> Option<&str> {
 fn check_auth(auth_header: Option<&str>, expected_token: &str) -> bool {
     match auth_header {
         Some(val) => {
-            // Expect "Bearer <token>"
-            if let Some(token) = val.strip_prefix("Bearer ") {
+            // Expect "Bearer <token>" — L6: case-insensitive scheme, BWS tolerated.
+            if let Some(token) = strip_bearer_scheme(val) {
                 constant_time_eq(token.as_bytes(), expected_token.as_bytes())
             } else {
                 false
@@ -1521,6 +1536,20 @@ fn metrics_handler(state: &ServerState) -> (u16, String, Vec<u8>, String) {
 /// ACLs are configured, the full `--auth-token` if single-token, or
 /// nothing if the server runs open.
 fn admin_shutdown_handler(state: &ServerState) -> (u16, String, Vec<u8>, String) {
+    // L14: refuse admin/shutdown over plain HTTP unless the operator
+    // opts in via GYT_SERVE_ALLOW_PLAIN_ADMIN. An on-path attacker who
+    // lifted the bearer token (only possible on plaintext) could
+    // otherwise drain the server at will.
+    if !state.tls_enabled
+        && std::env::var("GYT_SERVE_ALLOW_PLAIN_ADMIN").ok().as_deref() != Some("1")
+    {
+        return (
+            403,
+            "Forbidden".into(),
+            b"admin/shutdown blocked over plain HTTP (set GYT_SERVE_ALLOW_PLAIN_ADMIN=1 to override)\n".to_vec(),
+            "text/plain".into(),
+        );
+    }
     if let Ok(mut g) = state.shutdown.lock() {
         *g = true;
     }
@@ -2788,21 +2817,39 @@ fn wire_objects_have(
             n_skipped += 1;
             continue;
         };
-        // Canonical-encoding check for commits and tags: refuse to accept
-        // objects whose stored bytes don't match `encode(decode(bytes))`.
-        // Without this a malicious pusher can poison the repo with a
-        // non-canonical commit that every future reader fails to decode.
-        if kind == crate::object::ObjectKind::Commit
-            && crate::object::commit::decode(&payload).is_err()
-        {
-            n_skipped += 1;
-            continue;
+        // L2: make the commit/tag canonicality check explicit (mirror
+        // the tree branch below). Previously this relied on the side-
+        // effect that `commit::decode` / `tag::decode` internally
+        // re-encode and compare to the input — a defense-in-depth
+        // check that a future refactor could quietly drop without
+        // breaking visible behavior, weakening the wire gate.
+        if kind == crate::object::ObjectKind::Commit {
+            match crate::object::commit::decode(&payload) {
+                Ok(c) => {
+                    if crate::object::commit::encode(&c) != payload {
+                        n_skipped += 1;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    n_skipped += 1;
+                    continue;
+                }
+            }
         }
-        if kind == crate::object::ObjectKind::Tag
-            && crate::object::tag::decode(&payload).is_err()
-        {
-            n_skipped += 1;
-            continue;
+        if kind == crate::object::ObjectKind::Tag {
+            match crate::object::tag::decode(&payload) {
+                Ok(t) => {
+                    if crate::object::tag::encode(&t) != payload {
+                        n_skipped += 1;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    n_skipped += 1;
+                    continue;
+                }
+            }
         }
         // Canonical-encoding check for trees: the wire bytes must
         // re-encode to themselves. Without this, a pusher could

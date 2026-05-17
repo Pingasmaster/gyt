@@ -75,6 +75,11 @@ impl RepoIndex {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let total = g.len();
+        // L7: page=0 is invalid (pagination is 1-based per the docs).
+        // Previously page=0 aliased to page=1 silently via saturating_sub.
+        if page == 0 {
+            return (Vec::new(), total);
+        }
         let start = page.saturating_sub(1).saturating_mul(per_page);
         let end = start.saturating_add(per_page).min(total);
         if start >= total {
@@ -177,7 +182,13 @@ fn scan_all(repos_root: &Path) -> Vec<RepoIndexEntry> {
         if !owner_ent.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let owner = owner_ent.file_name().to_string_lossy().into_owned();
+        // L8: skip non-UTF8 owner names; lossy conversion collapses
+        // distinct bytes to U+FFFD and would collide repos.
+        let owner_os = owner_ent.file_name();
+        let Some(owner_str) = owner_os.to_str() else {
+            continue;
+        };
+        let owner = owner_str.to_string();
         let owner_path = owner_ent.path();
         let Ok(repos) = std::fs::read_dir(&owner_path) else {
             continue;
@@ -186,7 +197,12 @@ fn scan_all(repos_root: &Path) -> Vec<RepoIndexEntry> {
             if !repo_ent.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            let name = repo_ent.file_name().to_string_lossy().into_owned();
+            // L8: same for repo name.
+            let name_os = repo_ent.file_name();
+            let Some(name_str) = name_os.to_str() else {
+                continue;
+            };
+            let name = name_str.to_string();
             let repo_path = repo_ent.path();
             let is_non_bare = repo_path.join(".gyt").is_dir();
             let is_bare = repo_path.join("HEAD").is_file();

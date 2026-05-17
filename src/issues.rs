@@ -488,7 +488,12 @@ pub fn next_number_locked(repo: &Repo) -> Result<u64> {
     } else {
         1
     };
-    fs_util::atomic_write(&p, format!("{}\n", next + 1).as_bytes())?;
+    // L16: checked_add so a counter at u64::MAX doesn't panic in debug
+    // (test runner) or wrap silently in release.
+    let bumped = next.checked_add(1).ok_or_else(|| {
+        GytError::Refs("issues_next counter overflow (u64::MAX)".into())
+    })?;
+    fs_util::atomic_write(&p, format!("{bumped}\n").as_bytes())?;
     Ok(next)
 }
 
@@ -557,7 +562,17 @@ pub fn read(repo: &Repo, n: u64) -> Result<Issue> {
         Err(GytError::Refs(_)) => return Err(GytError::NotFound(format!("issue #{n}"))),
         Err(e) => return Err(e),
     };
-    read_blob(&repo.gyt_dir, &id)
+    let iss = read_blob(&repo.gyt_dir, &id)?;
+    // L17: cross-check the on-disk blob's `number` field against the
+    // ref's N. A malicious / corrupted push could otherwise point
+    // refs/issues/5 at a blob claiming `number = 99`, and `gyt issue
+    // show 5` would print "#99".
+    if iss.number != n {
+        return Err(GytError::Refs(format!(
+            "issue blob at refs/issues/{n} claims number={}", iss.number
+        )));
+    }
+    Ok(iss)
 }
 
 fn read_blob(repo_gyt: &Path, id: &ObjectId) -> Result<Issue> {

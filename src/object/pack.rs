@@ -221,17 +221,26 @@ fn idx_bytes(idx_path: &Path) -> Result<Vec<u8>> {
         }
     }
     let bytes = fs_util::read_all(idx_path)?;
-    idx_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            canon,
-            IdxCacheEntry {
-                bytes: bytes.clone(),
-                mtime,
-            },
-        );
+    insert_into_idx_cache(canon, bytes.clone(), mtime);
     Ok(bytes)
+}
+
+/// L13: cap the idx cache so it doesn't grow without bound across
+/// repos. Deleted-pack entries that nobody re-accesses linger forever
+/// otherwise. Drop one arbitrary entry to make room when at capacity.
+const MAX_IDX_CACHE_ENTRIES: usize = 4096;
+
+fn insert_into_idx_cache(canon: PathBuf, bytes: Vec<u8>, mtime: std::time::SystemTime) {
+    let mut g = idx_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if g.len() >= MAX_IDX_CACHE_ENTRIES
+        && !g.contains_key(&canon)
+        && let Some(victim) = g.keys().next().cloned()
+    {
+        g.remove(&victim);
+    }
+    g.insert(canon, IdxCacheEntry { bytes, mtime });
 }
 
 /// Binary-search `idx_path` for `id`, returning its offset in the

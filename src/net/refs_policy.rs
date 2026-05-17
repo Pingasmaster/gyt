@@ -524,14 +524,15 @@ fn enforce_metadata_monotonic(
 }
 
 fn read_ref(gyt_dir: &Path, refname: &str) -> std::io::Result<Option<ObjectId>> {
-    let path = gyt_dir.join(refname);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => match ObjectId::from_hex(s.trim()) {
-            Ok(id) => Ok(Some(id)),
-            Err(_) => Ok(None),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    // L21: delegate to crate::refs::read_ref so any future loose-vs-
+    // packed handling change in one place is automatically picked up
+    // here. Map the GytError into io::Result<Option<...>> for the
+    // existing call sites.
+    match crate::refs::read_ref(gyt_dir, refname) {
+        Ok(id) => Ok(Some(id)),
+        Err(crate::errors::GytError::Refs(_)) => Ok(None),
+        Err(crate::errors::GytError::Io(e)) => Err(e),
+        Err(e) => Err(std::io::Error::other(e.to_string())),
     }
 }
 
@@ -792,9 +793,13 @@ fn rotate_audit_if_needed(gyt_dir: &Path, path: &Path) {
     // Cross-process: take the file lock for the rotation. Tight
     // timeout because rotation is fast; if another process is mid-
     // rotate we just bail and let the next append retry.
+    // L22: 500 ms is too tight on contended NFS — the rotation would
+    // silently fail, the log would grow past AUDIT_LOG_MAX_BYTES, and
+    // subsequent appends would keep colliding. 5 s gives realistic
+    // NFS retransmits a chance to land.
     let _file_lock = match crate::fs_util::FileLock::acquire(
         &gyt_dir.join("audit-rotate.lock"),
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(5),
     ) {
         Ok(l) => l,
         Err(_) => return,

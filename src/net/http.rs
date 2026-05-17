@@ -24,6 +24,11 @@ use std::sync::Mutex;
 
 const USER_AGENT: &str = concat!("gyt/", env!("CARGO_PKG_VERSION"));
 
+/// M19: bound the plain-HTTP body so a malicious server can't OOM
+/// the client by claiming Content-Length: 99999999999. The HTTPS path
+/// is bounded by http_body_util::Limited via hyper.
+const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
+
 /// A parsed HTTP response.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
@@ -408,10 +413,6 @@ fn read_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse> {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("connection") && contains_token(v, "close"));
 
-    // M19: bound the plain-HTTP body so a malicious server can't OOM
-    // the client by claiming Content-Length: 99999999999. The HTTPS
-    // path is bounded by http_body_util::Limited via hyper.
-    const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
     let body = if is_chunked {
         let buf = chunked_decode(reader)?;
         if buf.len() > MAX_RESPONSE_BODY_BYTES {

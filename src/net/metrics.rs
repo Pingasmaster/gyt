@@ -132,9 +132,11 @@ impl Metrics {
             "gyt_objects_served_total",
             self.objects_served_total.load(Ordering::Relaxed),
         );
-        // Per-handler counts share a single label key.
+        // L9: emit `# TYPE gyt_requests_by_handler_total counter` once
+        // before the loop. Strict OpenMetrics (`promtool check
+        // metrics`) rejects repeated TYPE lines.
+        out.push_str("# TYPE gyt_requests_by_handler_total counter\n");
         let mut h = |label: &str, v: u64| {
-            out.push_str("# TYPE gyt_requests_by_handler_total counter\n");
             out.push_str("gyt_requests_by_handler_total{handler=\"");
             out.push_str(label);
             out.push_str("\"} ");
