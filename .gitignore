@@ -9,3 +9,15 @@ target/
 
 # Claude Code worktrees (sub-agents create these; not part of the repo)
 .claude/
+
+# F-D11-11: defense-in-depth against `gyt add .` accidentally
+# staging operator key material. None of these should ever live in
+# a tracked file, but mistakes happen and these patterns catch the
+# common shapes.
+*.pem
+*.key
+id_ed25519
+id_ed25519.pub
+id_ed25519_*
+ci-key
+*.tls-ticket-key
