@@ -20,6 +20,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut policy_config: Option<PathBuf> = None;
     let mut allow_multiprocess = false;
     let mut allow_force = false;
+    let mut heavy_decompression_log: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -67,6 +68,13 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                      \x20                      /refs/update. Default off: any `rw` token would\n\
                      \x20                      otherwise be able to rewind every ref it can write."
                 );
+                println!(
+                    "  --log-heavy-decompression <file>\n\
+                     \x20                      Append a line for any /objects/have request whose\n\
+                     \x20                      decompressed output exceeds 100 GiB. Observational\n\
+                     \x20                      only — pushes are NEVER rejected based on volume.\n\
+                     \x20                      Lets operators manually review pathological pushes."
+                );
                 return Ok(ServeConfig {
                     listen_addr: listen,
                     h2_listen_addr: h2_listen,
@@ -82,6 +90,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                     policy_config,
                     allow_multiprocess,
                     allow_force,
+                    heavy_decompression_log,
                 });
             }
             "--listen" => {
@@ -189,6 +198,15 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
             "--allow-force" => {
                 allow_force = true;
             }
+            "--log-heavy-decompression" => {
+                i += 1;
+                let s = args.get(i).cloned().ok_or_else(|| {
+                    crate::errors::GytError::InvalidArgument(
+                        "--log-heavy-decompression requires a file path".into(),
+                    )
+                })?;
+                heavy_decompression_log = Some(PathBuf::from(s));
+            }
             other => {
                 return Err(crate::errors::GytError::InvalidArgument(format!(
                     "serve: unknown flag {other}"
@@ -258,6 +276,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         policy_config,
         allow_force,
         allow_multiprocess,
+        heavy_decompression_log,
     })
 }
 

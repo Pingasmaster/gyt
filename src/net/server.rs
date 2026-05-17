@@ -211,6 +211,15 @@ pub struct ServeConfig {
     /// no `force` bit. Operators who want to keep that behavior must
     /// now opt in by passing `--allow-force` to `gyt serve`.
     pub allow_force: bool,
+    /// Optional file path for the heavy-decompression operator log.
+    /// When set, any `/objects/have` request that decompresses at
+    /// least `compress::HEAVY_DECOMPRESSION_LOG_BYTES` (100 GiB) is
+    /// recorded here as a tab-separated line
+    /// `<ts>\t<repo>\t<bytes>\tobjects/have`. The log is purely
+    /// observational — pushes are NEVER rejected based on
+    /// decompressed volume; legitimate large pushes (restoring long
+    /// history) must succeed. When None, no log is written.
+    pub heavy_decompression_log: Option<PathBuf>,
 }
 #[expect(
     clippy::expect_used,
@@ -352,6 +361,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         signers_file: config.signers_file.clone(),
         policy_config: config.policy_config.clone(),
         allow_force: config.allow_force,
+        heavy_decompression_log: config.heavy_decompression_log.clone(),
         shutdown: Mutex::new(false),
         metrics: Metrics::default(),
         listen_addr: addr,
@@ -971,6 +981,11 @@ pub(crate) struct ServerState {
     /// `?force=1` / `?force-with-lease=1` on `/refs/update` are
     /// ignored — every push runs in strict FastForward mode.
     allow_force: bool,
+    /// Mirrors `ServeConfig::heavy_decompression_log`. When set, the
+    /// `/objects/have` handler appends a line to this path for any
+    /// request whose decompressed-byte total crosses
+    /// `compress::HEAVY_DECOMPRESSION_LOG_BYTES`.
+    heavy_decompression_log: Option<PathBuf>,
     pub(crate) shutdown: Mutex<bool>,
     metrics: Metrics,
     /// Bound local address. Stored so the admin-shutdown handler can
@@ -2657,15 +2672,19 @@ fn wire_objects_have(
             );
         }
     };
-    // F-D3-02: one cumulative XZ-output budget for the whole request.
-    // The outer pack XZ + every entry's inner XZ all subtract from
-    // this AtomicU64. The per-stream MAX_DECOMPRESSED_BYTES still
-    // applies; the budget kills the multi-stream chain attack.
-    let xz_budget = std::sync::atomic::AtomicU64::new(
-        crate::compress::MAX_REQUEST_XZ_OUTPUT_BYTES,
-    );
+    // F-D3-02 (revised per user feedback): no per-request hard budget.
+    // Legitimate large pushes restoring long history can decompress
+    // hundreds of GiB across many objects, and the user wants those to
+    // succeed without operator intervention. We *accumulate* the
+    // decompressed-byte count purely so the heavy-decompression log
+    // (opt-in, see `state.heavy_decompression_log`) can record repos
+    // that crossed an operator-visible threshold. The per-stream
+    // `compress::MAX_DECOMPRESSED_BYTES` still guards single-stream
+    // bombs.
+    let xz_bytes_total =
+        std::sync::atomic::AtomicU64::new(0);
     // Parse body as packfile format
-    let entries = match crate::net::protocol::parse_packfile_with_budget(body, &xz_budget) {
+    let entries = match crate::net::protocol::parse_packfile_accumulating(body, &xz_bytes_total) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -2699,9 +2718,9 @@ fn wire_objects_have(
     let mut n_skipped = 0u32;
     for entry in &entries {
         // Decompress on-disk bytes to get raw: "<kind> <size>\0<payload>"
-        // F-D3-02: account every per-entry decode against the same
-        // cumulative budget the outer pack XZ already debited.
-        let Ok(raw) = crate::compress::decode_with_budget(&entry.bytes, &xz_budget) else {
+        // Each entry's decompressed size is added to xz_bytes_total so
+        // we can log heavy-decompression after the request completes.
+        let Ok(raw) = crate::compress::decode_accumulating(&entry.bytes, &xz_bytes_total) else {
             n_skipped += 1;
             continue;
         };
@@ -2765,6 +2784,34 @@ fn wire_objects_have(
         u64::from(n_stored),
         std::sync::atomic::Ordering::Relaxed,
     );
+
+    // Heavy-decompression operator log (replaces F-D3-02's hard
+    // budget, which would have rejected legitimate large pushes).
+    // Records the *repository* (not the actor) so operators can
+    // manually review long-tail pathological pushes. Opt-in: only
+    // fires when `--log-heavy-decompression <file>` was set.
+    let total_xz_bytes = xz_bytes_total.load(std::sync::atomic::Ordering::Acquire);
+    if total_xz_bytes >= crate::compress::HEAVY_DECOMPRESSION_LOG_BYTES
+        && let Some(log_path) = &state.heavy_decompression_log
+    {
+        let repo_name = router::get_param(params, "repo").unwrap_or("?");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let line = format!(
+            "{ts}\t{repo_name}\t{total_xz_bytes}\tobjects/have\n"
+        );
+        // Best-effort append. The log is observational, so a write
+        // failure here must not affect the push response.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
 
     let body = format!("stored={n_stored} skipped={n_skipped}");
     (200, "OK".into(), body.into_bytes(), "text/plain".into())

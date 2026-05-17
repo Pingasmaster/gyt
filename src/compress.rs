@@ -22,14 +22,16 @@ pub const SIZE_XZ_HIGH: usize = 10 * 1024 * 1024;
 /// for legitimate large packfiles.
 pub const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Per-request cumulative ceiling on bytes the XZ decoder is allowed to
-/// emit. Closes F-D3-02: `MAX_DECOMPRESSED_BYTES` only caps ONE stream,
-/// but `wire_objects_have` decodes the outer pack XZ AND every entry's
-/// inner XZ. A pusher could chain thousands of entries each near the
-/// 1 GiB ceiling and burn hours of CPU per request. 2 GiB total per
-/// request is more than the 256 MiB body cap can imply legitimately
-/// even with maximum compression ratio.
-pub const MAX_REQUEST_XZ_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Threshold above which a single `/objects/have` request is logged as
+/// "heavy decompression" against the target repository. The server does
+/// NOT reject such requests — legitimate pushes restoring long history
+/// can decompress hundreds of gigabytes across many objects. This is
+/// operator-observable evidence for *manual* review, not a gate.
+///
+/// Logging is opt-in: only fires when the server was started with
+/// `--log-heavy-decompression <file>`. Decompression bombs in a single
+/// stream are still rejected by `MAX_DECOMPRESSED_BYTES` (per-stream).
+pub const HEAVY_DECOMPRESSION_LOG_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 #[expect(
     clippy::expect_used,
     reason = "the invariant guarded by this expect cannot fail (verified at the call site)"
@@ -100,29 +102,19 @@ pub fn xz_decode_raw(body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Same as `decode`, but also subtracts the produced output size from a
-/// caller-supplied per-request budget. F-D3-02: a single push can
-/// trigger N decode calls (outer pack XZ + per-entry inner XZ);
-/// without a cumulative budget, an attacker can chain thousands of
-/// near-1-GiB-decoded entries and burn server CPU for hours. Returns
-/// `GytError::Object` once the budget is exhausted — the caller
-/// (typically `wire_objects_have`) surfaces this as 413.
-pub fn decode_with_budget(
+/// Like `decode`, but also increments a caller-supplied accumulator
+/// with the number of decompressed bytes produced. The accumulator is
+/// observational only — `wire_objects_have` uses it to decide whether
+/// to append a "heavy decompression" entry to the operator's log file
+/// AFTER the request completes. There is no enforcement / no
+/// rejection based on the accumulator; legitimate large pushes must
+/// not be throttled by total decompressed volume.
+pub fn decode_accumulating(
     stored: &[u8],
-    remaining: &std::sync::atomic::AtomicU64,
+    accumulator: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<u8>> {
     let out = decode(stored)?;
-    let produced = out.len() as u64;
-    // saturating_sub via fetch_update: drop budget but never go below 0.
-    let prev = remaining.load(std::sync::atomic::Ordering::Acquire);
-    if produced > prev {
-        remaining.store(0, std::sync::atomic::Ordering::Release);
-        return Err(GytError::Object(format!(
-            "xz: cumulative request decompressed output exceeded budget \
-             (this entry added {produced} bytes, only {prev} were left)"
-        )));
-    }
-    remaining.fetch_sub(produced, std::sync::atomic::Ordering::AcqRel);
+    accumulator.fetch_add(out.len() as u64, std::sync::atomic::Ordering::AcqRel);
     Ok(out)
 }
 

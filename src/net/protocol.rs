@@ -296,37 +296,27 @@ pub fn parse_packfile(body: &[u8]) -> Result<Vec<PackEntry>> {
     }
 }
 
-/// Like `parse_packfile`, but routes the outer XZ decode through a
-/// caller-supplied cumulative byte budget. Used by `wire_objects_have`
-/// (F-D3-02) so the entire request — outer pack XZ + every entry's
-/// inner XZ — is bounded by ONE total ceiling rather than the per-
-/// stream cap allowing N near-1-GiB streams.
-pub fn parse_packfile_with_budget(
+/// Like `parse_packfile`, but increments a caller-supplied counter
+/// with the number of bytes decompressed by the outer XZ stream (and
+/// the raw size of v1 bodies). Used by `wire_objects_have` for the
+/// optional heavy-decompression operator log — the counter is
+/// observational only, never used to reject legitimate large pushes.
+pub fn parse_packfile_accumulating(
     body: &[u8],
-    budget: &std::sync::atomic::AtomicU64,
+    accumulator: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<PackEntry>> {
     if body.is_empty() {
         return Err(GytError::Parse("packfile: empty body".into()));
     }
     match body[0] {
         PACKFILE_VERSION_RAW => {
-            // Raw v1 is decode-only legacy support; the inner bytes
-            // do not pass through xz. Account them against the budget
-            // directly so a v1 push can't bypass the cumulative cap.
-            let raw_len = body.len() as u64 - 1;
-            let prev = budget.load(std::sync::atomic::Ordering::Acquire);
-            if raw_len > prev {
-                budget.store(0, std::sync::atomic::Ordering::Release);
-                return Err(GytError::Parse(format!(
-                    "packfile: v1 body of {raw_len} bytes exceeds remaining budget {prev}"
-                )));
-            }
-            budget.fetch_sub(raw_len, std::sync::atomic::Ordering::AcqRel);
+            accumulator.fetch_add(
+                body.len() as u64 - 1,
+                std::sync::atomic::Ordering::AcqRel,
+            );
             parse_pack(&body[1..])
         }
         PACKFILE_VERSION_XZ => {
-            // Decode the outer XZ stream against the same budget the
-            // inner per-entry decodes will use.
             let stored: Vec<u8> = {
                 let mut v = Vec::with_capacity(5 + body.len() - 1);
                 v.extend_from_slice(&crate::compress::MAGIC);
@@ -334,7 +324,7 @@ pub fn parse_packfile_with_budget(
                 v.extend_from_slice(&body[1..]);
                 v
             };
-            let decompressed = crate::compress::decode_with_budget(&stored, budget)
+            let decompressed = crate::compress::decode_accumulating(&stored, accumulator)
                 .map_err(|e| GytError::Parse(format!("packfile: xz decompress: {e}")))?;
             parse_pack(&decompressed)
         }
