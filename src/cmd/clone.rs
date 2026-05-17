@@ -26,7 +26,7 @@ use crate::object::{ObjectKind, store, tag, tree};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[expect(
     clippy::indexing_slicing,
     reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
@@ -112,6 +112,11 @@ fn default_dir_from_url(url: &str) -> Result<String> {
 }
 
 fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> Result<()> {
+    // M22: track whether we created `dir` so we can clean up on
+    // failure. Without this, a half-initialised dir (with `origin`
+    // already pointing at the URL) is left behind and the user has
+    // to manually `rm -rf` to retry.
+    let we_created = !dir.exists();
     if dir.exists() {
         let mut iter = std::fs::read_dir(dir)?;
         if iter.next().is_some() {
@@ -122,11 +127,31 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> R
         }
     }
     println!("cloning {url} into {}...", dir.display());
+    match clone_into_inner(url, dir, insecure, depth) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Roll back our partial directory if we created it.
+            if we_created {
+                let _ = std::fs::remove_dir_all(dir);
+            } else {
+                // We didn't create it — wipe `.gyt/` and any files we
+                // started materializing, but leave the dir.
+                let _ = std::fs::remove_dir_all(dir.join(".gyt"));
+            }
+            Err(e)
+        }
+    }
+}
 
+fn clone_into_inner(url: &str, dir: &Path, insecure: bool, depth: Option<u32>) -> Result<()> {
     init::init_at(dir)?;
     let repo = Repo::open(dir)?;
 
-    // Persist origin.
+    // Persist origin verbatim. Stripping the embedded bearer token
+    // would break subsequent `gyt fetch` / `gyt pull`, which read the
+    // URL back from config and re-send the Authorization header.
+    // The audit plan's M23 store-redacted idea was wrong on second
+    // look. We DO redact when printing the URL (M27 in remote.rs).
     let mut cfg = Config::load(&repo)?;
     cfg.remotes.insert("origin".into(), url.to_string());
     cfg.write(&repo.gyt_dir)?;
@@ -141,12 +166,28 @@ fn clone_into(url: &str, dir: &PathBuf, insecure: bool, depth: Option<u32>) -> R
     // issues, discussions and PRs travel with the repo. Anything outside
     // these namespaces is dropped — we don't want a malicious server to
     // be able to fill our ref database with arbitrary names.
+    //
+    // M22: skip-and-warn instead of aborting on individual bad ref
+    // names. A single malformed ref name from a hostile server should
+    // not nuke the whole clone — the legitimate refs still travel.
     let mut n_refs = 0usize;
+    let mut n_skipped_refs = 0usize;
     for r in &server_refs {
         if is_user_visible_ref(&r.name) {
-            refs::write_ref(&repo.gyt_dir, &r.name, &r.id)?;
-            n_refs += 1;
+            match refs::write_ref(&repo.gyt_dir, &r.name, &r.id) {
+                Ok(()) => n_refs += 1,
+                Err(e) => {
+                    eprintln!(
+                        "clone: skipping ref {}: {e}",
+                        crate::term::s(&r.name)
+                    );
+                    n_skipped_refs += 1;
+                }
+            }
         }
+    }
+    if n_skipped_refs > 0 {
+        eprintln!("clone: skipped {n_skipped_refs} unsafe ref name(s)");
     }
 
     // Choose HEAD: prefer refs/heads/main; otherwise first branch in server_refs.

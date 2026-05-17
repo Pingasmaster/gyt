@@ -22,9 +22,29 @@ pub fn safe_display(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         let v = c as u32;
+        // L19: Unicode bidi-control codepoints (Trojan Source / CVE-
+        // 2021-42574). These re-order the visible glyphs of subsequent
+        // characters so a malicious commit message can render
+        // misleadingly in any terminal that supports bidi. Strip them.
+        if matches!(v,
+            // bidi formatting (LRE/RLE/PDF/LRO/RLO/LRM/RLM/ALM):
+            0x202a..=0x202e |
+            0x200e | 0x200f | 0x061c |
+            // bidi isolates (LRI/RLI/FSI/PDI):
+            0x2066..=0x2069
+        ) {
+            out.push('?');
+            continue;
+        }
+        // C1 controls (U+0080..U+009F) — also strip; some terminals
+        // honor them as escape introducers.
+        if (0x80..=0x9f).contains(&v) {
+            out.push('?');
+            continue;
+        }
         // Keep printable ASCII, TAB, LF, and any multi-byte UTF-8.
         // Drop the rest visibly so escape sequences can't leak through.
-        if v >= 0x80 || c == '\t' || c == '\n' || (0x20..=0x7e).contains(&v) {
+        if v >= 0xa0 || c == '\t' || c == '\n' || (0x20..=0x7e).contains(&v) {
             out.push(c);
         } else {
             // CR / FF / ESC / BEL / DEL / other C0 → drop visibly.

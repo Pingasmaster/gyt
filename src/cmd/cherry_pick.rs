@@ -164,14 +164,16 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
         for (path, bytes) in &conflict_blobs {
-            let abs = repo.workdir.join(path);
+            // H5: refuse if any ancestor is a symlink.
+            let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&abs, bytes)?;
         }
-        std::fs::write(
-            repo.gyt_dir.join("CHERRY_PICK_HEAD"),
+        // M2: atomic_write so a crash doesn't leave a torn state file.
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("CHERRY_PICK_HEAD"),
             format!("{}\n", target_id.to_hex()).as_bytes(),
         )?;
         std::fs::write(repo.gyt_dir.join("MERGE_MSG"), target_commit.message.as_bytes())?;
@@ -266,7 +268,8 @@ fn apply_files_to_workdir(repo: &Repo, merged: &BTreeMap<PathBuf, (u32, ObjectId
         }
     }
     for (path, (mode, hash)) in merged {
-        let abs = repo.workdir.join(path);
+        // H5: refuse if any ancestor is a symlink.
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }

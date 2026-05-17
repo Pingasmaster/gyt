@@ -577,7 +577,10 @@ fn flatten_recurse(
 fn materialize_tree_to(gyt_dir: &Path, tree_id: &ObjectId, root: &Path) -> Result<()> {
     let files = flatten_tree(gyt_dir, tree_id, Path::new(""))?;
     for f in &files {
-        let abs = root.join(&f.path);
+        // H5: refuse if any ancestor is a symlink. The root is
+        // typically a fresh dir but a malicious operator could pre-
+        // populate it before `gyt worktree add`.
+        let abs = crate::workdir::safe_workdir_path(root, &f.path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }

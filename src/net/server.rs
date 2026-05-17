@@ -2598,6 +2598,11 @@ fn wire_info_refs(
     (200, "OK".into(), body, "text/plain".into())
 }
 
+/// M33: maximum number of object ids accepted in a single
+/// `objects/want` request body. Legitimate clones at the largest
+/// real-world repo sizes stay well under 100 K.
+const MAX_WANT_IDS: usize = 100_000;
+
 /// POST /{repo}/objects/want - given list of object IDs, return the compressed objects
 fn wire_objects_want(
     state: &ServerState,
@@ -2615,12 +2620,42 @@ fn wire_objects_want(
             );
         }
     };
-    // Body is newline-separated object IDs (hex)
-    let ids: Vec<String> = String::from_utf8_lossy(body)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    // M32: use the same parser as parse_wants so the wire format
+    // has exactly one definition (avoids drift between two parsers).
+    // M33: cap id count at MAX_WANT_IDS (see top of file) —
+    // legitimate clones don't request more, and a 256 MiB body
+    // would otherwise allocate ~250 MB of String. Returns 400 on
+    // parse error (incl. cap exceeded).
+    let parsed_ids = match crate::net::protocol::parse_wants(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request".into(),
+                format!("invalid want list: {e}").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
+    if parsed_ids.len() > MAX_WANT_IDS {
+        return (
+            413,
+            "Payload Too Large".into(),
+            format!("too many ids in want list ({} > {MAX_WANT_IDS})", parsed_ids.len())
+                .into_bytes(),
+            "text/plain".into(),
+        );
+    }
+    // Dedup before sorting — cuts cache-key cost and rejects
+    // amplification via duplicate-id repetition.
+    let mut seen: std::collections::HashSet<crate::hash::ObjectId> =
+        std::collections::HashSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    for oid in parsed_ids {
+        if seen.insert(oid) {
+            ids.push(oid.to_hex());
+        }
+    }
 
     // Cache key: BLAKE3 of the sorted want-set. Sorting normalizes
     // permutations (same wants in different order = same key); the
@@ -2706,23 +2741,12 @@ fn wire_objects_have(
     // bombs.
     let xz_bytes_total =
         std::sync::atomic::AtomicU64::new(0);
-    // Parse body as packfile format
-    let entries = match crate::net::protocol::parse_packfile_accumulating(body, &xz_bytes_total) {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                400,
-                "Bad Request".into(),
-                format!("invalid pack: {e}").into_bytes(),
-                "text/plain".into(),
-            );
-        }
-    };
-    // Hold the object-store lock for the duration of the upload so a
-    // concurrent gc cannot prune objects we've written but not yet
-    // referenced. The lock is short — every entry is a single
-    // decompress + canonicality check + write — so contention is
-    // negligible in practice.
+    // M11: acquire objects.lock BEFORE parsing the body. A malicious
+    // payload can take seconds in the outer XZ decompression; during
+    // that window an unlocked parse lets gc race-prune objects the
+    // upload is about to write — reopening the gc race that CLAUDE.md
+    // claims is closed. Parsing is bounded by MAX_DECOMPRESSED_BYTES
+    // and MAX_PACK_ENTRIES, so holding the lock through it is safe.
     let _objects_lock = match crate::fs_util::FileLock::acquire(
         &gyt_dir.join("objects.lock"),
         std::time::Duration::from_secs(30),
@@ -2737,6 +2761,19 @@ fn wire_objects_have(
             );
         }
     };
+    // Parse body as packfile format
+    let entries = match crate::net::protocol::parse_packfile_accumulating(body, &xz_bytes_total) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                400,
+                "Bad Request".into(),
+                format!("invalid pack: {e}").into_bytes(),
+                "text/plain".into(),
+            );
+        }
+    };
+    // (Lock acquired above for M11 — was previously here.)
     let mut n_stored = 0u32;
     let mut n_skipped = 0u32;
     for entry in &entries {

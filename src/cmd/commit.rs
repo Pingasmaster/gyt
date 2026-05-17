@@ -193,9 +193,13 @@ pub fn run(args: &[String]) -> Result<()> {
     } else {
         format!("commit: {first_line_for_log}")
     };
+    // M1 / F-D9-04: write the reflog FIRST, then advance the ref.
+    // Previously the ref was advanced before the reflog record, so a
+    // crash between the two would leave a moved ref with no reflog
+    // entry — paired with `gc --expire-reflog 0` this is silent data
+    // loss (the old tip can no longer be recovered).
     let branch_label = match &head {
         Head::Symbolic(name) => {
-            refs::write_ref(&repo.gyt_dir, name, &id)?;
             crate::reflog::record(
                 &repo.gyt_dir,
                 name,
@@ -212,10 +216,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 &identity,
                 &reflog_msg,
             );
+            refs::write_ref(&repo.gyt_dir, name, &id)?;
             short_branch(name)
         }
         Head::Detached(_) => {
-            refs::write_head(&repo.gyt_dir, &Head::Detached(id))?;
             crate::reflog::record(
                 &repo.gyt_dir,
                 "HEAD",
@@ -224,6 +228,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 &identity,
                 &reflog_msg,
             );
+            refs::write_head(&repo.gyt_dir, &Head::Detached(id))?;
             "HEAD".to_string()
         }
     };

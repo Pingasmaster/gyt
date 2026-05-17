@@ -284,7 +284,8 @@ fn three_way_merge(
             conflicted_paths.iter().map(|(p, _)| p).collect();
 
         for (path, render) in &conflicted_paths {
-            let abs = repo.workdir.join(path);
+            // H5: refuse if any ancestor is a symlink.
+            let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -303,15 +304,18 @@ fn three_way_merge(
             // on the other".
             let bytes =
                 render_tree_conflict_marker(repo, &c.path, c.kind, c.base, c.ours, c.theirs);
-            let abs = repo.workdir.join(&c.path);
+            // H5: refuse if any ancestor is a symlink.
+            let abs = crate::workdir::safe_workdir_path(&repo.workdir, &c.path)?;
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&abs, bytes)?;
         }
 
-        std::fs::write(
-            repo.gyt_dir.join("MERGE_HEAD"),
+        // M2: atomic_write so a crash mid-write doesn't leave a torn
+        // MERGE_HEAD that breaks rebase-continue / merge-abort flows.
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("MERGE_HEAD"),
             format!("{}\n", theirs.to_hex()).as_bytes(),
         )?;
         std::fs::write(repo.gyt_dir.join("MERGE_MSG"), message.as_bytes())?;
@@ -534,7 +538,8 @@ fn apply_files_to_workdir(
         }
     }
     for (path, (mode, hash)) in merged {
-        let abs = repo.workdir.join(path);
+        // H5: refuse if any ancestor is a symlink.
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -616,7 +621,8 @@ pub fn materialize_commit(repo: &Repo, commit_id: &ObjectId) -> Result<()> {
 
     // 2. Materialize files from target tree.
     for (path, (mode, hash)) in &target_files {
-        let abs = repo.workdir.join(path);
+        // H5: refuse if any ancestor is a symlink.
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }

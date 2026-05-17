@@ -8,7 +8,10 @@
     clippy::expect_used,
     clippy::panic,
     clippy::string_slice,
-    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::never_loop,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure; nested helpers are colocated with their callers; the once-true loop uses break to escape early"
 )]
 
 use std::path::{Path, PathBuf};

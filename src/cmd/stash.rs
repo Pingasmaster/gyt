@@ -579,9 +579,16 @@ fn flatten_recurse(
 fn materialize_tree(repo: &Repo, tree_id: &ObjectId) -> Result<()> {
     let files = flatten_tree(&repo.gyt_dir, tree_id, Path::new(""))?;
     for f in &files {
-        let abs = repo.workdir.join(&f.path);
+        // H5: refuse if any ancestor is a symlink. Also B9: drop a
+        // leaf symlink before writing so `fs::write` doesn't follow it.
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, &f.path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&abs)
+            && meta.file_type().is_symlink()
+        {
+            let _ = std::fs::remove_file(&abs);
         }
         let payload = crate::object::blob::read(&repo.gyt_dir, &f.hash)?;
         if f.mode == MODE_SYMLINK {

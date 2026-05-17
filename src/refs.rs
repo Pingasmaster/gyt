@@ -155,8 +155,14 @@ pub fn write_head(repo_gyt_dir: &Path, head: &Head) -> Result<()> {
 /// Read the ObjectId pointed to by a ref (e.g. `refs/heads/main`).
 pub fn read_ref(repo_gyt_dir: &Path, name: &str) -> Result<ObjectId> {
     let p = ref_path(repo_gyt_dir, name)?;
-    if !p.exists() {
-        return Err(GytError::Refs(format!("ref {name} not found")));
+    // M4: refuse symlinked refs — a planted symlink would let a
+    // 64-hex-shaped file outside `.gyt/` be accepted as the ref tip.
+    let meta = std::fs::symlink_metadata(&p)
+        .map_err(|_| GytError::Refs(format!("ref {name} not found")))?;
+    if meta.file_type().is_symlink() {
+        return Err(GytError::Refs(format!(
+            "ref {name} is a symlink (refusing to follow)"
+        )));
     }
     let bytes = fs_util::read_all(&p)?;
     let text = std::str::from_utf8(&bytes)

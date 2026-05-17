@@ -92,7 +92,6 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     }
 
     let prev = refs::read_ref(&repo.gyt_dir, &head_ref).ok();
-    refs::write_ref(&repo.gyt_dir, &head_ref, &target)?;
     let mode_label = match mode {
         Mode::Soft => "soft",
         Mode::Mixed => "mixed",
@@ -103,23 +102,12 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         .and_then(|c| c.identity().ok())
         .unwrap_or_else(|| "-".to_string());
     let reflog_msg = format!("reset --{mode_label}: {rev}");
-    crate::reflog::record(
-        &repo.gyt_dir,
-        &head_ref,
-        prev.as_ref(),
-        &target,
-        &identity,
-        &reflog_msg,
-    );
-    crate::reflog::record(
-        &repo.gyt_dir,
-        "HEAD",
-        prev.as_ref(),
-        &target,
-        &identity,
-        &reflog_msg,
-    );
 
+    // M7 / M1: do the work-affecting writes BEFORE advancing the ref.
+    // Previously the ref was advanced first; a crash before the index
+    // rewrite left "every file dirty" on the next status. We also
+    // write the reflog before the ref (F-D9-04) so a crash between
+    // them doesn't leave a moved ref with no recovery breadcrumb.
     if mode == Mode::Mixed || mode == Mode::Hard {
         let target_tree = commit::decode(&obj.payload)?.tree;
         let files = flatten_tree(repo, &target_tree)?;
@@ -143,7 +131,24 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             crate::cmd::merge::materialize_commit(repo, &target)?;
         }
     }
-    // Soft: only ref updated above, index and workdir unchanged
+    crate::reflog::record(
+        &repo.gyt_dir,
+        &head_ref,
+        prev.as_ref(),
+        &target,
+        &identity,
+        &reflog_msg,
+    );
+    crate::reflog::record(
+        &repo.gyt_dir,
+        "HEAD",
+        prev.as_ref(),
+        &target,
+        &identity,
+        &reflog_msg,
+    );
+    refs::write_ref(&repo.gyt_dir, &head_ref, &target)?;
+
     Ok(())
 }
 

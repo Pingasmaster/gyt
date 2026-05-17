@@ -315,7 +315,11 @@ fn write_line(out: &mut String, prefix: char, color: &str, payload: &[u8], use_c
     let prefix_str = prefix.to_string();
     // We render bytes lossily; this is a developer-facing diff view.
     let body = String::from_utf8_lossy(payload);
-    let combined = format!("{prefix_str}{body}");
+    // M28: route attacker-controlled blob bytes through term::s so
+    // ANSI escapes / OSC sequences in file content can't rewrite the
+    // operator's terminal.
+    let safe_body = term::s(&body);
+    let combined = format!("{prefix_str}{safe_body}");
     if use_color {
         out.push_str(&term::paint_when(use_color, color, &combined));
     } else {

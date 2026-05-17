@@ -57,6 +57,15 @@ pub struct TlsStream {
     inner: StreamOwned<ClientConnection, TcpStream>,
 }
 
+impl TlsStream {
+    /// M20: expose the underlying TCP socket so callers can set
+    /// read/write timeouts after the TLS handshake completes.
+    #[must_use]
+    pub fn tcp(&self) -> &TcpStream {
+        self.inner.get_ref()
+    }
+}
+
 impl Read for TlsStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)

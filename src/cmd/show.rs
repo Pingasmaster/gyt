@@ -42,7 +42,9 @@ fn show(repo: &Repo, id: &ObjectId, show_sig: bool) -> Result<()> {
         ObjectKind::Blob => {
             let bytes = blob::read(&repo.gyt_dir, id)?;
             match std::str::from_utf8(&bytes) {
-                Ok(s) => print!("{s}"),
+                // M28: route blob content through term::s so attacker-
+                // controlled ANSI escapes can't rewrite the terminal.
+                Ok(s) => print!("{}", term::s(s)),
                 Err(_) => println!("<binary, {} bytes>", bytes.len()),
             }
         }

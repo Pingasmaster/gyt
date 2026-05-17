@@ -630,12 +630,14 @@ fn load_allowed_signers_at(path: &Path) -> Result<Vec<VerifyingKey>> {
     parse_allowed_signers(&text)
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "hex_part.as_bytes()[j*2] / [j*2+1] is gated by the `hex_part.len() != 64` early return (so for j in 0..32, j*2+1 < 64)"
-)]
 fn parse_allowed_signers(text: &str) -> Result<Vec<VerifyingKey>> {
     let mut out = Vec::new();
+    // M26: skip individual bad lines (with a warn-once stderr message)
+    // instead of failing the whole file. Previously, one malformed
+    // line returned Err for the whole file → `unwrap_or_default()` at
+    // the call site → empty allowed list → every signed push failed
+    // silently with MissingAllowedSigners. Operator had no signal
+    // that their file was malformed.
     for (i, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -643,29 +645,45 @@ fn parse_allowed_signers(text: &str) -> Result<Vec<VerifyingKey>> {
         }
         let hex_part = line.split_whitespace().next().unwrap_or("");
         if hex_part.len() != 64 {
-            return Err(GytError::Parse(format!(
-                "allowed_signers line {}: expected 64 hex chars, got {}",
+            audit_warn_once(&format!(
+                "allowed_signers line {}: expected 64 hex chars, got {}; skipping",
                 i + 1,
                 hex_part.len()
-            )));
+            ));
+            continue;
         }
         let mut bytes = [0u8; 32];
+        let mut ok = true;
         for (j, b) in bytes.iter_mut().enumerate() {
-            let hi = (hex_part.as_bytes()[j * 2] as char)
-                .to_digit(16)
-                .ok_or_else(|| {
-                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
-                })?;
-            let lo = (hex_part.as_bytes()[j * 2 + 1] as char)
-                .to_digit(16)
-                .ok_or_else(|| {
-                    GytError::Parse(format!("allowed_signers line {}: bad hex", i + 1))
-                })?;
-            *b = ((hi << 4) | lo) as u8;
+            let pair = match hex_part.get(j * 2..j * 2 + 2) {
+                Some(p) => p,
+                None => {
+                    ok = false;
+                    break;
+                }
+            };
+            match u8::from_str_radix(pair, 16) {
+                Ok(v) => *b = v,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
         }
-        let vk = VerifyingKey::from_bytes(&bytes)
-            .map_err(|e| GytError::Parse(format!("allowed_signers line {}: {e}", i + 1)))?;
-        out.push(vk);
+        if !ok {
+            audit_warn_once(&format!(
+                "allowed_signers line {}: bad hex; skipping",
+                i + 1
+            ));
+            continue;
+        }
+        match VerifyingKey::from_bytes(&bytes) {
+            Ok(vk) => out.push(vk),
+            Err(e) => audit_warn_once(&format!(
+                "allowed_signers line {}: {e}; skipping",
+                i + 1
+            )),
+        }
     }
     Ok(out)
 }

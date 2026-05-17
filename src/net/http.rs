@@ -259,14 +259,26 @@ impl HttpClient {
     }
 
     fn open_conn(&self) -> Result<Box<dyn Conn>> {
+        // M20: client-side read/write timeouts so a slow-loris server
+        // can't hang the CLI forever. Tunable via GYT_CLIENT_TIMEOUT_SECS;
+        // default is 600 s (long enough for legitimate large clones).
+        let secs: u64 = std::env::var("GYT_CLIENT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
+        let timeout = std::time::Duration::from_secs(secs);
         match self.scheme {
             Scheme::Https => {
                 let s = tls::connect_tls(&self.host, self.port)?;
+                let _ = s.tcp().set_read_timeout(Some(timeout));
+                let _ = s.tcp().set_write_timeout(Some(timeout));
                 Ok(Box::new(s))
             }
             Scheme::Http => {
                 let s = TcpStream::connect((self.host.as_str(), self.port))
                     .map_err(|e| GytError::Net(format!("tcp connect: {e}")))?;
+                let _ = s.set_read_timeout(Some(timeout));
+                let _ = s.set_write_timeout(Some(timeout));
                 Ok(Box::new(s))
             }
         }
@@ -396,16 +408,40 @@ fn read_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse> {
         .iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("connection") && contains_token(v, "close"));
 
+    // M19: bound the plain-HTTP body so a malicious server can't OOM
+    // the client by claiming Content-Length: 99999999999. The HTTPS
+    // path is bounded by http_body_util::Limited via hyper.
+    const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024;
     let body = if is_chunked {
-        chunked_decode(reader)?
+        let buf = chunked_decode(reader)?;
+        if buf.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(GytError::Net(format!(
+                "response body too large: {} > {MAX_RESPONSE_BODY_BYTES}",
+                buf.len()
+            )));
+        }
+        buf
     } else if let Some(n) = content_length {
+        if n > MAX_RESPONSE_BODY_BYTES {
+            return Err(GytError::Net(format!(
+                "advertised Content-Length too large: {n} > {MAX_RESPONSE_BODY_BYTES}"
+            )));
+        }
         let mut buf = vec![0u8; n];
         reader.read_exact(&mut buf)?;
         buf
     } else if conn_close {
-        // No framing + server is closing — read to EOF.
+        // No framing + server is closing — read to EOF, but cap the
+        // total resident bytes.
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
+        reader
+            .take(MAX_RESPONSE_BODY_BYTES as u64 + 1)
+            .read_to_end(&mut buf)?;
+        if buf.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(GytError::Net(format!(
+                "response body exceeded {MAX_RESPONSE_BODY_BYTES} bytes"
+            )));
+        }
         buf
     } else {
         // No framing on a keep-alive response would deadlock the next

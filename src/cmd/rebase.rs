@@ -202,7 +202,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             apply_files_to_workdir(repo, &tm.merged)?;
             write_index_from_map(repo, &tm.merged)?;
             for (path, bytes) in &conflict_blobs {
-                let abs = repo.workdir.join(path);
+                // H5: refuse if any ancestor is a symlink.
+                let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
                 if let Some(parent) = abs.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -213,15 +214,19 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 .skip(idx + 1)
                 .map(|c| c.to_hex())
                 .collect();
-            std::fs::write(
-                repo.gyt_dir.join("REBASE_HEAD"),
-                format!("{}\n", current.to_hex()),
+            // M2: atomic_write so a crash mid-write doesn't tear the state.
+            crate::fs_util::atomic_write(
+                &repo.gyt_dir.join("REBASE_HEAD"),
+                format!("{}\n", current.to_hex()).as_bytes(),
             )?;
-            std::fs::write(
-                repo.gyt_dir.join("REBASE_ONTO"),
-                format!("{}\n", target_id.to_hex()),
+            crate::fs_util::atomic_write(
+                &repo.gyt_dir.join("REBASE_ONTO"),
+                format!("{}\n", target_id.to_hex()).as_bytes(),
             )?;
-            std::fs::write(repo.gyt_dir.join("REBASE_TODO"), remaining.join("\n"))?;
+            crate::fs_util::atomic_write(
+                &repo.gyt_dir.join("REBASE_TODO"),
+                remaining.join("\n").as_bytes(),
+            )?;
             return Err(GytError::Repo(format!(
                 "rebase: conflicts replaying {}. Resolve files and re-commit, then run `gyt rebase --abort` to give up.",
                 short(c)
@@ -358,17 +363,18 @@ fn run_continue(repo: &Repo) -> Result<()> {
                     .skip(idx)
                     .map(|c| c.to_hex())
                     .collect();
-                std::fs::write(
-                    repo.gyt_dir.join("REBASE_HEAD"),
-                    format!("{}\n", prev_head.to_hex()),
+                // M2: atomic_write so a crash mid-write doesn't tear the state.
+                crate::fs_util::atomic_write(
+                    &repo.gyt_dir.join("REBASE_HEAD"),
+                    format!("{}\n", prev_head.to_hex()).as_bytes(),
                 )?;
-                std::fs::write(
-                    repo.gyt_dir.join("REBASE_ONTO"),
-                    format!("{}\n", onto.to_hex()),
+                crate::fs_util::atomic_write(
+                    &repo.gyt_dir.join("REBASE_ONTO"),
+                    format!("{}\n", onto.to_hex()).as_bytes(),
                 )?;
-                std::fs::write(
-                    repo.gyt_dir.join("REBASE_TODO"),
-                    still_left.join("\n"),
+                crate::fs_util::atomic_write(
+                    &repo.gyt_dir.join("REBASE_TODO"),
+                    still_left.join("\n").as_bytes(),
                 )?;
                 refs::write_ref(&repo.gyt_dir, &head_ref, &cursor)?;
                 return Err(GytError::Repo(format!(
@@ -460,7 +466,8 @@ fn replay_one(repo: &Repo, cursor: &ObjectId, c: &ObjectId) -> Result<ReplayOutc
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
         for (path, bytes) in &conflict_blobs {
-            let abs = repo.workdir.join(path);
+            // H5: refuse if any ancestor is a symlink.
+            let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -586,7 +593,8 @@ fn apply_files_to_workdir(repo: &Repo, merged: &BTreeMap<PathBuf, (u32, ObjectId
         }
     }
     for (path, (mode, hash)) in merged {
-        let abs = repo.workdir.join(path);
+        // H5: refuse if any ancestor is a symlink.
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -42,15 +42,18 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
     let mut index = Index::read(&repo.index_path())?;
     let mut removed: Vec<PathBuf> = Vec::new();
+    // M6: collect planned workdir unlinks; perform them AFTER the
+    // new index is written to disk.
+    let mut scheduled_unlinks: Vec<PathBuf> = Vec::new();
 
     for arg in &paths {
         if arg == "." {
-            // Remove all staged files.
+            // Remove all staged files. M6: defer the workdir unlink.
             let to_remove: Vec<PathBuf> = index.entries.iter().map(|e| e.path.clone()).collect();
             for p in &to_remove {
                 let abs = repo.workdir.join(p);
                 if abs.exists() {
-                    fs::remove_file(&abs)?;
+                    scheduled_unlinks.push(abs);
                 }
                 index.remove(p);
                 removed.push(p.clone());
@@ -85,7 +88,7 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 removed.push(rel.to_path_buf());
                 continue;
             }
-            // File exists in worktree and is in index - just remove it.
+            // File exists in worktree and is in index - schedule the unlink.
             // H6: do NOT canonicalize(): on a symlink-tracked entry the
             // canonicalize would follow the link and delete the target
             // (e.g. tracked-symlink → ~/.ssh/authorized_keys). `abs` is
@@ -96,9 +99,10 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                     "gyt rm: '{arg}' is a directory (use `gyt add` to unstage, then remove contents manually)"
                 )));
             }
-            fs::remove_file(&abs)?;
+            // M6: defer unlink until after the index is rewritten.
             index.remove(rel);
             removed.push(rel.to_path_buf());
+            scheduled_unlinks.push(abs);
             continue;
         }
 
@@ -123,12 +127,26 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             )));
         }
 
-        fs::remove_file(&abs)?;
+        // M6: schedule the unlink rather than performing it inline.
+        // We write the new index AFTER the in-memory removes and
+        // BEFORE the workdir unlinks below — so a crash mid-loop
+        // leaves the disk in a consistent state (either everything
+        // happens, or the in-memory work is lost and disk is intact).
         index.remove(rel);
         removed.push(rel.to_path_buf());
+        scheduled_unlinks.push(abs);
     }
 
+    // M6: write the index FIRST so it reflects the in-memory state,
+    // then unlink workdir files. Previously the index was written
+    // last, so a crash mid-loop could leave workdir files gone but
+    // still referenced by the on-disk index.
     index.write(&repo.index_path())?;
+    for abs in &scheduled_unlinks {
+        // Best-effort — index already says the file is gone, so a
+        // failed unlink will just show as "untracked file" in status.
+        let _ = fs::remove_file(abs);
+    }
 
     for p in &removed {
         println!("rm {}", forward_slash(p));

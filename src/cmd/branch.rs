@@ -135,7 +135,23 @@ fn create(repo: &Repo, name: &str) -> Result<()> {
 }
 
 fn delete(repo: &Repo, name: &str, force: bool) -> Result<()> {
-    validate_branch_name(name)?;
+    // M10: a clone can land a refname that `validate_ref_name` accepts
+    // but `validate_branch_name` rejects (e.g. unicode like `épée`).
+    // For delete, accept anything `validate_ref_name` accepts so the
+    // user can clean up whatever they actually have on disk.
+    if let Err(stricter_err) = validate_branch_name(name) {
+        let ref_name = format!("refs/heads/{name}");
+        if crate::refs::validate_ref_name(&ref_name).is_err() {
+            return Err(stricter_err);
+        }
+        // Permissive path: only allow delete (not create), and only
+        // when the ref actually exists, so we don't widen the
+        // create surface.
+        if refs::read_ref(&repo.gyt_dir, &ref_name).is_err() {
+            return Err(stricter_err);
+        }
+        return refs::delete_ref(&repo.gyt_dir, &ref_name);
+    }
     if let Some(cur) = current_branch(&repo.gyt_dir)?
         && cur == name
     {

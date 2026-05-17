@@ -194,7 +194,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
 
 fn restore_one(repo: &Repo, entry: &IndexEntry) -> Result<()> {
     use crate::object::tree;
-    let abs = repo.workdir.join(&entry.path);
+    // H5: refuse if any ancestor is a symlink.
+    let abs = crate::workdir::safe_workdir_path(&repo.workdir, &entry.path)?;
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent)?;
     }
