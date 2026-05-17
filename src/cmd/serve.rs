@@ -19,7 +19,10 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut signers_file: Option<PathBuf> = None;
     let mut policy_config: Option<PathBuf> = None;
     let mut allow_multiprocess = false;
-    let mut allow_force = false;
+    // Default ON: matches the historical behavior every existing
+    // operator's clients depend on. Strict FF mode is opt-in via
+    // `--strict-ff` for operators who want to block force pushes.
+    let mut allow_force = true;
     let mut heavy_decompression_log: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -64,9 +67,14 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                      \x20                      caches and rate-limit buckets diverge per replica."
                 );
                 println!(
-                    "  --allow-force         Accept `?force=1` and `?force-with-lease=1` on\n\
-                     \x20                      /refs/update. Default off: any `rw` token would\n\
-                     \x20                      otherwise be able to rewind every ref it can write."
+                    "  --strict-ff           Reject `?force=1` and `?force-with-lease=1` on\n\
+                     \x20                      /refs/update so a rw token cannot rewind a ref.\n\
+                     \x20                      Default OFF (force pushes are allowed) to match\n\
+                     \x20                      the historical behavior every existing client\n\
+                     \x20                      expects; operators who want strict FF can opt in."
+                );
+                println!(
+                    "  --allow-force         Deprecated alias retained for compat (default)."
                 );
                 println!(
                     "  --log-heavy-decompression <file>\n\
@@ -196,7 +204,14 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
                 allow_multiprocess = true;
             }
             "--allow-force" => {
+                // Kept for backward compat; default is already true.
                 allow_force = true;
+            }
+            "--strict-ff" => {
+                // Opt-in strict mode: reject `?force=1` and
+                // `?force-with-lease=1` on /refs/update so a rw
+                // token cannot rewind a ref.
+                allow_force = false;
             }
             "--log-heavy-decompression" => {
                 i += 1;

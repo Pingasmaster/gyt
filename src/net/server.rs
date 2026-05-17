@@ -201,15 +201,16 @@ pub struct ServeConfig {
     /// per replica — the file-level locks (refs.lock, objects.lock,
     /// audit-rotate.lock) keep the on-disk data correct.
     pub allow_multiprocess: bool,
-    /// When true, accept the `?force=1` and `?force-with-lease=1`
-    /// query parameters on `/refs/update`. When false (default), both
-    /// query parameters are ignored — every push runs in strict
-    /// FastForward mode regardless of what the client requests.
+    /// When true (default), accept `?force=1` and `?force-with-lease=1`
+    /// on `/refs/update`. When false (operator passed `--strict-ff`),
+    /// both are ignored — every push runs in strict FastForward mode.
     ///
-    /// F-D4-03: previously every `rw` token implicitly carried force-
-    /// push capability across every ref it could write. The ACL had
-    /// no `force` bit. Operators who want to keep that behavior must
-    /// now opt in by passing `--allow-force` to `gyt serve`.
+    /// Defaults to ON so an upgrade does not silently start rejecting
+    /// pushes that worked the day before. The audit recommendation
+    /// for a `force` ACL bit / opt-in flag would block legitimate
+    /// users that exist today; operators who want that posture can
+    /// opt in with `--strict-ff`. Abuse remains visible through the
+    /// existing per-update audit log.
     pub allow_force: bool,
     /// Optional file path for the heavy-decompression operator log.
     /// When set, any `/objects/have` request that decompresses at
