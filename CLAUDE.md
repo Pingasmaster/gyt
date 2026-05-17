@@ -2,6 +2,38 @@
 
 ## Hard rules
 
+### Never change `rust-toolchain.toml` away from `channel = "beta"`
+
+`rust-toolchain.toml` pins `channel = "beta"` and `rust-version =
+"1.96"` in `Cargo.toml`. This is deliberate: the project uses
+language features that only ship on beta (or have not yet reached the
+current stable). Do **not** "pin to stable for reproducibility" — the
+project knows it's on beta and has chosen that tradeoff. Reproducible
+builds are achieved through `Cargo.lock` and the exact `=X.Y.Z` deps
+in `Cargo.toml`, not by avoiding beta.
+
+If you see beta and think "I should pin this to a stable release",
+that is wrong. Leave it alone.
+
+### Tests are expensive — run them only at the end of a batch of fixes
+
+`cargo test --all-features -- --test-threads=1` takes ~5 minutes on this
+project. Do **not** run it after every single edit. The expected workflow
+inside a multi-fix session:
+
+1. Make a change.
+2. Verify it compiles with `cargo build --release` (or `cargo check` —
+   much faster) per worktree.
+3. Commit.
+4. Move on to the next fix.
+5. **Only at the very end**, after every fix has been committed, run
+   the full `cargo test --all-features -- --test-threads=1` once to
+   catch regressions across the whole batch.
+
+If a fix is structurally risky (e.g. it changes a parser contract that
+many tests depend on) you may run a narrowly-scoped `cargo test
+--test <name>` for that one suite, but never the whole tree mid-batch.
+
 ### Never drop or weaken XZ compression
 
 XZ/LZMA (via `lzma-rust2`) is the project's mandated compression for both:
