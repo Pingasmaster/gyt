@@ -33,7 +33,13 @@ socket2 = { version = "=0.6.3", features = ["all"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# F-D11-03: `strip = "symbols"` left DWARF debug sections in place,
+# which embed the build machine's absolute source paths
+# (/home/<user>/temp/gyt/src/..., ~/.cargo/registry/...). `strip =
+# true` strips both the symbol table AND DWARF. `panic = "unwind"`
+# is intentionally kept (not the default `abort`) because
+# src/fuzz.rs uses std::panic::catch_unwind.
+strip = true
 
 # === STRICT CLIPPY HARNESSES ===
 #
