@@ -272,3 +272,65 @@ fn malformed_wasm_clean_error() {
     assert!(r.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Count the number of threads in this process by listing
+/// `/proc/self/task`. Linux-specific — gyt is Linux-only and the
+/// integration tests already assume `/proc`.
+fn thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map_or(0, |rd| rd.filter_map(Result::ok).count())
+}
+
+/// F2 regression: a wasm module that fails to *instantiate* (e.g.
+/// because it imports a hostcall outside the `gyt_ci` namespace) used
+/// to leak the 1 Hz wall-time ticker thread on the `?` early-return.
+/// Each leaked thread sleeps for up to `wall_time_secs` seconds (4 h
+/// by default) before self-exiting, holding an Engine Arc the whole
+/// time. The TickerGuard's Drop now joins the ticker on every exit
+/// path. 20 sequential instantiation failures must not inflate the
+/// process's thread count.
+#[test]
+fn failed_instantiation_does_not_leak_ticker() {
+    const BAD_IMPORT_WAT: &str = r#"
+(module
+  (import "evil" "do_evil" (func $evil))
+  (func (export "_start") (result i32)
+    call $evil
+    i32.const 0))
+"#;
+    let dir = unique_tmp("ticker-leak");
+    let wasm = write_wat(&dir, "bad-import", BAD_IMPORT_WAT);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // Short wall-time: if the guard regresses, the leaked threads stay
+    // visible in /proc/self/task long enough for the assertion below
+    // to see them.
+    let policy = gyt::ci_wasm::CiPolicy {
+        wall_time_secs: 30,
+        ..gyt::ci_wasm::CiPolicy::default()
+    };
+
+    let baseline = thread_count();
+    for _ in 0..20 {
+        let r = gyt::ci_wasm::run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
+        assert!(
+            r.is_err(),
+            "module with unknown import must fail to instantiate"
+        );
+    }
+    // Give a beat for any half-shutdown threads to vanish from
+    // /proc/self/task on slow CI.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let after = thread_count();
+
+    // With 20 leaks at 30s wall time and a ~200ms post-loop sleep,
+    // ALL 20 leaked threads would still be visible if the guard
+    // regressed. Allow a small slack (8) for runtime workers and
+    // cargo-test bookkeeping.
+    assert!(
+        after <= baseline + 8,
+        "ticker thread leak detected: baseline={baseline} after 20 failed instantiations={after}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

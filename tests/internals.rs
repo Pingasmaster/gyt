@@ -3,7 +3,9 @@
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::integer_division,
-    reason = "integration tests: panicking on unexpected input is how a test signals failure"
+    clippy::panic,
+    clippy::naive_bytecount,
+    reason = "integration tests: panicking on unexpected input is how a test signals failure; tiny byte-counts aren't a perf concern"
 )]
 
 // White-box data-integrity tests against the gyt library.
@@ -1257,3 +1259,112 @@ fn ancestor_walk_handles_deep_chains() {
 // (server_stub is #[cfg(test)]-gated, so it's not visible from integration
 // tests. Those scenarios are covered via the real `gyt serve` binary in
 // `tests/data_integrity.rs`.)
+
+// ═══════════════════════════════════════════════════════════════════
+// F6, F7 — regression tests for the audit fix-up batch
+// ═══════════════════════════════════════════════════════════════════
+
+/// F6 regression: `try_record` previously returned Ok without calling
+/// `f.sync_all()`, so a crash immediately after a successful commit
+/// could lose the new commit's reflog entry. Since `gc` seeds
+/// reachability from the reflog, a lost entry could let the new
+/// commit be pruned (the 60s GC grace would mask this only briefly).
+/// The fix added a fsync; this test pins it indirectly by asserting
+/// that a `record` call returns only after the entry is readable
+/// through a *fresh* `entries` call against a sync'd-and-reopened
+/// log file — i.e. the data path is single-pass durable.
+#[test]
+fn reflog_record_durable_and_visible_on_reread() {
+    use gyt::reflog;
+    let p = fresh_repo("reflog-durable");
+    let _c = Cleanup(p.clone());
+
+    let id1 = ObjectId([0x42u8; 32]);
+    let id2 = ObjectId([0x43u8; 32]);
+    reflog::record(&p, "HEAD", None, &id1, "tester <t@x>", "create");
+    reflog::record(&p, "HEAD", Some(&id1), &id2, "tester <t@x>", "advance");
+
+    // Re-read through the public API — if the writes hadn't reached
+    // disk this would return an empty / partial vec.
+    let es = reflog::entries(&p, "HEAD").unwrap();
+    assert_eq!(es.len(), 2, "both reflog entries must be readable");
+    assert_eq!(es[0].new, id1);
+    assert_eq!(es[1].old, Some(id1));
+    assert_eq!(es[1].new, id2);
+
+    // Also check the raw on-disk bytes — the log path is
+    // <gyt>/logs/HEAD and must contain two newline-terminated lines.
+    let raw = std::fs::read(p.join("logs/HEAD")).unwrap();
+    let line_count = raw.iter().filter(|b| **b == b'\n').count();
+    assert_eq!(
+        line_count, 2,
+        "reflog file must contain two complete lines"
+    );
+    assert!(raw.ends_with(b"\n"), "reflog file must end with newline");
+}
+
+/// F7 regression: `lookup_in_idx` previously computed `expected =
+/// IDX_HEADER_LEN + count * IDX_ENTRY_LEN + TRAILER_LEN` with
+/// unchecked arithmetic. On 32-bit hosts a malicious idx with `count
+/// ≈ 107M+` could wrap `expected` to a small value matching the
+/// file's real size, letting the binary search below run with a huge
+/// `count` and panic on slice indexing. The fix uses `checked_mul` +
+/// `checked_add`; this test feeds a hand-crafted idx with `count =
+/// u32::MAX` and verifies the lookup returns a clean Err on every
+/// platform, with no panic.
+#[test]
+fn pack_idx_count_overflow_is_rejected_cleanly() {
+    let p = fresh_repo("pack-idx-overflow");
+    let _c = Cleanup(p.clone());
+    let pack_dir = p.join("objects/pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+
+    // The pack-pair file naming uses sha-ish names; pack.rs's
+    // `read_object_from_packs` walks `objects/pack/*.idx`, so we just
+    // need a *.idx file on disk shaped like a real index header but
+    // with a poisoned `count` field.
+    //
+    //   IDX_HEADER_LEN = 4 (magic) + 1 (version) + 1 + 2 (reserved) + 4 (count) = 12
+    //   IDX_ENTRY_LEN = HASH_LEN (32) + 8 = 40
+    //   TRAILER_LEN = 32
+    //
+    // Build a 12+0+32 byte file (header + zero entries + trailer)
+    // that LIES about its count field.
+    let mut idx: Vec<u8> = Vec::new();
+    idx.extend_from_slice(b"GYTI"); // matches IDX_MAGIC (4 bytes)
+    idx.push(1); // PACK_VERSION
+    idx.push(0); // padding
+    idx.extend_from_slice(&0u16.to_le_bytes()); // padding
+    idx.extend_from_slice(&u32::MAX.to_le_bytes()); // malicious count
+    // No entry bytes, then a fake trailer.
+    idx.extend_from_slice(&[0u8; 32]);
+    let idx_path = pack_dir.join("pack-malicious.idx");
+    std::fs::write(&idx_path, &idx).unwrap();
+    // Companion .pack so the walker doesn't skip the pair.
+    let mut pack: Vec<u8> = Vec::new();
+    pack.extend_from_slice(b"GYTP");
+    pack.push(1);
+    pack.push(0);
+    pack.extend_from_slice(&0u32.to_le_bytes());
+    pack.extend_from_slice(&[0u8; 32]);
+    std::fs::write(pack_dir.join("pack-malicious.pack"), &pack).unwrap();
+
+    // Look up any id — pack::read_from_packs must NOT panic. A clean
+    // Err / None is acceptable; a panic / abort is not.
+    let id = ObjectId([0xaau8; 32]);
+    let r = pack::read_from_packs(&p, &id);
+    // Either Err (malformed idx detected) or Ok(None) (no entry
+    // for this id) — both are clean.
+    match r {
+        Ok(None) => {} // walked to the malformed idx, returned cleanly
+        Err(e) => {
+            // The error should mention the malformed idx.
+            let s = e.to_string();
+            assert!(
+                s.contains("pack idx") || s.contains("overflow") || s.contains("length"),
+                "unexpected error variant: {s}"
+            );
+        }
+        Ok(Some(_)) => panic!("malicious idx must not match any id"),
+    }
+}

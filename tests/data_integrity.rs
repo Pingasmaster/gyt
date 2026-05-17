@@ -4226,3 +4226,94 @@ fn soak_200_concurrent_clones() {
     // eventually (TCP backlog absorbs the rest).
     assert!(ok >= 180, "{ok}/200 concurrent clones succeeded");
 }
+
+#[test]
+fn worktree_add_parallel_does_not_double_create_branch() {
+    // F1 regression: `gyt worktree add -b foo …` previously skipped
+    // `repo.lock()`, so two concurrent invocations could both pass the
+    // "branch doesn't exist" check and race on the ref write. The lock
+    // now serialises them: exactly one succeeds, the other fails with
+    // "branch foo already exists" (or the worktree-dir collision check,
+    // whichever fires first).
+    let e = Env::new("worktree-parallel-add");
+    e.ok(&["init"]);
+    init_commit(&e, "base.txt", b"base\n", "base");
+
+    let wt1 = e.path("wt1");
+    let wt2 = e.path("wt2");
+    let bin = e.bin.clone();
+    let dir = e.dir.clone();
+    let wt1c = wt1.clone();
+    let h1 = std::thread::spawn(move || {
+        Command::new(&bin)
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .env("GYT_AUTHOR_NAME", "Test User")
+            .env("GYT_AUTHOR_EMAIL", "test@example.com")
+            .args(["worktree", "add", "-b", "shared", wt1c.to_str().unwrap()])
+            .output()
+            .unwrap()
+    });
+    let bin2 = e.bin.clone();
+    let dir2 = e.dir.clone();
+    let wt2c = wt2.clone();
+    let h2 = std::thread::spawn(move || {
+        Command::new(&bin2)
+            .current_dir(&dir2)
+            .env("HOME", &dir2)
+            .env("GYT_AUTHOR_NAME", "Test User")
+            .env("GYT_AUTHOR_EMAIL", "test@example.com")
+            .args(["worktree", "add", "-b", "shared", wt2c.to_str().unwrap()])
+            .output()
+            .unwrap()
+    });
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    let ok_count = u32::from(r1.status.success()) + u32::from(r2.status.success());
+    assert_eq!(
+        ok_count, 1,
+        "exactly one parallel `worktree add -b shared` must succeed; \
+         r1={} r2={}\n stderr1={}\n stderr2={}",
+        r1.status,
+        r2.status,
+        String::from_utf8_lossy(&r1.stderr),
+        String::from_utf8_lossy(&r2.stderr),
+    );
+    // The ref must point at a real commit.
+    let head = e.path(".gyt/refs/heads/shared");
+    assert!(head.exists(), "refs/heads/shared must exist after race");
+    let hex = std::fs::read_to_string(&head).unwrap();
+    assert_eq!(
+        hex.trim().len(),
+        64,
+        "shared ref must contain a 64-char hex id, got {hex:?}"
+    );
+}
+
+#[test]
+fn index_parse_rejects_count_larger_than_data() {
+    // F3 regression: a maliciously-crafted index declaring `count =
+    // u32::MAX` previously triggered Vec::with_capacity(~4B) of
+    // IndexEntry (~80 B each → ~320 GB virtual alloc), aborting the
+    // process under `panic = abort`. The parser now sanity-checks
+    // `count * ENTRY_FIXED_LEN` against the remaining bytes before
+    // allocating and returns a clean Err.
+    let e = Env::new("index-malformed-count");
+    e.ok(&["init"]);
+    // Build a 32-byte index file by hand:
+    //   magic "GYTI" (4) | version u32=1 (4) | count u32=u32::MAX (4) | garbage
+    let mut idx = Vec::new();
+    idx.extend_from_slice(b"GYTI");
+    idx.extend_from_slice(&1u32.to_le_bytes());
+    idx.extend_from_slice(&u32::MAX.to_le_bytes());
+    idx.extend_from_slice(&[0u8; 20]);
+    std::fs::write(e.path(".gyt/index"), &idx).unwrap();
+    // `gyt status` reads the index. It must fail cleanly (non-zero
+    // exit, descriptive Err message), NOT panic / abort.
+    let (_, err) = e.fail(&["status"]);
+    assert!(
+        err.contains("index")
+            && (err.contains("entries") || err.contains("count") || err.contains("bytes")),
+        "expected a clean index-parse error, got stderr={err:?}"
+    );
+}
