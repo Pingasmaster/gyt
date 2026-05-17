@@ -52,6 +52,10 @@ fn cmd_add(args: &[String]) -> Result<()> {
     reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
 )]
 fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
+    // Serialize against every other ref-mutating command in the repo.
+    // Without this, two concurrent `worktree add -b foo` invocations can
+    // both pass the "branch doesn't exist" check and race on the ref write.
+    let _lock = repo.lock()?;
     // Parse: [-b <branch>] <path> [<base-rev>]
     let mut new_branch: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();

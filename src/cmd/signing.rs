@@ -14,6 +14,7 @@
 use crate::errors::{GytError, Result};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Default signing key path.
 pub fn default_key_path() -> PathBuf {
@@ -50,17 +51,22 @@ pub fn resolve_pub_path(config: Option<&str>) -> PathBuf {
 /// a strong sign of a setup mistake we don't want to paper over.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
     enforce_private_mode(path)?;
-    let bytes = std::fs::read(path)
-        .map_err(|e| GytError::Ci(format!("reading signing key {}: {e}", path.display())))?;
+    // Read straight into a Zeroizing<Vec<u8>> so the on-disk key material
+    // is wiped from the heap when this scope ends, regardless of whether
+    // the early-return paths below fire. SigningKey itself zeroizes on
+    // drop; the intermediate stack array does not, so we wrap it too.
+    let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        std::fs::read(path)
+            .map_err(|e| GytError::Ci(format!("reading signing key {}: {e}", path.display())))?,
+    );
     if bytes.len() != 32 {
         return Err(GytError::Ci(format!(
             "signing key must be exactly 32 bytes, got {}",
             bytes.len()
         )));
     }
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| GytError::Ci("signing key: expected 32 bytes".into()))?;
+    let mut arr: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+    arr.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&arr))
 }
 

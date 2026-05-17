@@ -7,11 +7,10 @@
 //   * `--ff-only` — refuse if not a fast-forward (no replay required).
 //   * `--abort`   — discard a rebase that left the repo with conflicts.
 //   * default     — replay; on conflict, write conflict markers, drop the
-//                   `.gyt/REBASE_HEAD` + `REBASE_TODO` state, and exit. The
-//                   user resolves and re-runs `gyt rebase --continue`
-//                   (TODO: not implemented yet — the user can resolve and
-//                   run `gyt commit` then re-run `gyt rebase` for the
-//                   remaining commits).
+//                   `.gyt/REBASE_HEAD` + `REBASE_TODO` state, and exit.
+//                   The user resolves, stages the result, and re-runs
+//                   `gyt rebase --continue` to replay the remaining
+//                   commits.
 
 use crate::cmd::util::resolve_rev;
 use crate::config::Config;

@@ -14,16 +14,27 @@ use std::path::{Path, PathBuf};
 const KEY_DIR: &str = ".config/gyt";
 const KEY_FILE: &str = "ci-key";
 
-fn key_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    PathBuf::from(home).join(KEY_DIR).join(KEY_FILE)
+fn key_path() -> Result<PathBuf> {
+    // Reject an unset HOME loudly. The previous code fell back to `/root`,
+    // which silently sent CI secrets to a predictable, world-known location
+    // — fine if the process happened to be root, but a confusing
+    // permission-denied error for any other user, and a footgun for any
+    // automation that ran without HOME set (containers, systemd units).
+    let home = std::env::var("HOME").map_err(|_| {
+        GytError::Ci(
+            "HOME is not set; cannot locate the CI secret key. \
+             Set HOME or run from a user shell."
+                .into(),
+        )
+    })?;
+    Ok(PathBuf::from(home).join(KEY_DIR).join(KEY_FILE))
 }
 
 /// Load the CI encryption key, generating a new one if it doesn't exist.
 /// On Unix the file is created with mode `0600`; the loader refuses to read
 /// a key whose mode allows group or world access.
 pub fn ensure_key() -> Result<[u8; 32]> {
-    let path = key_path();
+    let path = key_path()?;
     if path.exists() {
         enforce_private_mode(&path)?;
         let raw =

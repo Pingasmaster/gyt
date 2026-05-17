@@ -264,7 +264,21 @@ fn lookup_in_idx(idx_path: &Path, id: &ObjectId) -> Result<Option<u64>> {
         )));
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
-    let expected = IDX_HEADER_LEN + count * IDX_ENTRY_LEN + TRAILER_LEN;
+    // Use checked arithmetic so a malicious `count` on a 32-bit host
+    // cannot wrap `expected` to a small value that happens to equal
+    // `bytes.len()`, letting the binary search below run with a huge
+    // upper bound and panic on slice indexing. On 64-bit this can't
+    // overflow today (u32::MAX * 40 fits in usize), but the check is
+    // free and removes the implicit target-width assumption.
+    let expected = count
+        .checked_mul(IDX_ENTRY_LEN)
+        .and_then(|n| n.checked_add(IDX_HEADER_LEN + TRAILER_LEN))
+        .ok_or_else(|| {
+            GytError::Object(format!(
+                "pack idx {}: entry count {count} overflows expected size",
+                idx_path.display()
+            ))
+        })?;
     if bytes.len() != expected {
         return Err(GytError::Object(format!(
             "pack idx {}: length mismatch (have {}, want {expected})",

@@ -416,18 +416,13 @@ pub fn run_ci_wasm_with_policy(
     // refactor that drops the pre-sleep can't accidentally trap the
     // store on its very first instruction.
     store.set_epoch_deadline(deadline_secs);
-    let ticker_engine = engine.clone();
-    let ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ticker_stop_clone = ticker_stop.clone();
-    let ticker = std::thread::spawn(move || {
-        for _ in 0..deadline_secs {
-            if ticker_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-            ticker_engine.increment_epoch();
-        }
-    });
+    // The ticker thread must be joined on every exit path — including
+    // the `?` early-return out of `linker.instantiate` below. A bare
+    // `spawn` + manual stop-and-join leaks the thread (and its engine
+    // Arc clone) for up to `deadline_secs` seconds whenever any of the
+    // intervening fallible calls returns early. TickerGuard's Drop
+    // takes care of that uniformly.
+    let _ticker = TickerGuard::spawn(engine.clone(), deadline_secs);
 
     // 4. Instantiate. If the module imports anything outside our
     //    `gyt_ci` namespace, this fails — by design.
@@ -453,13 +448,48 @@ pub fn run_ci_wasm_with_policy(
         Err(e) => Err(GytError::Ci(format!("WASM has no _start or _main: {e}"))),
     };
 
-    // 5. Tell the ticker to exit and join it so we don't leak a
-    //    background thread per CI run. The increment_epoch calls are
-    //    cheap and harmless after the store is dropped.
-    ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = ticker.join();
-
+    // `_ticker` drops here, signalling the ticker thread to stop and
+    // joining it before we return. The increment_epoch calls are cheap
+    // and harmless after the store is dropped.
     result
+}
+
+/// RAII handle for the 1 Hz wall-time ticker thread. Spawning a bare
+/// `std::thread` and stopping it manually means every fallible call
+/// between spawn and stop leaks the thread on early return; wrapping
+/// the lifecycle in `Drop` removes that footgun.
+struct TickerGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TickerGuard {
+    fn spawn(engine: Engine, deadline_secs: u64) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..deadline_secs {
+                if stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                engine.increment_epoch();
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for TickerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Per-store resource limiter (memory + tables + instance count).

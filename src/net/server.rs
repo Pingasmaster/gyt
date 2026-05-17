@@ -1054,6 +1054,10 @@ impl AclEntry {
 /// to be `/` — so the only valid patterns are `*` (global), an exact
 /// repo name, or `<segment>/*` / `<segment>/<segment>/*` / … (any
 /// path with a trailing `/*`).
+#[expect(
+    clippy::string_slice,
+    reason = "pattern[..pattern.len() - 1] slices off the trailing ASCII '*' verified by ends_with('*') above; ASCII bytes are always UTF-8 char boundaries"
+)]
 fn validate_acl_pattern(pattern: &str) -> std::result::Result<(), String> {
     if pattern.is_empty() {
         return Err("pattern must be non-empty".into());
@@ -1092,8 +1096,7 @@ fn validate_acl_pattern(pattern: &str) -> std::result::Result<(), String> {
 /// because silently dropping a malformed line could downgrade trust.
 #[expect(
     clippy::indexing_slicing,
-    clippy::string_slice,
-    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line; the validate_acl_pattern slice is by ASCII-only '*' position which is also a UTF-8 char boundary"
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
 )]
 fn load_acl(path: &std::path::Path) -> Result<Vec<AclEntry>> {
     let text = std::fs::read_to_string(path).map_err(|e| {
@@ -1389,15 +1392,18 @@ fn check_auth(auth_header: Option<&str>, expected_token: &str) -> bool {
     }
 }
 
-/// Constant-time byte-slice equality. Returns false if lengths differ, but
-/// still walks both buffers up to `max(a.len(), b.len())` so the time taken
-/// does not branch on the position of the first mismatch.
+/// Constant-time byte-slice equality. Returns false if lengths differ.
+///
+/// The loop runs over the *expected* token's length (`b.len()`), not
+/// `max(a.len(), b.len())`. Using `max` would let an attacker learn the
+/// expected token's length by varying the attacker-supplied length and
+/// observing whether request time scales with attacker input — a small
+/// but real leak. Binding to `b.len()` keeps runtime independent of
+/// `a.len()`. Token *contents* are still walked in constant time.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len = a.len().max(b.len());
     let mut acc: u8 = u8::from(a.len() != b.len());
-    for i in 0..len {
+    for (i, &y) in b.iter().enumerate() {
         let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
         acc |= x ^ y;
     }
     acc == 0
@@ -2954,6 +2960,7 @@ fn wire_refs_update(
 mod tests {
     #![expect(
         clippy::unwrap_used,
+        clippy::indexing_slicing,
         reason = "test code: panicking on unexpected input is how a test signals failure"
     )]
     use super::*;
@@ -3397,5 +3404,42 @@ mod tests {
         assert!(repo_path(&state, "alice", ".dotfiles").is_some());
 
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// F4 regression: `constant_time_eq` previously walked
+    /// `max(a.len(), b.len())` iterations, which made the runtime
+    /// scale with the attacker-supplied input's length and leaked the
+    /// expected token's length. The new loop runs exactly `b.len()`
+    /// iterations, independent of `a.len()`. Verify correctness
+    /// (length mismatches reject; equal contents accept; wrong byte
+    /// at every position rejects), and verify the structural property
+    /// that the loop bound is `b.len()` (no panic / no OOB regardless
+    /// of `a.len()`).
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch_and_compares_contents() {
+        let expected = b"abcdefghij"; // 10 bytes
+        // Equal: accepted.
+        assert!(constant_time_eq(b"abcdefghij", expected));
+        // Empty attacker input vs non-empty expected: rejected.
+        assert!(!constant_time_eq(b"", expected));
+        // Attacker shorter than expected: rejected.
+        assert!(!constant_time_eq(b"abc", expected));
+        // Attacker longer than expected: rejected.
+        assert!(!constant_time_eq(b"abcdefghijklmnop", expected));
+        // Same length, single byte off at every position: rejected.
+        for i in 0..expected.len() {
+            let mut bad = expected.to_vec();
+            bad[i] ^= 0xff;
+            assert!(
+                !constant_time_eq(&bad, expected),
+                "diff at position {i} must reject"
+            );
+        }
+        // Structural: attacker-supplied input far longer than expected
+        // must not panic and must not be accepted.
+        let long = vec![b'a'; 4096];
+        assert!(!constant_time_eq(&long, expected));
+        // Empty-vs-empty is a degenerate but well-defined case.
+        assert!(constant_time_eq(b"", b""));
     }
 }

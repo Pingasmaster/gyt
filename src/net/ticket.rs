@@ -42,6 +42,7 @@ use rand::RngCore;
 use rustls::server::ProducesTickets;
 use std::fmt;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 use crate::errors::{GytError, Result};
 
@@ -122,13 +123,15 @@ fn parse_key(hex: &str) -> Result<Key<Aes256Gcm>> {
             hex.len()
         )));
     }
-    let mut bytes = [0u8; 32];
+    // Zeroize the decoded key on scope exit so the raw 32-byte material
+    // doesn't linger in stack memory after the Key copy is made.
+    let mut bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     for i in 0..32 {
         let b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
             .map_err(|e| GytError::Net(format!("ticket key not valid hex: {e}")))?;
         bytes[i] = b;
     }
-    Ok(*Key::<Aes256Gcm>::from_slice(&bytes))
+    Ok(*Key::<Aes256Gcm>::from_slice(&*bytes))
 }
 
 impl ProducesTickets for SharedTicketer {

@@ -185,6 +185,18 @@ impl Index {
         }
         let count = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes")) as usize;
 
+        // `count` is attacker-controlled (it's a u32 from the on-disk
+        // header). A maliciously-crafted index declaring `count = u32::MAX`
+        // would otherwise trigger `Vec::with_capacity(~4B)` of IndexEntry
+        // (≈80–100 B each → ~320–400 GB virtual alloc) and abort the
+        // process. Reject any count that cannot possibly fit in the
+        // remaining bytes before allocating.
+        let min_remaining = data.len().saturating_sub(HEADER_LEN);
+        if count.saturating_mul(ENTRY_FIXED_LEN) > min_remaining {
+            return Err(GytError::Index(format!(
+                "index claims {count} entries but only {min_remaining} bytes remain after header"
+            )));
+        }
         let mut entries = Vec::with_capacity(count);
         let mut off = HEADER_LEN;
         for i in 0..count {

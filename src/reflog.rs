@@ -9,8 +9,12 @@
 // `<old-hex>` is 64 zeros for ref creation. Lines never contain `\n` except
 // at the end; messages with embedded newlines are silently flattened.
 //
-// Reflog writes are best-effort: failures are logged and swallowed so a
-// disk hiccup or permissions issue doesn't break a commit or merge.
+// Reflog writes are best-effort at the *caller* boundary: `record` swallows
+// any error from `try_record` so a disk hiccup or permissions issue doesn't
+// break a commit or merge. But when `try_record` returns Ok, the entry is
+// durable on disk — the write is fsync'd before we return, so a crash
+// immediately after a successful commit cannot lose its reflog entry
+// (which `gc` relies on as a reachability seed).
 //
 // Reading: `entries()` returns the parsed lines (newest last, matching
 // on-disk order). `entries_reverse()` is provided for the common UX of
@@ -75,6 +79,11 @@ fn try_record(
         .append(true)
         .open(&path)?;
     f.write_all(line.as_bytes())?;
+    // Durability: gc seeds its reachability walk from reflog entries, so a
+    // crash after a successful commit that loses the reflog entry could let
+    // gc prune the new commit (mitigated only by the 60s mtime grace).
+    // fsync makes "record returned Ok" mean "entry survives a crash".
+    f.sync_all()?;
     Ok(())
 }
 
