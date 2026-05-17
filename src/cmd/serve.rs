@@ -19,6 +19,10 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
     let mut signers_file: Option<PathBuf> = None;
     let mut policy_config: Option<PathBuf> = None;
     let mut allow_multiprocess = false;
+    // H12: explicit operator opt-in for running --auth-token without
+    // TLS on a non-loopback bind. Default false: refuse, because the
+    // bearer token would otherwise be sent in cleartext.
+    let mut allow_plaintext_auth = false;
     // Default ON: matches the historical behavior every existing
     // operator's clients depend on. Strict FF mode is opt-in via
     // `--strict-ff` for operators who want to block force pushes.
@@ -203,6 +207,12 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
             "--allow-multiprocess" => {
                 allow_multiprocess = true;
             }
+            "--allow-plaintext-auth" => {
+                // H12 opt-in: explicitly acknowledge that the bearer
+                // token will be sent over cleartext on the configured
+                // non-loopback bind.
+                allow_plaintext_auth = true;
+            }
             "--allow-force" => {
                 // Kept for backward compat; default is already true.
                 allow_force = true;
@@ -247,6 +257,28 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
         return Err(crate::errors::GytError::InvalidArgument(
             "--listen-h2 / --listen-h3 require --cert and --key".into(),
         ));
+    }
+
+    // H12: if auth is configured but TLS is not, every push leaks the
+    // bearer token in cleartext over the network. Refuse to start
+    // unless the operator opts in via --allow-plaintext-auth OR the
+    // bind is loopback only.
+    if (auth_token.is_some() || auth_tokens_file.is_some())
+        && tls_cert.is_none()
+        && !allow_plaintext_auth
+    {
+        let any_nonloopback = std::iter::once(listen.as_str())
+            .chain(h2_listen.as_deref())
+            .chain(h3_listen.as_deref())
+            .any(|a| !is_loopback_listen_addr(a));
+        if any_nonloopback {
+            return Err(crate::errors::GytError::InvalidArgument(
+                "auth token configured without TLS on a non-loopback bind: bearer \
+                 tokens would be sent in cleartext. Provide --cert and --key, bind \
+                 to loopback only, or pass --allow-plaintext-auth to opt in."
+                    .into(),
+            ));
+        }
     }
 
     if tls_ticket_key.is_some() && tls_cert.is_none() {
@@ -429,15 +461,40 @@ mod tests {
     fn serve_custom_listen_addr() {
         let _g = lock();
         // F-D9-03 added: a non-loopback bind without auth is refused.
-        // Pair the listen with --auth-token so the config parses.
+        // H12 added: --auth-token without TLS on a non-loopback bind
+        // also needs --allow-plaintext-auth to opt in. This test pins
+        // the "auth + opt-in" path; the strict-by-default behaviour is
+        // covered by `serve_plaintext_auth_without_optin_is_refused`.
         let config = parse_args(&[
             "--listen".into(),
             "0.0.0.0:3000".into(),
             "--auth-token".into(),
             "secret".into(),
+            "--allow-plaintext-auth".into(),
         ])
         .unwrap();
         assert_eq!(config.listen_addr, "0.0.0.0:3000");
+    }
+
+    #[test]
+    fn serve_plaintext_auth_without_optin_is_refused() {
+        let _g = lock();
+        // H12: --auth-token on a non-loopback bind without TLS or
+        // --allow-plaintext-auth must be refused.
+        let res = parse_args(&[
+            "--listen".into(),
+            "0.0.0.0:3000".into(),
+            "--auth-token".into(),
+            "secret".into(),
+        ]);
+        let msg = match res {
+            Ok(_) => panic!("expected error"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("cleartext") || msg.contains("plaintext"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

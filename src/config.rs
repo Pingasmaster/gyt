@@ -163,9 +163,10 @@ fn merge_into(base: &mut Config, other: Config) {
     if other.create_default_gytignore {
         base.create_default_gytignore = true;
     }
-    if other.sign_required {
-        base.sign_required = true;
-    }
+    // M29: per-repo config wins over global, in both directions.
+    // Previously `sign_required` was a one-way `if other.sign_required
+    // { true }`, so a repo could turn ON signing but never OFF.
+    base.sign_required = other.sign_required;
 }
 
 // TOML string quoting helper, used in tests only today. Exercised by

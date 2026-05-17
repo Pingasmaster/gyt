@@ -6,6 +6,19 @@ use crate::object::commit::{self, Commit};
 use crate::refs::{self, Head};
 use crate::repo::Repo;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// H14: a `\n`, `\r`, or other control byte in an author / co-author /
+/// reviewer / ai value injects an additional header line into the
+/// commit, which (combined with the canonical re-encode check) can be
+/// used to smuggle a fake `signature` line. Reject at CLI parse time.
+fn reject_control_bytes(flag: &str, value: &str) -> Result<()> {
+    if let Some(b) = value.bytes().find(|&b| b < 0x20 || b == 0x7f) {
+        return Err(GytError::InvalidArgument(format!(
+            "commit: {flag} value contains control byte 0x{b:02x}"
+        )));
+    }
+    Ok(())
+}
 #[expect(
     clippy::indexing_slicing,
     clippy::string_slice,
@@ -43,33 +56,27 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--ai" => {
                 i += 1;
-                ai_assists.push(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            GytError::InvalidArgument("commit: --ai requires a value".into())
-                        })?
-                        .clone(),
-                );
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("commit: --ai requires a value".into())
+                })?;
+                reject_control_bytes("--ai", v)?;
+                ai_assists.push(v.clone());
             }
             "--co-author" => {
                 i += 1;
-                co_authors.push(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            GytError::InvalidArgument("commit: --co-author requires a value".into())
-                        })?
-                        .clone(),
-                );
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("commit: --co-author requires a value".into())
+                })?;
+                reject_control_bytes("--co-author", v)?;
+                co_authors.push(v.clone());
             }
             "--reviewer" => {
                 i += 1;
-                reviewers.push(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            GytError::InvalidArgument("commit: --reviewer requires a value".into())
-                        })?
-                        .clone(),
-                );
+                let v = args.get(i).ok_or_else(|| {
+                    GytError::InvalidArgument("commit: --reviewer requires a value".into())
+                })?;
+                reject_control_bytes("--reviewer", v)?;
+                reviewers.push(v.clone());
             }
             "--allow-empty" => {
                 allow_empty = true;

@@ -120,6 +120,15 @@ impl RateLimiter {
         cfg: LimitConfig,
         now: Instant,
     ) -> bool {
+        // H8: cap the bucket map's total size. Without this, an
+        // IPv6 /64 attacker rotating source addresses creates millions
+        // of `Key::Ip` entries before the time-based GC sweeps (5min);
+        // each entry is ~80 bytes resident → multi-GiB OOM. When the
+        // map is full, treat new-key inserts as denials (fail-closed).
+        const MAX_RATE_LIMIT_ENTRIES: usize = 65_536;
+        if !map.contains_key(&key) && map.len() >= MAX_RATE_LIMIT_ENTRIES {
+            return false;
+        }
         let cap = u64::from(cfg.capacity) * 1000;
         let entry = map.entry(key).or_insert(Bucket {
             millitokens: cap,

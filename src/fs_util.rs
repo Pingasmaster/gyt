@@ -12,6 +12,15 @@ use std::time::Duration;
 static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_with_mode(path, data, default_mode_for(path))
+}
+
+/// Like `atomic_write` but explicitly sets the file's Unix mode after
+/// the temp-file is created and before the rename. Closes H7: every
+/// gyt write previously used `File::create` with the default umask
+/// (typically 0o644), so on multi-user hosts every local user could
+/// read all loose objects, refs, HEAD, reflog, and the index.
+pub fn atomic_write_with_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -26,6 +35,16 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+        // Force the mode explicitly so we don't depend on the
+        // process umask. On non-Unix this is a no-op.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
+        }
+        // Silence the unused-variable warning on non-Unix.
+        #[cfg(not(unix))]
+        let _ = mode;
     }
     fs::rename(&tmp, path)?;
     // fsync the parent directory so the rename is durable across power
@@ -45,6 +64,21 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 pub fn read_all(path: &Path) -> Result<Vec<u8>> {
     Ok(fs::read(path)?)
+}
+
+/// Pick the default permission mode for a given path. Anything under
+/// a `.gyt/` directory is private to the user (0o600); everything else
+/// (workdir files, config files) follows the standard 0o644.
+fn default_mode_for(path: &Path) -> u32 {
+    for comp in path.components() {
+        if let std::path::Component::Normal(s) = comp
+            && let Some(name) = s.to_str()
+            && name == ".gyt"
+        {
+            return 0o600;
+        }
+    }
+    0o644
 }
 
 /// Cross-process mutex implemented as an O_EXCL lockfile. Holding a

@@ -629,7 +629,17 @@ fn cmd_ci_run(args: &[String]) -> Result<()> {
         )));
     }
     let out_dir = repo.workdir.join(".gyt-ci-output");
-    std::fs::create_dir_all(&out_dir)?;
+    // C5: refuse output dir if it's a symlink (malicious-clone RCE precursor).
+    if let Ok(meta) = std::fs::symlink_metadata(&out_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(GytError::Ci(format!(
+                "pr #{n}: output dir {} is a symlink; refusing",
+                out_dir.display()
+            )));
+        }
+    } else {
+        std::fs::create_dir_all(&out_dir)?;
+    }
 
     let wasms = collect_wasm_scripts(&ci_dir);
     if wasms.is_empty() {

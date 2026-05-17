@@ -322,23 +322,26 @@ pub fn evaluate_with_mode(
             ));
             continue;
         }
-        // F-D8-01: issue/PR refs back blob objects (canonical TOML),
-        // not commits. The FF / ancestry check below would invoke
-        // `is_ancestor` which calls `commit::read` on the blob hash —
-        // that fails for every non-commit object, so `is_ancestor`
-        // returned `Ok(false)` and EVERY second push of an issue or
-        // PR was rejected with 409. Skip the commit-DAG FF gate for
-        // these refs; the canonical-TOML monotonic-append check is
-        // applied separately at `wire_objects_have` (F-D8-02).
-        //
-        // Signature enforcement also doesn't apply to issue/PR blobs
-        // — `commits_new_since` on a blob seed returns an empty list
-        // (now that F-D4-04 distinguishes seed-vs-parent reads), so
-        // the signature block falls through harmlessly. We special-
-        // case here to make the intent obvious.
+        // C4: type-check the new ref's target object kind before any
+        // FF logic. Previously a create-mode update (`u.old == None`)
+        // could point `refs/heads/poison` at a blob — every future
+        // reader then errored `commit::read` on the blob. Persistent
+        // DoS on `refs/heads/*` from any rw client.
+        if let Err(e) = enforce_target_kind(gyt_dir, &u.name, &u.new) {
+            blocked.push((u.name.clone(), e));
+            continue;
+        }
+        // F-D8-01 / C3: issue/PR refs back blob objects (canonical
+        // TOML), not commits. Skip the commit-DAG FF gate. Enforce
+        // the monotonic-append invariant here: an rw client can
+        // otherwise upload a blob with `events = []` and silently
+        // erase the whole audit trail.
         let is_metadata_ref =
             u.name.starts_with("refs/issues/") || u.name.starts_with("refs/prs/");
         if is_metadata_ref {
+            if let Err(e) = enforce_metadata_monotonic(gyt_dir, &u.name, u.old.as_ref(), &u.new) {
+                blocked.push((u.name.clone(), e));
+            }
             continue;
         }
         // Three modes have three different gate combinations. We always
@@ -413,6 +416,111 @@ pub fn evaluate_with_mode(
     }
 
     PolicyEvaluation { blocked }
+}
+
+/// C4: refuse a ref-update whose target object kind doesn't match the
+/// ref's namespace. `refs/heads/*` and `refs/remotes/*` must point at
+/// a Commit; `refs/tags/*` may point at Commit or Tag; `refs/issues/*`
+/// and `refs/prs/*` must point at a Blob. The new id MUST be present
+/// in the local object store (the wire push completed before we got
+/// here) — otherwise the FF logic can't run anyway.
+fn enforce_target_kind(
+    gyt_dir: &Path,
+    refname: &str,
+    new_id: &ObjectId,
+) -> std::result::Result<(), PolicyError> {
+    use crate::object::ObjectKind;
+    // null-id is the "delete this ref" sentinel.
+    if new_id.0.iter().all(|&b| b == 0) {
+        return Ok(());
+    }
+    let obj = match crate::object::store::read(gyt_dir, new_id) {
+        Ok(o) => o,
+        Err(_) => {
+            return Err(PolicyError::BadRefName {
+                refname: refname.into(),
+                reason: format!("target object {new_id} not present"),
+            });
+        }
+    };
+    let ok = if refname.starts_with("refs/heads/")
+        || refname.starts_with("refs/remotes/")
+    {
+        obj.kind == ObjectKind::Commit
+    } else if refname.starts_with("refs/tags/") {
+        obj.kind == ObjectKind::Commit || obj.kind == ObjectKind::Tag
+    } else if refname.starts_with("refs/issues/") || refname.starts_with("refs/prs/") {
+        obj.kind == ObjectKind::Blob
+    } else {
+        // Other refs/ namespaces are server-controlled; require Commit
+        // by default (e.g. refs/stash). is_user_visible_ref already
+        // limits what reaches the wire.
+        obj.kind == ObjectKind::Commit
+    };
+    if !ok {
+        return Err(PolicyError::BadRefName {
+            refname: refname.into(),
+            reason: format!(
+                "wrong target kind {:?} for namespace",
+                obj.kind
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// C3 / F-D8-02: enforce the monotonic-append invariant on
+/// `refs/issues/<N>` and `refs/prs/<N>` updates. The old blob (if any)
+/// must decode as the matching kind, the new blob must decode, and
+/// `new` must be a legitimate extension of `old` per the per-kind
+/// `validate_extends` helper.
+fn enforce_metadata_monotonic(
+    gyt_dir: &Path,
+    refname: &str,
+    old_id: Option<&ObjectId>,
+    new_id: &ObjectId,
+) -> std::result::Result<(), PolicyError> {
+    // Delete: null new id is the "drop this ref" path; no extension check.
+    if new_id.0.iter().all(|&b| b == 0) {
+        return Ok(());
+    }
+    // Read new blob.
+    let new_obj = match crate::object::store::read(gyt_dir, new_id) {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(PolicyError::Internal(format!(
+                "read new metadata blob: {e}"
+            )));
+        }
+    };
+    if refname.starts_with("refs/issues/") {
+        let new_iss = crate::issues::decode(&new_obj.payload)
+            .map_err(|e| PolicyError::Internal(format!("decode new issue: {e}")))?;
+        if let Some(oid) = old_id {
+            let old_obj = match crate::object::store::read(gyt_dir, oid) {
+                Ok(o) => o,
+                Err(_) => return Ok(()),  // old ref vanished between reads; create-mode.
+            };
+            let old_iss = crate::issues::decode(&old_obj.payload)
+                .map_err(|e| PolicyError::Internal(format!("decode old issue: {e}")))?;
+            crate::issues::validate_extends(&old_iss, &new_iss)
+                .map_err(|e| PolicyError::Internal(e.to_string()))?;
+        }
+    } else if refname.starts_with("refs/prs/") {
+        let new_pr = crate::prs::decode(&new_obj.payload)
+            .map_err(|e| PolicyError::Internal(format!("decode new pr: {e}")))?;
+        if let Some(oid) = old_id {
+            let old_obj = match crate::object::store::read(gyt_dir, oid) {
+                Ok(o) => o,
+                Err(_) => return Ok(()),
+            };
+            let old_pr = crate::prs::decode(&old_obj.payload)
+                .map_err(|e| PolicyError::Internal(format!("decode old pr: {e}")))?;
+            crate::prs::validate_extends(&old_pr, &new_pr)
+                .map_err(|e| PolicyError::Internal(e.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 fn read_ref(gyt_dir: &Path, refname: &str) -> std::io::Result<Option<ObjectId>> {

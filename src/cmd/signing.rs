@@ -12,7 +12,7 @@
 // `gyt config signing.pub <path>`.
 
 use crate::errors::{GytError, Result};
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -129,6 +129,36 @@ pub fn sign_commit(payload: &[u8], key_path: &Path) -> Result<String> {
     Ok(base64_encode(signature.to_bytes().as_slice()))
 }
 
+/// Sign the given commit if the repo config requires it (or `force_sign`
+/// is set). Returns the (possibly-signed) Commit ready for `commit::write`.
+///
+/// Closes C7: previously `gyt merge`, `gyt rebase`, and `gyt cherry-pick`
+/// constructed commits with hardcoded `signature: None` and never checked
+/// `commit.sign_required`. A repo configured "all commits signed" then
+/// silently accepted unsigned commits through every non-commit path.
+/// Now every commit-producing path routes through this helper.
+pub fn maybe_sign_commit(
+    repo: &crate::repo::Repo,
+    c: crate::object::commit::Commit,
+    force_sign: bool,
+) -> Result<crate::object::commit::Commit> {
+    let cfg = crate::config::Config::load(repo)?;
+    if !cfg.sign_required && !force_sign {
+        return Ok(c);
+    }
+    if c.signature.is_some() {
+        return Ok(c);
+    }
+    let payload = commit_payload_without_sig(&c);
+    let key_path =
+        resolve_key_path(std::env::var("GYT_SIGNING_KEY").ok().as_deref());
+    let b64_sig = sign_commit(&payload, &key_path)?;
+    Ok(crate::object::commit::Commit {
+        signature: Some(b64_sig),
+        ..c
+    })
+}
+
 /// Compute the commit payload that gets signed — the full commit encoding
 /// with the signature line omitted.  This is the payload signed by ed25519.
 pub fn commit_payload_without_sig(c: &crate::object::commit::Commit) -> Vec<u8> {
@@ -189,7 +219,11 @@ pub fn verify_signature(
         .try_into()
         .map_err(|_| GytError::Ci("signature: expected 64 bytes".into()))?;
     let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-    Ok(verifying_key.verify(payload, &sig).is_ok())
+    // M35: use verify_strict to reject non-canonical R/S encodings
+    // (Ed25519 signature malleability). `verify` accepts them, which
+    // would let an attacker produce a second valid sig over the same
+    // message bytes.
+    Ok(verifying_key.verify_strict(payload, &sig).is_ok())
 }
 
 /// Generate a new ed25519 keypair. Saves to the given paths (or defaults).

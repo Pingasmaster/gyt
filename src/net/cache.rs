@@ -26,6 +26,13 @@ pub struct ResponseCache {
     inner: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
     max_entries: usize,
+    /// H9: hard cap on cumulative body bytes across all entries. Without
+    /// this, the pack_cache (256 entries × hundreds of MiB per pack)
+    /// could pin tens of GiB of resident memory under attacker churn.
+    /// 0 means "no byte cap" (fall back to entry-count limit only).
+    max_bytes: usize,
+    /// Current total body bytes resident in the cache.
+    bytes: Mutex<usize>,
 }
 
 impl ResponseCache {
@@ -34,6 +41,19 @@ impl ResponseCache {
             inner: Mutex::new(HashMap::new()),
             ttl,
             max_entries,
+            max_bytes: 0,
+            bytes: Mutex::new(0),
+        }
+    }
+
+    /// Like `new` but with an explicit cumulative byte cap (H9).
+    pub fn new_with_bytes(ttl: Duration, max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            ttl,
+            max_entries,
+            max_bytes,
+            bytes: Mutex::new(0),
         }
     }
 
@@ -67,27 +87,62 @@ impl ResponseCache {
     /// eviction). We avoid LRU bookkeeping because the access pattern
     /// for these endpoints is near-uniform anyway — every repo
     /// listing is roughly equally hot.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the bytes_held lock is intentionally held across the eviction loop to keep `bytes_val` in sync with the entry map; releasing it earlier would race a concurrent insert"
+    )]
     pub fn insert(&self, key: String, body: Vec<u8>, content_type: String) {
         let now = Instant::now();
+        let body_len = body.len();
+        // H9: refuse single entries that would be more than a quarter
+        // of the byte cap. A small number of huge entries shouldn't be
+        // able to evict every other useful entry on their own.
+        if self.max_bytes > 0 && body_len * 4 > self.max_bytes {
+            return;
+        }
         let mut g = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if g.len() >= self.max_entries {
-            // Try to evict an expired entry first.
+        let mut bytes_held = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes_val: usize = *bytes_held;
+        // If overwriting, the old body's bytes are released.
+        if let Some(prev) = g.get(&key) {
+            bytes_val = bytes_val.saturating_sub(prev.body.len());
+        }
+        // Evict to make room in entry count.
+        while g.len() >= self.max_entries {
             let stale = g
                 .iter()
                 .find(|(_, e)| e.expires <= now)
                 .map(|(k, _)| k.clone());
-            if let Some(k) = stale {
-                g.remove(&k);
-            } else {
-                // Nothing expired; drop one arbitrary entry to make room.
-                if let Some(k) = g.keys().next().cloned() {
-                    g.remove(&k);
+            let evict_key = stale.or_else(|| g.keys().next().cloned());
+            let Some(k) = evict_key else { break };
+            if let Some(e) = g.remove(&k) {
+                bytes_val = bytes_val.saturating_sub(e.body.len());
+            }
+        }
+        // Evict to make room in bytes (H9).
+        if self.max_bytes > 0 {
+            while bytes_val.saturating_add(body_len) > self.max_bytes {
+                let stale = g
+                    .iter()
+                    .find(|(_, e)| e.expires <= now)
+                    .map(|(k, _)| k.clone());
+                let evict_key = stale.or_else(|| g.keys().next().cloned());
+                let Some(k) = evict_key else { break };
+                if let Some(e) = g.remove(&k) {
+                    bytes_val = bytes_val.saturating_sub(e.body.len());
+                } else {
+                    break;
                 }
             }
         }
+        bytes_val = bytes_val.saturating_add(body_len);
+        *bytes_held = bytes_val;
         g.insert(
             key,
             Entry {
@@ -100,12 +155,28 @@ impl ResponseCache {
 
     /// Invalidate every cache entry whose key starts with the given
     /// prefix. Used by refs/update to flush per-repo entries.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "both guards held across retain to keep `bytes` in sync with the map"
+    )]
     pub fn invalidate_prefix(&self, prefix: &str) {
         let mut g = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.retain(|k, _| !k.starts_with(prefix));
+        let mut bytes_held = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut freed = 0usize;
+        g.retain(|k, e| {
+            let keep = !k.starts_with(prefix);
+            if !keep {
+                freed = freed.saturating_add(e.body.len());
+            }
+            keep
+        });
+        *bytes_held = bytes_held.saturating_sub(freed);
     }
 
     /// Invalidate the global list cache (the /api/repos response).
@@ -113,12 +184,21 @@ impl ResponseCache {
     /// only writer is human ops (`mkdir` on the host) so this is
     /// rarely needed at runtime — but it's wired up so admin tools
     /// can poke it.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "both guards held together to keep `bytes` in sync with the map"
+    )]
     pub fn invalidate_all(&self) {
         let mut g = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes_held = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.clear();
+        *bytes_held = 0;
     }
 }
 

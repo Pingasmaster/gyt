@@ -94,7 +94,7 @@ impl PrEventKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrEvent {
     pub kind: PrEventKind,
     pub author: String,
@@ -417,6 +417,82 @@ pub fn next_number_locked(repo: &Repo) -> Result<u64> {
     };
     fs_util::atomic_write(&p, format!("{}\n", next + 1).as_bytes())?;
     Ok(next)
+}
+
+/// Validate that `new` is a legitimate monotonic-append update to
+/// `old`. See `issues::validate_extends` for full rationale (C3 /
+/// F-D8-02). Adds PR-specific checks:
+/// - `source_ref` and `target_ref` are immutable after creation.
+/// - `state` transitions are constrained: open ↔ closed allowed any
+///   time; open → merged allowed only if a matching `merge` event is
+///   appended in this same update.
+pub fn validate_extends(old: &Pr, new: &Pr) -> Result<()> {
+    if new.number != old.number {
+        return Err(GytError::Refs(format!(
+            "pr rewind: number changed {} -> {}",
+            old.number, new.number
+        )));
+    }
+    if new.created_ts != old.created_ts {
+        return Err(GytError::Refs("pr rewind: created_ts changed".into()));
+    }
+    if new.author != old.author {
+        return Err(GytError::Refs("pr rewind: author changed".into()));
+    }
+    if new.title != old.title {
+        return Err(GytError::Refs("pr rewind: title changed".into()));
+    }
+    if new.source_ref != old.source_ref {
+        return Err(GytError::Refs("pr rewind: source_ref changed".into()));
+    }
+    if new.target_ref != old.target_ref {
+        return Err(GytError::Refs("pr rewind: target_ref changed".into()));
+    }
+    if new.events.len() < old.events.len() {
+        return Err(GytError::Refs(format!(
+            "pr rewind: event count decreased {} -> {}",
+            old.events.len(),
+            new.events.len()
+        )));
+    }
+    for (i, oe) in old.events.iter().enumerate() {
+        if new.events.get(i) != Some(oe) {
+            return Err(GytError::Refs(format!(
+                "pr rewind: event #{i} was modified"
+            )));
+        }
+    }
+    // State transitions
+    #[expect(
+        clippy::unnested_or_patterns,
+        reason = "explicit tuple-pattern enumeration is more readable here than nested or-patterns"
+    )]
+    match (old.state, new.state) {
+        (PrState::Open, PrState::Open)
+        | (PrState::Closed, PrState::Closed)
+        | (PrState::Merged, PrState::Merged)
+        | (PrState::Open, PrState::Closed)
+        | (PrState::Closed, PrState::Open) => {}
+        (PrState::Open, PrState::Merged) | (PrState::Closed, PrState::Merged) => {
+            // A merge transition requires at least one new merge event
+            // appended in this update. Without it, a client can set
+            // `state = "merged"` without actually merging.
+            let start = old.events.len();
+            // Length already validated above (new.events.len() >= start).
+            let appended = new.events.get(start..).unwrap_or(&[]);
+            if !appended.iter().any(|e| e.kind == PrEventKind::Merge) {
+                return Err(GytError::Refs(
+                    "pr rewind: state -> merged requires a matching merge event".into(),
+                ));
+            }
+        }
+        (PrState::Merged, _) => {
+            return Err(GytError::Refs(
+                "pr rewind: cannot transition out of merged state".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn ref_name(n: u64) -> String {

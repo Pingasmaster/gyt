@@ -21,6 +21,12 @@ use crate::net::server::{ServerState, dispatch_request};
 
 const H3_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
+/// H13: cap simultaneous QUIC handshakes. Without this an attacker
+/// can open thousands of QUIC connections before the rate limiter
+/// sees them. 4096 is generous for legitimate workloads; beyond this
+/// we refuse the accept and drop the inbound.
+const H3_MAX_INFLIGHT: usize = 4096;
+
 pub(crate) fn run_h3(
     listen_addr: &str,
     cert_path: &Path,
@@ -44,6 +50,7 @@ pub(crate) fn run_h3(
     runtime.block_on(async move {
         let endpoint = quinn::Endpoint::server(server_config, addr)
             .map_err(|e| GytError::Net(format!("h3: bind {addr}: {e}")))?;
+        let inflight = Arc::new(tokio::sync::Semaphore::new(H3_MAX_INFLIGHT));
         eprintln!("gyt serve: h3 listening on https://{addr} (QUIC/UDP)");
 
         loop {
@@ -63,8 +70,19 @@ pub(crate) fn run_h3(
                 Err(_) => continue, // timeout
             };
 
+            // H13: try_acquire so an overload doesn't queue forever
+            // in the QUIC stack. Past the cap, drop the inbound.
+            let permit = match inflight.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // Just drop the incoming. Quinn signals the peer
+                    // via lack of response; cheaper than processing it.
+                    continue;
+                }
+            };
             let st = state.clone();
             tokio::spawn(async move {
+                let _permit = permit; // released on task end
                 let conn = match incoming.await {
                     Ok(c) => c,
                     Err(e) => {

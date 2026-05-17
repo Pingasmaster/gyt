@@ -153,7 +153,7 @@ impl IssueState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub kind: EventKind,
     pub author: String,
@@ -490,6 +490,57 @@ pub fn next_number_locked(repo: &Repo) -> Result<u64> {
     };
     fs_util::atomic_write(&p, format!("{}\n", next + 1).as_bytes())?;
     Ok(next)
+}
+
+/// Validate that `new` is a legitimate monotonic-append update to
+/// `old`. Closes C3/F-D8-02: previously the wire path accepted any
+/// `refs/issues/<N>` blob, so an rw client could push a blob with
+/// `events = []` and silently erase the entire issue history. Now we
+/// require:
+///
+/// - same `number`, `kind`, `created_ts`, `author`, `title` (header
+///   fields can never change after creation), and
+/// - `new.events` is a prefix-extension of `old.events` (existing
+///   events are byte-for-byte preserved, only new events appended).
+///
+/// `state` and `labels`/`assignees`/`mentions` MAY change between
+/// versions (closing an issue / adding a label is a legitimate
+/// update); those don't need a matching event today.
+pub fn validate_extends(old: &Issue, new: &Issue) -> Result<()> {
+    if new.number != old.number {
+        return Err(GytError::Refs(format!(
+            "issue rewind: number changed {} -> {}",
+            old.number, new.number
+        )));
+    }
+    if new.kind != old.kind {
+        return Err(GytError::Refs("issue rewind: kind changed".into()));
+    }
+    if new.created_ts != old.created_ts {
+        return Err(GytError::Refs("issue rewind: created_ts changed".into()));
+    }
+    if new.author != old.author {
+        return Err(GytError::Refs("issue rewind: author changed".into()));
+    }
+    if new.title != old.title {
+        return Err(GytError::Refs("issue rewind: title changed".into()));
+    }
+    if new.events.len() < old.events.len() {
+        return Err(GytError::Refs(format!(
+            "issue rewind: event count decreased {} -> {}",
+            old.events.len(),
+            new.events.len()
+        )));
+    }
+    for (i, oe) in old.events.iter().enumerate() {
+        // Length already validated above so .get is Some.
+        if new.events.get(i) != Some(oe) {
+            return Err(GytError::Refs(format!(
+                "issue rewind: event #{i} was modified"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn ref_name(n: u64) -> String {

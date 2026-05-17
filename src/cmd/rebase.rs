@@ -246,6 +246,8 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             signature: None,
             message: pc.message.clone(),
         };
+        // C7: honor sign_required.
+        let new_commit = crate::cmd::signing::maybe_sign_commit(repo, new_commit, false)?;
         let new_id = commit_obj::write(&repo.gyt_dir, &new_commit)?;
         cursor = new_id;
     }
@@ -341,6 +343,7 @@ fn run_continue(repo: &Repo) -> Result<()> {
         signature: None,
         message: first_pc.message.clone(),
     };
+    let new_commit = crate::cmd::signing::maybe_sign_commit(repo, new_commit, false)?;
     cursor = commit_obj::write(&repo.gyt_dir, &new_commit)?;
 
     // 2. Replay the remaining todos with the three-way engine.
@@ -483,6 +486,7 @@ fn replay_one(repo: &Repo, cursor: &ObjectId, c: &ObjectId) -> Result<ReplayOutc
         signature: None,
         message: pc.message.clone(),
     };
+    let new_commit = crate::cmd::signing::maybe_sign_commit(repo, new_commit, false)?;
     let new_id = commit_obj::write(&repo.gyt_dir, &new_commit)?;
     Ok(ReplayOutcome::Clean(new_id))
 }

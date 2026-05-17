@@ -142,7 +142,18 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let out = output_dir.unwrap_or_else(|| cwd.join(".gyt-ci-output"));
-    if !out.exists() {
+    // C5: refuse to use the output dir if it (or a parent component of
+    // the leaf) is a symlink. A malicious clone could ship a
+    // `.gyt-ci-output -> ~/.ssh` symlink; default policy is
+    // output_write=true so the wasm gets write access to ~/.ssh.
+    if let Ok(meta) = std::fs::symlink_metadata(&out) {
+        if meta.file_type().is_symlink() {
+            return Err(GytError::Ci(format!(
+                "gyt ci: output dir {} is a symlink; refusing (remove it or pass --ci-output)",
+                out.display()
+            )));
+        }
+    } else {
         std::fs::create_dir_all(&out).map_err(GytError::Io)?;
     }
 

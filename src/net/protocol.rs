@@ -50,11 +50,21 @@ pub fn encode_info_refs(refs: &[RefEntry]) -> Vec<u8> {
     out
 }
 
+/// M21: caps to prevent a malicious server from blowing up client
+/// memory / filesystem with millions of refs.
+pub const MAX_INFO_REFS_ENTRIES: usize = 1_000_000;
+pub const MAX_INFO_REF_NAME_LEN: usize = 1024;
+
 pub fn parse_info_refs(body: &[u8]) -> Result<Vec<RefEntry>> {
     let s = std::str::from_utf8(body)
         .map_err(|_| GytError::Parse("info/refs: not valid utf-8".into()))?;
     let mut out = Vec::new();
     for (i, line) in s.split_inclusive('\n').enumerate() {
+        if out.len() >= MAX_INFO_REFS_ENTRIES {
+            return Err(GytError::Parse(format!(
+                "info/refs: entry count exceeds {MAX_INFO_REFS_ENTRIES}"
+            )));
+        }
         let line = line.strip_suffix('\n').unwrap_or(line);
         if line.is_empty() {
             continue;
@@ -65,6 +75,12 @@ pub fn parse_info_refs(body: &[u8]) -> Result<Vec<RefEntry>> {
         if name.is_empty() {
             return Err(GytError::Parse(format!(
                 "info/refs line {i}: empty refname"
+            )));
+        }
+        if name.len() > MAX_INFO_REF_NAME_LEN {
+            return Err(GytError::Parse(format!(
+                "info/refs line {i}: refname length {} exceeds {MAX_INFO_REF_NAME_LEN}",
+                name.len()
             )));
         }
         let id = ObjectId::from_hex(hex)?;

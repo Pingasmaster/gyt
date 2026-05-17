@@ -368,7 +368,14 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         listen_addr: addr,
         rate_limiter: RateLimiter::new(configured_ip_limit(), configured_actor_limit()),
         response_cache: ResponseCache::new(configured_response_cache_ttl(), 10_000),
-        pack_cache: ResponseCache::new(std::time::Duration::from_hours(1), 256),
+        // H9: cap the pack cache at 2 GiB cumulative across all entries
+        // (single entries > 512 MiB are refused). Without this, 256
+        // permuted want-sets × ~200 MiB packfile each ≈ 50 GiB RSS.
+        pack_cache: ResponseCache::new_with_bytes(
+            std::time::Duration::from_hours(1),
+            256,
+            2 * 1024 * 1024 * 1024,
+        ),
         repo_index: RepoIndex::build(&config.repos_root),
         alt_svc_value,
         tls_enabled: tls_config.is_some(),
@@ -1349,10 +1356,17 @@ const fn route_needs_write(route: &router::RouteMatch) -> bool {
 /// without authentication so probes from k8s / a load balancer don't
 /// have to know the bearer token. `AdminShutdown` is deliberately not
 /// in this set — it must always be auth-gated.
+///
+/// H11: `/metrics` was previously in this set. It exposed operational
+/// counters (per-handler request volume, unauthorized-request rate,
+/// pool-exhaustion events) that an unauthenticated attacker could use
+/// for probing / amplification. It's now auth-gated alongside everything
+/// else. Operators wanting unauth metrics can put `/metrics` behind a
+/// network-policy-isolated sidecar.
 const fn route_is_unauth_probe(route: &router::RouteMatch) -> bool {
     matches!(
         route.handler,
-        Handler::Healthz | Handler::Readyz | Handler::Metrics
+        Handler::Healthz | Handler::Readyz
     )
 }
 
@@ -2548,7 +2562,9 @@ fn wire_info_refs(
     params: &[(String, String)],
 ) -> (u16, String, Vec<u8>, String) {
     let repo = router::get_param(params, "repo").unwrap_or("");
-    let cache_key = format!("wire_info_refs:{repo}");
+    // M15: trailing `:` so cache invalidation is anchored — without
+    // it, a push to repo `foo` would invalidate `foobar`/`foo2` too.
+    let cache_key = format!("wire_info_refs:{repo}:");
     if let Some((body, ctype)) = state.response_cache.get(&cache_key) {
         return (200, "OK".into(), body, ctype);
     }
@@ -2941,10 +2957,14 @@ fn wire_refs_update(
     // the new objects on the next clone.
     if n_updated > 0 {
         let repo = router::get_param(params, "repo").unwrap_or("");
-        state.response_cache.invalidate_prefix(&format!("wire_info_refs:{repo}"));
+        state.response_cache.invalidate_prefix(&format!("wire_info_refs:{repo}:"));
         state.response_cache.invalidate_prefix("api_refs:");
         state.response_cache.invalidate_prefix("repo_list:");
         state.pack_cache.invalidate_prefix(&format!("pack:{repo}:"));
+        // M17: the repo_index caches `head_commit` per repo; without
+        // this refresh `repo_list` returns stale tip information for
+        // up to 5 minutes (the periodic rescan interval).
+        state.repo_index.rescan(&state.repos_root);
     }
 
     state

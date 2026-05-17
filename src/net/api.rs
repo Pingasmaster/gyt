@@ -363,11 +363,17 @@ pub fn parse_object_id(hex: &str) -> Result<ObjectId, String> {
 // ---------- URL parsing helpers ----------
 
 pub fn parse_page(params: &[(String, String)], default: usize) -> usize {
-    params
+    // H10: cap at 1M. Without a cap, an attacker can inject 1M unique
+    // `?page=N` cache keys, flushing hot entries via the random-eviction
+    // policy in cache.rs. Anything past 1M pages is nonsensical anyway
+    // (a billion-commit repo at per_page=100 is 10M pages).
+    const MAX_PAGE: usize = 1_000_000;
+    let v = params
         .iter()
         .find(|(k, _)| k == "page")
         .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(default)
+        .unwrap_or(default);
+    v.min(MAX_PAGE)
 }
 
 pub fn parse_per_page(params: &[(String, String)], default: usize, max: usize) -> usize {

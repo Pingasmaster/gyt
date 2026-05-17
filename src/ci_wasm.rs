@@ -281,7 +281,21 @@ pub fn run_ci_wasm_with_policy(
                     // evasion — quietly skip the print and keep going.
                     return Ok(());
                 };
-                print!("[wasm-ci] {msg}");
+                // H16: strip C0/C1 control codes from the log message
+                // before printing. Without this, a malicious script
+                // can ship ANSI escapes (terminal-title spoof, OSC 52
+                // clipboard write, fake-prompt injection) through the
+                // operator's terminal. Keep \n and \t.
+                let cleaned: String = msg
+                    .chars()
+                    .filter(|&c| {
+                        let cu = c as u32;
+                        c == '\n'
+                            || c == '\t'
+                            || (cu >= 0x20 && cu != 0x7f && !(0x80..0xa0).contains(&cu))
+                    })
+                    .collect();
+                print!("[wasm-ci] {cleaned}");
                 let _ = std::io::Write::flush(&mut std::io::stdout());
                 Ok(())
             },
@@ -609,9 +623,31 @@ fn resolve_read(s: &Sandbox, rel: &str) -> Option<PathBuf> {
             // contain its own .gyt metadata directory.
             return None;
         }
+        // H15: case-insensitive ".gyt" component match — defends
+        // against case-insensitive filesystems (macOS HFS+/APFS, ext4
+        // casefold dirs, NTFS) where `.GYT/` bypasses the byte-prefix
+        // check above.
+        if path_contains_gyt_component(&canonical) {
+            return None;
+        }
         return Some(canonical);
     }
     None
+}
+
+/// True iff any path component equals `.gyt` (ASCII-case-insensitive).
+/// Used for the H15 "case-folded .gyt bypass" defense in resolve_read /
+/// resolve_write.
+fn path_contains_gyt_component(p: &Path) -> bool {
+    for comp in p.components() {
+        if let std::path::Component::Normal(s) = comp
+            && let Some(name) = s.to_str()
+            && name.eq_ignore_ascii_case(".gyt")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Resolve a relative path against the write-allowed roots. Walks them
@@ -645,6 +681,7 @@ fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
             }
             if canon_parent.starts_with(&s.repo_gyt_meta)
                 || canon_parent.starts_with(&root_gyt)
+                || path_contains_gyt_component(&canon_parent)
             {
                 return None;
             }
@@ -652,11 +689,18 @@ fn resolve_write(s: &Sandbox, rel: &str) -> Option<(PathBuf, String)> {
             if !cand.starts_with(root) {
                 continue;
             }
+            // H15: also check the lexical candidate path.
+            if path_contains_gyt_component(&cand) {
+                return None;
+            }
             return Some((cand, rel.to_string()));
         }
         if cand.starts_with(root) {
             // Lexical-only fallback (parent doesn't exist yet).
             if cand.starts_with(&s.repo_gyt_meta) || cand.starts_with(&root_gyt) {
+                return None;
+            }
+            if path_contains_gyt_component(&cand) {
                 return None;
             }
             return Some((cand, rel.to_string()));

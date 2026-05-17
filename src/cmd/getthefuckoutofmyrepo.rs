@@ -165,17 +165,19 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
-    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/heads/")? {
+    // Note: list_refs validates the prefix via validate_ref_name,
+    // which rejects trailing slashes. Use the bare namespace string.
+    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/heads")? {
         head_refs.push((name, oid));
     }
-    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/tags/")? {
+    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/tags")? {
         head_refs.push((name, oid));
     }
     // Also rewrite refs/remotes/* and refs/stash — otherwise destroyed
     // content stays reachable via remote-tracking refs or stash chains,
     // which defeats the whole point of this command (purging secrets /
     // accidentally-committed files from *all* history).
-    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/remotes/")? {
+    for (name, oid) in refs::list_refs(&repo.gyt_dir, "refs/remotes")? {
         head_refs.push((name, oid));
     }
     if let Ok(stash_id) = refs::read_ref(&repo.gyt_dir, "refs/stash") {
@@ -246,8 +248,14 @@ pub fn run(args: &[String]) -> Result<()> {
             continue;
         }
         if let Some(c) = commits.get(&oid) {
-            let new_tree =
-                rewrite_tree_entries(&repo.gyt_dir, &c.tree, &resolved, &cwd, &mut seen)?;
+            let new_tree = rewrite_tree_entries(
+                &repo.gyt_dir,
+                &c.tree,
+                &resolved,
+                &cwd,
+                Path::new(""),
+                &mut seen,
+            )?;
 
             let new_parents: Vec<ObjectId> = c
                 .parents
@@ -310,17 +318,38 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Walk a tree, removing any entry whose absolute path matches one in
+/// `targets`, and recursively rewriting subtree entries.
+///
+/// `cwd` is the workdir root; `subpath` is the relative path from `cwd`
+/// to the tree we're currently rewriting. Previously the recursion did
+/// not pass `subpath` down and compared `cwd.join(name)` at every depth
+/// — so `gyt getthefuckoutofmyrepo src/secret.txt` only ever matched
+/// against `cwd/secret.txt` (root entry), never `cwd/src/secret.txt`,
+/// silently leaving the secret in every historical tree. (C6.)
+///
+/// The memoization cache is keyed on `(tree_oid, subpath)` because the
+/// same subtree hash CAN appear at different paths within one commit
+/// (e.g. `a/X` and `b/X` both referencing the same content); rewrites
+/// for those two paths can legitimately differ. Without subpath in the
+/// key, the second lookup would return the first's rewrite.
 fn rewrite_tree_entries(
     repo_path: &Path,
     tree_oid: &ObjectId,
     targets: &[PathBuf],
     cwd: &Path,
+    subpath: &Path,
     seen: &mut HashMap<ObjectId, ObjectId>,
 ) -> Result<ObjectId> {
     if is_null(tree_oid) {
         return Ok(*tree_oid);
     }
-    if let Some(&new_oid) = seen.get(tree_oid) {
+    // Cache hit: a previous tree pass at the SAME `(tree_oid, subpath)`
+    // produced the same rewrite. The cache is per-walk so the result
+    // is always consistent with the in-walk `targets` set.
+    if subpath.as_os_str().is_empty()
+        && let Some(&new_oid) = seen.get(tree_oid)
+    {
         return Ok(new_oid);
     }
 
@@ -329,20 +358,31 @@ fn rewrite_tree_entries(
     let new_entries: Vec<TreeEntry> = entries
         .into_iter()
         .filter(|e| {
-            let target_path = cwd.join(fs_bytes(&e.name));
+            let target_path = cwd.join(subpath).join(fs_bytes(&e.name));
             !targets.iter().any(|t| t == &target_path)
         })
         .map(|mut e| {
             if e.mode == MODE_DIR {
-                e.hash = rewrite_tree_entries(repo_path, &e.hash, targets, cwd, seen)
-                    .ok()
-                    .unwrap_or(e.hash);
+                let child_subpath = subpath.join(fs_bytes(&e.name));
+                e.hash = rewrite_tree_entries(
+                    repo_path,
+                    &e.hash,
+                    targets,
+                    cwd,
+                    &child_subpath,
+                    seen,
+                )
+                .ok()
+                .unwrap_or(e.hash);
             }
             e
         })
         .collect();
 
     let new_oid = tree::write(repo_path, &new_entries)?;
+    if subpath.as_os_str().is_empty() {
+        seen.insert(*tree_oid, new_oid);
+    }
     Ok(new_oid)
 }
 

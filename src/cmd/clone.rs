@@ -269,6 +269,11 @@ pub fn walk_and_fetch(
         }
         if !to_fetch.is_empty() {
             let fetch_vec: Vec<ObjectId> = to_fetch.into_iter().collect();
+            // H4: track the requested set so we can reject any object
+            // the server returns that we didn't ask for. Without this,
+            // a hostile server can flood the client's `.gyt/objects/`
+            // with arbitrary content per response (unbounded disk-fill).
+            let requested: HashSet<ObjectId> = fetch_vec.iter().copied().collect();
             let body = encode_wants(&fetch_vec);
             let resp = client.post("objects/want", &body, &[])?;
             if resp.status != 200 {
@@ -280,6 +285,11 @@ pub fn walk_and_fetch(
             for entry in parse_packfile(&resp.body)? {
                 let raw = compress::decode(&entry.bytes)?;
                 let entry_id = hash::hash_bytes(&raw);
+                if !requested.contains(&entry_id) {
+                    return Err(GytError::Net(format!(
+                        "clone: server returned unsolicited object {entry_id}"
+                    )));
+                }
                 let (kind, payload) = store::parse_raw(&raw)?;
                 // F-D3-03: mirror the server-side canonicality gate
                 // on EVERY object kind the client persists. A hostile

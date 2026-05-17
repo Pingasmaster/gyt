@@ -86,8 +86,12 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 continue;
             }
             // File exists in worktree and is in index - just remove it.
-            let abs = abs.canonicalize()?;
-            if abs.is_dir() {
+            // H6: do NOT canonicalize(): on a symlink-tracked entry the
+            // canonicalize would follow the link and delete the target
+            // (e.g. tracked-symlink → ~/.ssh/authorized_keys). `abs` is
+            // already contained via the strip_prefix(workdir) check above.
+            let meta = fs::symlink_metadata(&abs)?;
+            if meta.file_type().is_dir() {
                 return Err(GytError::InvalidArgument(format!(
                     "gyt rm: '{arg}' is a directory (use `gyt add` to unstage, then remove contents manually)"
                 )));
@@ -111,9 +115,9 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             continue;
         }
 
-        let abs = abs.canonicalize()?;
-        // Not staged, file exists: remove from worktree.
-        if abs.is_dir() {
+        // H6: see above — symlink_metadata + no canonicalize.
+        let meta = fs::symlink_metadata(&abs)?;
+        if meta.file_type().is_dir() {
             return Err(GytError::InvalidArgument(format!(
                 "gyt rm: '{arg}' is a directory (use `gyt add` to unstage, then remove contents manually)"
             )));

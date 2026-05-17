@@ -13,6 +13,10 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
+    // M5: take the repo lock so a concurrent `gyt add` between our
+    // walk and the unlink can't have its newly-staged file removed
+    // from the workdir.
+    let _lock = repo.lock()?;
     let mut dry_run = false;
 
     for arg in args {

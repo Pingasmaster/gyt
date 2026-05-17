@@ -250,6 +250,8 @@ fn make_commit(
         signature: None,
         message,
     };
+    // C7: honor sign_required.
+    let c = crate::cmd::signing::maybe_sign_commit(repo, c, false)?;
     commit_obj::write(&repo.gyt_dir, &c)
 }
 

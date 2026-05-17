@@ -346,6 +346,10 @@ fn three_way_merge(
         signature: None,
         message,
     };
+    // C7: route through maybe_sign_commit so the repo's sign_required
+    // config is honored. Previously every merge commit was unsigned
+    // regardless of policy.
+    let merge_commit = crate::cmd::signing::maybe_sign_commit(repo, merge_commit, false)?;
     let merge_id = commit::write(&repo.gyt_dir, &merge_commit)?;
 
     let msg = format!("merge: -> {}", short(&merge_id));

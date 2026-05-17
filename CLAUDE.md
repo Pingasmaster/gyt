@@ -41,7 +41,14 @@ inside a multi-fix session:
 
 1. Make a change.
 2. Verify it compiles with `cargo build` (debug, fast) or
-   `cargo check` per worktree.
+   `cargo check` per worktree. **Always also run `cargo clippy
+   --all-features --all-targets -- -D warnings`** at the same time —
+   `cargo build` lets clippy lints slip through, and `check.sh` runs
+   clippy with `-D warnings` so anything that doesn't pass clippy
+   will fail CI later. The expected per-edit verification line is:
+   `cargo build && cargo clippy --all-features --all-targets -- -D warnings`
+   (build first because clippy invokes a rebuild and the build output
+   is easier to read on raw compile errors).
 3. Commit.
 4. Move on to the next fix.
 5. **Only at the very end**, after every fix has been committed, run

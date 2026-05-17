@@ -44,6 +44,74 @@ const MODE_EXEC: u32 = 0o100_755;
 const MODE_SYMLINK: u32 = 0o120_000;
 const MODE_DIR: u32 = 0o040_000;
 
+/// Verify that every ancestor of `rel` under `workdir` is either
+/// missing or a real directory — never a symlink. Returns the joined
+/// absolute path safe to open / write to.
+///
+/// Closes H5: every materializer site previously did
+/// `fs::create_dir_all(parent); fs::write(abs, ...)`. Both follow
+/// symlinks. If a workdir parent dir was replaced by a symlink to
+/// `~/.ssh` (planted by a malicious local process, or by a previous
+/// checkout of a tree whose entry name pointed at an attacker target),
+/// the next checkout's write to `workdir/a/file.txt` lands in
+/// `~/.ssh/file.txt`. `validate_symlink_target` only prevents *gyt*
+/// from planting the trap — it does not detect a pre-existing trap.
+///
+/// This helper walks `rel`'s parent components one at a time, stating
+/// each with `symlink_metadata` (which does NOT follow links), and
+/// errors out if any existing ancestor is a symlink.
+pub fn safe_workdir_path(workdir: &Path, rel: &Path) -> Result<PathBuf> {
+    if rel.is_absolute() {
+        return Err(GytError::Repo(format!(
+            "safe_workdir_path: refusing absolute path {}",
+            rel.display()
+        )));
+    }
+    let mut cur = workdir.to_path_buf();
+    if let Some(parent) = rel.parent() {
+        for comp in parent.components() {
+            match comp {
+                std::path::Component::Normal(name) => {
+                    cur.push(name);
+                    if let Ok(meta) = fs::symlink_metadata(&cur)
+                        && meta.file_type().is_symlink()
+                    {
+                        return Err(GytError::Repo(format!(
+                            "safe_workdir_path: ancestor {} is a symlink",
+                            cur.display()
+                        )));
+                    }
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(GytError::Repo(format!(
+                        "safe_workdir_path: refusing path with non-normal component {}",
+                        rel.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(workdir.join(rel))
+}
+
+/// Atomically write `data` to `workdir/rel` after verifying no ancestor
+/// is a symlink (H5). If the leaf already exists as a symlink, it is
+/// removed first so the subsequent open doesn't follow it.
+pub fn safe_workdir_write(workdir: &Path, rel: &Path, data: &[u8]) -> Result<()> {
+    let abs = safe_workdir_path(workdir, rel)?;
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&abs)
+        && meta.file_type().is_symlink()
+    {
+        fs::remove_file(&abs)?;
+    }
+    fs::write(&abs, data)?;
+    Ok(())
+}
+
 /// Validate a symlink target before creating it on disk. A malicious
 /// tree object can carry a blob whose contents (the symlink target) is
 /// `/etc`, `..`, or anything else that would escape the workdir.

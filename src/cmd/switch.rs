@@ -146,9 +146,12 @@ fn switch_to(repo: &Repo, branch: &str) -> Result<()> {
             }
         }
     }
-    // 2. Write/update files from the new tree.
+    // 2. Write/update files from the new tree. H5: route through
+    // `safe_workdir_path` so a workdir parent dir that was replaced
+    // by a symlink (e.g. `~/.ssh`) can't trick the materializer into
+    // writing through it.
     for (path, entry) in &target_files {
-        let abs = repo.workdir.join(path);
+        let abs = crate::workdir::safe_workdir_path(&repo.workdir, Path::new(path))?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }

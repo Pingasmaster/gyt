@@ -5,6 +5,7 @@
 
 use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
+use crate::index::Index;
 use crate::object::{commit, store, tag, tree};
 use crate::refs;
 use crate::repo::Repo;
@@ -495,21 +496,9 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     // In-progress operations have their own short-lived "tip refs"
     // stored as plain hex files at the gyt_dir root. Treat anything
     // mentioned in them as reachable so an interrupted merge/rebase
-    // can't be GC'd out from under the user.
-    for sticky in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REBASE_ONTO"] {
-        if let Ok(s) = std::fs::read_to_string(gyt_dir.join(sticky))
-            && let Ok(id) = ObjectId::from_hex(s.trim())
-        {
-            seeds.push(id);
-        }
-    }
-    if let Ok(text) = std::fs::read_to_string(gyt_dir.join("REBASE_TODO")) {
-        for line in text.lines() {
-            if let Ok(id) = ObjectId::from_hex(line.trim()) {
-                seeds.push(id);
-            }
-        }
-    }
+    // can't be GC'd out from under the user. F-D9-02 extends this
+    // to every secondary worktree's own copy of these files.
+    seed_per_worktree_sticky(gyt_dir, &mut seeds);
 
     // Reflog entries also reference commits; we treat reflog targets as
     // reachable so `gyt reflog`/recovery still works after gc.
@@ -523,6 +512,14 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
             }
         }
     }
+
+    // F-D9-01: every blob hashed via `gyt add` lives in the index but
+    // is not yet reachable from any ref. Without seeding from the index,
+    // a `gyt add` blob with no following commit is pruned by gc after
+    // the mtime grace expires; the next `gyt commit` then writes a tree
+    // whose blob is gone from disk → silent permanent data loss.
+    // Seed from the main index AND every secondary worktree's index.
+    seed_from_indexes(gyt_dir, &mut seeds);
 
     // Walk closure from all seeds
     let mut queue: VecDeque<ObjectId> = seeds.into_iter().collect();
@@ -567,6 +564,89 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     }
 
     reachable
+}
+
+/// Seed reachability from in-progress sticky state files
+/// (`MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REBASE_HEAD`, `REBASE_ONTO`,
+/// `REBASE_TODO`) for the main worktree AND every secondary worktree
+/// under `<gyt>/worktrees/<name>/`. Also seeds each secondary
+/// worktree's `HEAD` when it's detached (the symbolic case is already
+/// covered by the per-prefix `refs/heads` walk in the caller).
+///
+/// Closes F-D9-02: previously only the main worktree's sticky files
+/// were read, so a detached HEAD or in-progress rebase in an aux
+/// worktree was silently pruned.
+fn seed_per_worktree_sticky(gyt_dir: &Path, seeds: &mut Vec<ObjectId>) {
+    // Main worktree first.
+    seed_sticky_in_dir(gyt_dir, seeds);
+    let wts_dir = gyt_dir.join("worktrees");
+    let Ok(rd) = std::fs::read_dir(&wts_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let wt_meta_dir = entry.path();
+        if !wt_meta_dir.is_dir() {
+            continue;
+        }
+        seed_sticky_in_dir(&wt_meta_dir, seeds);
+        // The aux worktree's HEAD: if it's a `ref: refs/heads/X` symref,
+        // refs/heads/X is already in the main refs walk. If it's
+        // detached (just a hex), the commit is only anchored here.
+        if let Ok(s) = std::fs::read_to_string(wt_meta_dir.join("HEAD"))
+            && let Ok(id) = ObjectId::from_hex(s.trim())
+        {
+            seeds.push(id);
+        }
+    }
+}
+
+/// Read the sticky-ref files in `dir` and push any decoded hashes into
+/// `seeds`. Best-effort: missing files / parse errors are ignored.
+fn seed_sticky_in_dir(dir: &Path, seeds: &mut Vec<ObjectId>) {
+    for sticky in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REBASE_HEAD", "REBASE_ONTO"] {
+        if let Ok(s) = std::fs::read_to_string(dir.join(sticky))
+            && let Ok(id) = ObjectId::from_hex(s.trim())
+        {
+            seeds.push(id);
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(dir.join("REBASE_TODO")) {
+        for line in text.lines() {
+            if let Ok(id) = ObjectId::from_hex(line.trim()) {
+                seeds.push(id);
+            }
+        }
+    }
+}
+
+/// Seed reachability from every index entry's blob hash, for the main
+/// worktree AND every secondary worktree's index. Closes F-D9-01: a
+/// `gyt add` blob with no following commit is otherwise unreachable
+/// from refs, gets pruned after the mtime grace, and the next commit's
+/// tree references a now-missing blob (silent data loss).
+fn seed_from_indexes(gyt_dir: &Path, seeds: &mut Vec<ObjectId>) {
+    let main_index = gyt_dir.join("index");
+    if let Ok(idx) = Index::read(&main_index) {
+        for e in &idx.entries {
+            seeds.push(e.hash);
+        }
+    }
+    let wts_dir = gyt_dir.join("worktrees");
+    let Ok(rd) = std::fs::read_dir(&wts_dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let wt_meta_dir = entry.path();
+        if !wt_meta_dir.is_dir() {
+            continue;
+        }
+        let wt_index = wt_meta_dir.join("index");
+        if let Ok(idx) = Index::read(&wt_index) {
+            for e in &idx.entries {
+                seeds.push(e.hash);
+            }
+        }
+    }
 }
 
 /// Read `.gyt/shallow` into a set of boundary commit ids. The file is

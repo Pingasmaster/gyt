@@ -123,6 +123,17 @@ pub fn decode(payload: &[u8]) -> Result<Vec<TreeEntry>> {
             .map_err(|_| GytError::Object("tree: non-utf8 mode".into()))?;
         let mode = u32::from_str_radix(mode_s, 8)
             .map_err(|_| GytError::Object(format!("tree: bad mode {mode_s:?}")))?;
+        // M37: reject leading-zero / non-canonical octal modes
+        // (e.g. `0100644`, `00100644`). encode() emits the
+        // strip-leading-zero form `{mode:o}`; without this check, two
+        // distinct on-disk byte sequences decode to the same logical
+        // tree and produce distinct hashes — a malicious server can
+        // plant N hash-distinct variants of the same tree.
+        if mode_s != format!("{mode:o}") {
+            return Err(GytError::Object(format!(
+                "tree: non-canonical mode token {mode_s:?}"
+            )));
+        }
         if !is_known_mode(mode) {
             return Err(GytError::Object(format!(
                 "tree: mode {mode:o} is not in the gyt whitelist"
