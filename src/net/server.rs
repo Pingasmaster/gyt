@@ -532,6 +532,16 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
                 .accepts_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+            // TCP_NODELAY: disable Nagle's algorithm on every accepted
+            // socket. Nagle interacts badly with delayed-ack on small
+            // responses (info/refs, healthz, REST API) — pre-this,
+            // those could see 40 ms of tail latency on Linux from the
+            // ack-delay window. HTTP responses are mostly bounded
+            // anyway, so we don't gain from coalescing small writes.
+            // Best-effort: a failure here doesn't break the connection,
+            // it just leaves Nagle on.
+            let _ = stream.set_nodelay(true);
+
             // try_acquire so an overload doesn't queue up sockets in
             // the kernel backlog (which would cause LBs to time out).
             // Past the cap, return 503 inline.
@@ -933,8 +943,15 @@ fn bind_with_reuseport(addr: std::net::SocketAddr) -> Result<TcpListener> {
     socket
         .bind(&SockAddr::from(addr))
         .map_err(|e| crate::errors::GytError::Net(format!("bind {addr}: {e}")))?;
+    // Listen backlog. The pre-1M-user value was 1024 — fine for a
+    // small host but a real bottleneck at scale: Linux silently
+    // caps to `net.core.somaxconn` (typically 4096 on modern
+    // distros), and under burst load the kernel drops SYNs once
+    // the accept queue fills. 4096 matches the modern somaxconn
+    // default; operators tuning for higher should raise the sysctl
+    // first then bump this value.
     socket
-        .listen(1024)
+        .listen(4096)
         .map_err(|e| crate::errors::GytError::Net(format!("listen(): {e}")))?;
     Ok(socket.into())
 }
