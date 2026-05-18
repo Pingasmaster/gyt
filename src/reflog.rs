@@ -74,10 +74,25 @@ fn try_record(
         "{old_hex}\t{}\t{who}\t{ts}\t+0000\t{message}\n",
         new.to_hex()
     );
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    // H7: 0o600 on creation. The reflog lives under .gyt/logs/ and
+    // can reveal commit ids, branch names, and author identities to
+    // any local user otherwise.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path)?;
+    // If the file already existed (from a previous record with the
+    // older default umask), tighten the mode on every append. Cheap
+    // and idempotent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     f.write_all(line.as_bytes())?;
     // Durability: gc seeds its reachability walk from reflog entries, so a
     // crash after a successful commit that loses the reflog entry could let
