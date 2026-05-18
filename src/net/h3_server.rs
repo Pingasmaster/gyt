@@ -354,6 +354,15 @@ fn build_quic_server_config(
         quinn::IdleTimeout::try_from(std::time::Duration::from_mins(1))
             .expect("60s within QUIC limits"),
     ));
+    // Server-initiated keepalive. Without this, a NAT box (cellular
+    // carrier, corporate, captive portal) that times out idle
+    // sessions silently kills the QUIC connection before our 60 s
+    // max_idle_timeout fires — and the client just sees a stalled
+    // download with no clean close. 25 s sits comfortably under the
+    // idle timeout (so the round-trip completes well before we'd
+    // give up) and under the typical NAT idle (30-60 s on cellular).
+    // PING frames are 1 byte of work per side; cost is negligible.
+    tp.keep_alive_interval(Some(std::time::Duration::from_secs(25)));
     // Refuse incoming QUIC datagrams. gyt's HTTP/3 path is streams-
     // only; leaving datagram support at the quinn default exposes
     // an unused frame parser to every connection. None denies them
