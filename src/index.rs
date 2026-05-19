@@ -41,6 +41,62 @@ pub struct Index {
     pub entries: Vec<IndexEntry>,
 }
 
+/// Reject paths that would escape the workdir or shadow `.gyt/`
+/// metadata. Called by `Index::decode` for every entry's path bytes
+/// after UTF-8 validation. The same shape of check belongs at every
+/// boundary that materializes index entries to the filesystem; doing
+/// it at the parse seam guarantees no downstream consumer ever sees
+/// one of these paths.
+///
+/// Rejects:
+///   - empty paths
+///   - absolute paths (`/...`)
+///   - any `..` or `.` component
+///   - empty components (e.g. `a//b`)
+///   - backslash anywhere (NTFS/exFAT path separator confusion)
+///   - NUL byte (path-truncation in C/Rust FFI boundaries)
+///   - any `.gyt` component (case-insensitive — APFS/NTFS/casefolded ext4)
+fn validate_index_path(path: &str, entry_idx: usize) -> Result<()> {
+    if path.is_empty() {
+        return Err(GytError::Index(format!(
+            "empty path in entry {entry_idx}"
+        )));
+    }
+    if path.starts_with('/') {
+        return Err(GytError::Index(format!(
+            "absolute path in entry {entry_idx}: {path:?}"
+        )));
+    }
+    if path.contains('\0') {
+        return Err(GytError::Index(format!(
+            "path contains NUL in entry {entry_idx}: {path:?}"
+        )));
+    }
+    if path.contains('\\') {
+        return Err(GytError::Index(format!(
+            "path contains backslash in entry {entry_idx}: {path:?}"
+        )));
+    }
+    for comp in path.split('/') {
+        if comp.is_empty() {
+            return Err(GytError::Index(format!(
+                "empty path component in entry {entry_idx}: {path:?}"
+            )));
+        }
+        if comp == "." || comp == ".." {
+            return Err(GytError::Index(format!(
+                "path traversal component in entry {entry_idx}: {path:?}"
+            )));
+        }
+        if comp.eq_ignore_ascii_case(".gyt") {
+            return Err(GytError::Index(format!(
+                "path enters .gyt/ in entry {entry_idx}: {path:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Normalize a path to a forward-slash relative string suitable for storage.
 fn path_to_storage_string(path: &Path) -> String {
     // We're linux-only; normalize backslashes if any sneak in.
@@ -229,6 +285,14 @@ impl Index {
                 .map_err(|_| GytError::Index(format!("non-utf8 path bytes in entry {i}")))?;
             off += path_len;
 
+            // Reject any path that would escape the workdir or shadow a
+            // refs/lock file. Downstream materialization sites also call
+            // workdir::safe_workdir_path which symlink-checks ancestors,
+            // but rejecting at the parse seam is defense-in-depth: a
+            // tampered-with `.gyt/index` can't smuggle a `../etc/passwd`
+            // path past *any* future caller that forgets the helper.
+            validate_index_path(path_str, i)?;
+
             entries.push(IndexEntry {
                 ctime_secs,
                 mtime_secs,
@@ -407,6 +471,86 @@ mod tests {
             GytError::Index(msg) => assert!(msg.contains("version"), "got: {msg}"),
             other => panic!("expected Index error, got {other:?}"),
         }
+    }
+
+    // ── B3: reject unsafe paths in the index ─────────────────────
+    //
+    // Construct an on-disk index with one synthetic entry whose path
+    // is dangerous, then assert `Index::read` returns Err. Doing the
+    // construction by hand (rather than building an `Index` and
+    // calling `.write()`) is intentional: `write` won't emit `..`
+    // paths to begin with, so we can't round-trip them. The threat
+    // model here is "attacker hand-edits `.gyt/index`".
+    fn write_index_with_path(p: &Path, bad_path: &str) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // one entry
+        // Entry: 8+8+8+4+32 = 60 bytes of fixed header + path_len(2) + path.
+        buf.extend_from_slice(&0i64.to_le_bytes()); // ctime
+        buf.extend_from_slice(&0i64.to_le_bytes()); // mtime
+        buf.extend_from_slice(&0u64.to_le_bytes()); // size
+        buf.extend_from_slice(&0o100_644u32.to_le_bytes()); // mode
+        buf.extend_from_slice(&[0u8; HASH_LEN]); // hash
+        let pb = bad_path.as_bytes();
+        buf.extend_from_slice(&u16::try_from(pb.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(pb);
+        std::fs::write(p, &buf).unwrap();
+    }
+
+    fn assert_index_rejects_path(label: &str, bad_path: &str) {
+        let t = tempdir::Dir::new(&format!("gyt-index-bad-{label}"));
+        let p = t.path().join("index");
+        write_index_with_path(&p, bad_path);
+        let err = Index::read(&p).unwrap_err();
+        let msg = match err {
+            GytError::Index(m) => m,
+            other => panic!("expected Index error for {label:?} path {bad_path:?}, got {other:?}"),
+        };
+        assert!(
+            !msg.contains("trailing garbage"),
+            "should have rejected at path validation, not later: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_parent_traversal_path() {
+        assert_index_rejects_path("dotdot", "../../etc/passwd");
+    }
+
+    #[test]
+    fn rejects_absolute_path() {
+        assert_index_rejects_path("absolute", "/etc/passwd");
+    }
+
+    #[test]
+    fn rejects_dot_component_path() {
+        assert_index_rejects_path("dot", "a/./b");
+    }
+
+    #[test]
+    fn rejects_empty_component_path() {
+        assert_index_rejects_path("empty-component", "a//b");
+    }
+
+    #[test]
+    fn rejects_backslash_path() {
+        assert_index_rejects_path("backslash", "a\\b");
+    }
+
+    #[test]
+    fn rejects_nul_path() {
+        assert_index_rejects_path("nul", "a\0b");
+    }
+
+    #[test]
+    fn rejects_gyt_component_path() {
+        // Either case must be rejected to defend case-insensitive
+        // filesystems (APFS / NTFS / casefolded ext4) where `.GYT/`
+        // would still shadow `.gyt/` metadata.
+        assert_index_rejects_path("dotgyt-lower", ".gyt/config");
+        assert_index_rejects_path("dotgyt-upper", ".GYT/config");
+        assert_index_rejects_path("dotgyt-mixed", "a/.Gyt/x");
     }
 
     mod tempdir {
