@@ -94,6 +94,118 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const ISSUE_REFS_PREFIX: &str = "refs/issues";
 const COUNTER_PATH: &str = "meta/issues_next";
 
+// B15 limits. The encoder uses Rust's `{:?}` debug formatting for
+// strings, which emits `\u{X}` for any byte < 0x20 outside `\n \r \t
+// \0` and for many printable non-ASCII codepoints. The hand-rolled
+// `parse_toml_string` does NOT handle `\u{...}` escapes, so a body
+// containing such a byte produces an encoded blob that no decoder
+// can read — permanent round-trip corruption. The simplest cure is
+// to refuse such bytes at the encode boundary (and again on decode,
+// as defense-in-depth against a malicious push that bypasses our
+// own encoder). Same gate applies to title/author/reason/array
+// entries — anywhere a string field round-trips through `{:?}`.
+const TS_MIN: i64 = 0;
+/// Hard upper bound (~year 2100). Without an upper bound, a single
+/// rw push with `ts = i64::MAX` jams the timeline forever: every
+/// subsequent legitimate event must be >= i64::MAX, so the
+/// monotonicity gate rejects them all.
+const TS_MAX: i64 = 4_102_444_800;
+const TITLE_MAX_BYTES: usize = 1024;
+const BODY_MAX_BYTES: usize = 65_536;
+const AUTHOR_MAX_BYTES: usize = 256;
+const REASON_MAX_BYTES: usize = 1024;
+const ARRAY_ENTRY_MAX_BYTES: usize = 256;
+const ARRAY_MAX_ENTRIES: usize = 256;
+const MENTIONS_MAX_ENTRIES: usize = 1024;
+const EVENTS_MAX: usize = 100_000;
+
+fn check_text_field(name: &str, s: &str, max_bytes: usize) -> Result<()> {
+    if s.len() > max_bytes {
+        return Err(GytError::Refs(format!(
+            "{name} too long: {} bytes (max {max_bytes})",
+            s.len()
+        )));
+    }
+    for (i, b) in s.as_bytes().iter().enumerate() {
+        // Permit only printable ASCII plus a small whitelist of
+        // structural whitespace. Anything in [0x00, 0x20) outside
+        // \n/\r/\t and the DEL byte (0x7f) would Debug-format to a
+        // `\u{X}` escape that the decoder cannot read.
+        let bad = *b == b'\x7f' || (*b < 0x20 && !matches!(*b, b'\n' | b'\r' | b'\t'));
+        if bad {
+            return Err(GytError::Refs(format!(
+                "{name} contains forbidden control byte 0x{b:02x} at offset {i}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_ts(name: &str, ts: i64) -> Result<()> {
+    if !(TS_MIN..=TS_MAX).contains(&ts) {
+        return Err(GytError::Refs(format!(
+            "{name} timestamp {ts} out of range [{TS_MIN}, {TS_MAX}]"
+        )));
+    }
+    Ok(())
+}
+
+fn check_array(name: &str, xs: &[String], max_entries: usize, entry_max_bytes: usize) -> Result<()> {
+    if xs.len() > max_entries {
+        return Err(GytError::Refs(format!(
+            "{name} too many entries: {} (max {max_entries})",
+            xs.len()
+        )));
+    }
+    for (i, s) in xs.iter().enumerate() {
+        check_text_field(&format!("{name}[{i}]"), s, entry_max_bytes)?;
+    }
+    Ok(())
+}
+
+/// B15: validate that an Issue is safely representable on disk. Called
+/// from `encode` (so we never write a blob we couldn't read back) and
+/// from `decode` (so a malicious push that bypassed our encoder still
+/// hits the gate).
+pub fn validate(iss: &Issue) -> Result<()> {
+    check_text_field("title", &iss.title, TITLE_MAX_BYTES)?;
+    check_text_field("author", &iss.author, AUTHOR_MAX_BYTES)?;
+    check_ts("created_ts", iss.created_ts)?;
+    check_array("labels", &iss.labels, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    check_array("assignees", &iss.assignees, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    if iss.mentions.len() > MENTIONS_MAX_ENTRIES {
+        return Err(GytError::Refs(format!(
+            "mentions too long: {} (max {MENTIONS_MAX_ENTRIES})",
+            iss.mentions.len()
+        )));
+    }
+    if iss.events.len() > EVENTS_MAX {
+        return Err(GytError::Refs(format!(
+            "events too long: {} (max {EVENTS_MAX})",
+            iss.events.len()
+        )));
+    }
+    for (i, e) in iss.events.iter().enumerate() {
+        check_text_field(&format!("event[{i}].author"), &e.author, AUTHOR_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].body"), &e.body, BODY_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].reason"), &e.reason, REASON_MAX_BYTES)?;
+        check_ts(&format!("event[{i}].ts"), e.ts)?;
+        check_array(
+            &format!("event[{i}].add"),
+            &e.add,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+        check_array(
+            &format!("event[{i}].remove"),
+            &e.remove,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
 /// The whole on-disk representation of one issue or discussion.
 #[derive(Debug, Clone)]
 pub struct Issue {
@@ -327,7 +439,7 @@ pub fn decode(bytes: &[u8]) -> Result<Issue> {
     let number = number.ok_or_else(|| invalid("missing number"))?;
     let kind = kind.ok_or_else(|| invalid("missing kind"))?;
     let state = state.ok_or_else(|| invalid("missing state"))?;
-    Ok(Issue {
+    let iss = Issue {
         number,
         kind,
         title,
@@ -338,7 +450,13 @@ pub fn decode(bytes: &[u8]) -> Result<Issue> {
         assignees,
         mentions,
         events,
-    })
+    };
+    // B15: defense-in-depth — refuse blobs whose contents bust the
+    // caps, even if some other client (or buggy older version of us)
+    // managed to write one. validate() also catches the control-byte
+    // case where `parse_toml_string` accepted a malformed escape.
+    validate(&iss)?;
+    Ok(iss)
 }
 
 fn invalid(field: &str) -> GytError {
@@ -606,6 +724,11 @@ fn read_blob(repo_gyt: &Path, id: &ObjectId) -> Result<Issue> {
 /// hold `repo.lock()` to prevent concurrent writers from interleaving
 /// updates.
 pub fn write_locked(repo: &Repo, issue: &Issue) -> Result<ObjectId> {
+    // B15: refuse to write a blob whose textual content would Debug-
+    // escape to `\u{X}` forms our hand-rolled parser can't read, or
+    // whose size exceeds the per-field caps. This is the first gate;
+    // decode() repeats it post-parse against malicious incoming blobs.
+    validate(issue)?;
     let bytes = encode(issue);
     let id = object::store::write_bytes(&repo.gyt_dir, ObjectKind::Blob, &bytes)?;
     refs::write_ref(&repo.gyt_dir, &ref_name(issue.number), &id)?;
@@ -881,5 +1004,74 @@ mod tests {
             reason: String::new(),
         });
         assert!(validate_extends(&old, &new).is_err());
+    }
+
+    // B15: encode/decode round-trip + control-byte / ts / length cap
+    // regression tests.
+
+    #[test]
+    fn validate_rejects_control_byte_in_body() {
+        let mut iss = fixture();
+        // 0x01 is the canonical "Debug-escapes to \u{1}" case our
+        // hand-rolled parser cannot read back.
+        iss.events[0].body = "hello\x01world".into();
+        assert!(
+            validate(&iss).is_err(),
+            "validate() must reject control byte 0x01"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_tab_and_newline() {
+        let mut iss = fixture();
+        // \n and \t are explicitly allowed (Debug formats them as
+        // `\n` / `\t` which parse_toml_string handles).
+        iss.events[0].body = "first\nsecond\tcol".into();
+        validate(&iss).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_oversize_body() {
+        let mut iss = fixture();
+        iss.events[0].body = "a".repeat(BODY_MAX_BYTES + 1);
+        assert!(validate(&iss).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_ts_far_future() {
+        let mut iss = fixture();
+        // B15: i64::MAX timestamp would otherwise jam the timeline
+        // forever — every legitimate future event must be >= i64::MAX
+        // to satisfy monotonicity, so they're all rejected.
+        iss.events[0].ts = i64::MAX;
+        assert!(validate(&iss).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_negative_ts() {
+        let mut iss = fixture();
+        iss.events[0].ts = -1;
+        assert!(validate(&iss).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_mentions() {
+        let mut iss = fixture();
+        iss.mentions = (0..(MENTIONS_MAX_ENTRIES + 1) as u64).collect();
+        assert!(validate(&iss).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_blob_with_control_byte_via_validate() {
+        // A blob synthesised by a malicious pusher with a control
+        // byte in the body would Debug-encode to `\u{1}` (since
+        // we're calling encode here, which uses {:?}), which
+        // parse_toml_string can't parse. So decode rejects with
+        // "unsupported escape" before validate even runs — that's
+        // fine, defense-in-depth.
+        let mut iss = fixture();
+        iss.events[0].body = "ctrl\x07byte".into();
+        let bytes = encode(&iss); // produces \u{7} escape
+        assert!(decode(&bytes).is_err(), "decode must reject \\u escape");
     }
 }

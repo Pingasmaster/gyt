@@ -33,6 +33,119 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const INCIDENT_REFS_PREFIX: &str = "refs/incidents";
 const COUNTER_PATH: &str = "meta/incidents_next";
 
+// B15 limits — see src/issues.rs for the rationale.
+const TS_MIN: i64 = 0;
+const TS_MAX: i64 = 4_102_444_800;
+const TITLE_MAX_BYTES: usize = 1024;
+const BODY_MAX_BYTES: usize = 65_536;
+const AUTHOR_MAX_BYTES: usize = 256;
+const REASON_MAX_BYTES: usize = 1024;
+const TYPE_MAX_BYTES: usize = 128;
+const STATE_STR_MAX_BYTES: usize = 64;
+const FIELD_KEY_MAX_BYTES: usize = 128;
+const FIELD_VAL_MAX_BYTES: usize = 4096;
+const ARRAY_ENTRY_MAX_BYTES: usize = 256;
+const ARRAY_MAX_ENTRIES: usize = 256;
+const MENTIONS_MAX_ENTRIES: usize = 1024;
+const FIELDS_MAX_ENTRIES: usize = 256;
+const EVENTS_MAX: usize = 100_000;
+
+fn check_text_field(name: &str, s: &str, max_bytes: usize) -> Result<()> {
+    if s.len() > max_bytes {
+        return Err(GytError::Refs(format!(
+            "{name} too long: {} bytes (max {max_bytes})",
+            s.len()
+        )));
+    }
+    for (i, b) in s.as_bytes().iter().enumerate() {
+        let bad = *b == b'\x7f' || (*b < 0x20 && !matches!(*b, b'\n' | b'\r' | b'\t'));
+        if bad {
+            return Err(GytError::Refs(format!(
+                "{name} contains forbidden control byte 0x{b:02x} at offset {i}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_ts(name: &str, ts: i64) -> Result<()> {
+    if !(TS_MIN..=TS_MAX).contains(&ts) {
+        return Err(GytError::Refs(format!(
+            "{name} timestamp {ts} out of range [{TS_MIN}, {TS_MAX}]"
+        )));
+    }
+    Ok(())
+}
+
+fn check_array(name: &str, xs: &[String], max_entries: usize, entry_max_bytes: usize) -> Result<()> {
+    if xs.len() > max_entries {
+        return Err(GytError::Refs(format!(
+            "{name} too many entries: {} (max {max_entries})",
+            xs.len()
+        )));
+    }
+    for (i, s) in xs.iter().enumerate() {
+        check_text_field(&format!("{name}[{i}]"), s, entry_max_bytes)?;
+    }
+    Ok(())
+}
+
+/// B15: validate an Incident is safely round-trippable through the
+/// hand-rolled TOML format and bounded against single-push DoS.
+pub fn validate(inc: &Incident) -> Result<()> {
+    check_text_field("title", &inc.title, TITLE_MAX_BYTES)?;
+    check_text_field("incident_type", &inc.incident_type, TYPE_MAX_BYTES)?;
+    check_text_field("author", &inc.author, AUTHOR_MAX_BYTES)?;
+    check_ts("created_ts", inc.created_ts)?;
+    check_array("labels", &inc.labels, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    check_array("assignees", &inc.assignees, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    if inc.mentions.len() > MENTIONS_MAX_ENTRIES {
+        return Err(GytError::Refs(format!(
+            "mentions too long: {} (max {MENTIONS_MAX_ENTRIES})",
+            inc.mentions.len()
+        )));
+    }
+    if inc.fields.len() > FIELDS_MAX_ENTRIES {
+        return Err(GytError::Refs(format!(
+            "fields too many: {} (max {FIELDS_MAX_ENTRIES})",
+            inc.fields.len()
+        )));
+    }
+    for (k, v) in &inc.fields {
+        check_text_field(&format!("fields[{k:?}].key"), k, FIELD_KEY_MAX_BYTES)?;
+        check_text_field(&format!("fields[{k:?}].value"), v, FIELD_VAL_MAX_BYTES)?;
+    }
+    if inc.events.len() > EVENTS_MAX {
+        return Err(GytError::Refs(format!(
+            "events too long: {} (max {EVENTS_MAX})",
+            inc.events.len()
+        )));
+    }
+    for (i, e) in inc.events.iter().enumerate() {
+        check_text_field(&format!("event[{i}].author"), &e.author, AUTHOR_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].body"), &e.body, BODY_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].reason"), &e.reason, REASON_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].new_state"), &e.new_state, STATE_STR_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].new_severity"), &e.new_severity, STATE_STR_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].field_key"), &e.field_key, FIELD_KEY_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].field_value"), &e.field_value, FIELD_VAL_MAX_BYTES)?;
+        check_ts(&format!("event[{i}].ts"), e.ts)?;
+        check_array(
+            &format!("event[{i}].add"),
+            &e.add,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+        check_array(
+            &format!("event[{i}].remove"),
+            &e.remove,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncidentState {
     Detected,
@@ -318,7 +431,7 @@ pub fn decode(bytes: &[u8]) -> Result<Incident> {
     if !kind_seen {
         return Err(invalid("missing kind"));
     }
-    Ok(Incident {
+    let inc = Incident {
         number: number.ok_or_else(|| invalid("missing number"))?,
         title,
         state: state.ok_or_else(|| invalid("missing state"))?,
@@ -331,7 +444,11 @@ pub fn decode(bytes: &[u8]) -> Result<Incident> {
         mentions,
         fields,
         events,
-    })
+    };
+    // B15: refuse blobs whose contents exceed caps or carry
+    // control bytes that would break the next round-trip.
+    validate(&inc)?;
+    Ok(inc)
 }
 
 fn invalid(field: &str) -> GytError {
@@ -664,6 +781,9 @@ fn read_blob(repo_gyt: &Path, id: &ObjectId) -> Result<Incident> {
 }
 
 pub fn write_locked(repo: &Repo, inc: &Incident) -> Result<ObjectId> {
+    // B15: refuse blobs we'd be unable to read back, or which would
+    // bust the per-field caps.
+    validate(inc)?;
     let bytes = encode(inc);
     let id = object::store::write_bytes(&repo.gyt_dir, ObjectKind::Blob, &bytes)?;
     refs::write_ref(&repo.gyt_dir, &ref_name(inc.number), &id)?;

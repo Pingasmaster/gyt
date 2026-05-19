@@ -29,6 +29,119 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const PR_REFS_PREFIX: &str = "refs/prs";
 const COUNTER_PATH: &str = "meta/prs_next";
 
+// B15 limits — see src/issues.rs for the rationale (Debug-format
+// produces `\u{X}` escapes the hand-rolled parser cannot read, and
+// unbounded fields make a single rw push able to fill server disk
+// or jam the per-issue timeline with i64::MAX timestamps).
+const TS_MIN: i64 = 0;
+const TS_MAX: i64 = 4_102_444_800;
+const TITLE_MAX_BYTES: usize = 1024;
+const BODY_MAX_BYTES: usize = 65_536;
+const AUTHOR_MAX_BYTES: usize = 256;
+const REASON_MAX_BYTES: usize = 1024;
+const RESULT_MAX_BYTES: usize = 4096;
+const REF_MAX_BYTES: usize = 255;
+const ARRAY_ENTRY_MAX_BYTES: usize = 256;
+const ARRAY_MAX_ENTRIES: usize = 256;
+const MENTIONS_MAX_ENTRIES: usize = 1024;
+const EVENTS_MAX: usize = 100_000;
+
+fn check_text_field(name: &str, s: &str, max_bytes: usize) -> Result<()> {
+    if s.len() > max_bytes {
+        return Err(GytError::Refs(format!(
+            "{name} too long: {} bytes (max {max_bytes})",
+            s.len()
+        )));
+    }
+    for (i, b) in s.as_bytes().iter().enumerate() {
+        let bad = *b == b'\x7f' || (*b < 0x20 && !matches!(*b, b'\n' | b'\r' | b'\t'));
+        if bad {
+            return Err(GytError::Refs(format!(
+                "{name} contains forbidden control byte 0x{b:02x} at offset {i}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_ts(name: &str, ts: i64) -> Result<()> {
+    if !(TS_MIN..=TS_MAX).contains(&ts) {
+        return Err(GytError::Refs(format!(
+            "{name} timestamp {ts} out of range [{TS_MIN}, {TS_MAX}]"
+        )));
+    }
+    Ok(())
+}
+
+fn check_array(name: &str, xs: &[String], max_entries: usize, entry_max_bytes: usize) -> Result<()> {
+    if xs.len() > max_entries {
+        return Err(GytError::Refs(format!(
+            "{name} too many entries: {} (max {max_entries})",
+            xs.len()
+        )));
+    }
+    for (i, s) in xs.iter().enumerate() {
+        check_text_field(&format!("{name}[{i}]"), s, entry_max_bytes)?;
+    }
+    Ok(())
+}
+
+/// B15: validate a Pr's textual content is safely round-trippable and
+/// references a valid ref namespace. Called from `write_locked` (so
+/// we never emit a blob we couldn't read back) and `decode` (so a
+/// crafted push bypassing our encoder hits the same wall).
+pub fn validate(pr: &Pr) -> Result<()> {
+    check_text_field("title", &pr.title, TITLE_MAX_BYTES)?;
+    check_text_field("author", &pr.author, AUTHOR_MAX_BYTES)?;
+    check_text_field("source_ref", &pr.source_ref, REF_MAX_BYTES)?;
+    check_text_field("target_ref", &pr.target_ref, REF_MAX_BYTES)?;
+    // B15: source_ref / target_ref must satisfy the same ref-name
+    // validator the on-disk writer uses. Without this, a crafted
+    // blob with `target_ref = "../../etc/passwd"` would be accepted
+    // by decode() and later operations might join it onto gyt_dir.
+    crate::refs::validate_ref_name(&pr.source_ref).map_err(|e| {
+        GytError::Refs(format!("source_ref: {e}"))
+    })?;
+    crate::refs::validate_ref_name(&pr.target_ref).map_err(|e| {
+        GytError::Refs(format!("target_ref: {e}"))
+    })?;
+    check_ts("created_ts", pr.created_ts)?;
+    check_array("labels", &pr.labels, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    check_array("assignees", &pr.assignees, ARRAY_MAX_ENTRIES, ARRAY_ENTRY_MAX_BYTES)?;
+    if pr.mentions.len() > MENTIONS_MAX_ENTRIES {
+        return Err(GytError::Refs(format!(
+            "mentions too long: {} (max {MENTIONS_MAX_ENTRIES})",
+            pr.mentions.len()
+        )));
+    }
+    if pr.events.len() > EVENTS_MAX {
+        return Err(GytError::Refs(format!(
+            "events too long: {} (max {EVENTS_MAX})",
+            pr.events.len()
+        )));
+    }
+    for (i, e) in pr.events.iter().enumerate() {
+        check_text_field(&format!("event[{i}].author"), &e.author, AUTHOR_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].body"), &e.body, BODY_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].reason"), &e.reason, REASON_MAX_BYTES)?;
+        check_text_field(&format!("event[{i}].result"), &e.result, RESULT_MAX_BYTES)?;
+        check_ts(&format!("event[{i}].ts"), e.ts)?;
+        check_array(
+            &format!("event[{i}].add"),
+            &e.add,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+        check_array(
+            &format!("event[{i}].remove"),
+            &e.remove,
+            ARRAY_MAX_ENTRIES,
+            ARRAY_ENTRY_MAX_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
     Open,
@@ -259,7 +372,7 @@ pub fn decode(bytes: &[u8]) -> Result<Pr> {
     if !kind_seen {
         return Err(invalid("missing kind"));
     }
-    Ok(Pr {
+    let pr = Pr {
         number: number.ok_or_else(|| invalid("missing number"))?,
         title,
         state: state.ok_or_else(|| invalid("missing state"))?,
@@ -271,7 +384,12 @@ pub fn decode(bytes: &[u8]) -> Result<Pr> {
         assignees,
         mentions,
         events,
-    })
+    };
+    // B15: defense-in-depth — refuse blobs whose contents exceed
+    // the caps or carry control bytes that would Debug-escape into
+    // unparseable `\u{X}` forms on the next round-trip.
+    validate(&pr)?;
+    Ok(pr)
 }
 
 fn invalid(field: &str) -> GytError {
@@ -543,6 +661,9 @@ fn read_blob(repo_gyt: &Path, id: &ObjectId) -> Result<Pr> {
 }
 
 pub fn write_locked(repo: &Repo, pr: &Pr) -> Result<ObjectId> {
+    // B15: reject blobs we'd be unable to read back, and reject
+    // unsafe source_ref/target_ref names at the boundary.
+    validate(pr)?;
     let bytes = encode(pr);
     let id = object::store::write_bytes(&repo.gyt_dir, ObjectKind::Blob, &bytes)?;
     refs::write_ref(&repo.gyt_dir, &ref_name(pr.number), &id)?;
