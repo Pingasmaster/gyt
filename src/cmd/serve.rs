@@ -330,6 +330,12 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig> {
 
 pub fn run(args: &[String]) -> Result<()> {
     let config = parse_args(args)?;
+    // parse_args prints help on `--help`/`-h` and returns a default
+    // ServeConfig; detect that here so we don't actually launch a
+    // server (which would otherwise block forever).
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(());
+    }
     serve(&config)
 }
 
