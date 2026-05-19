@@ -83,6 +83,17 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
                 "ref name has '..' or '.' component: {name:?}"
             )));
         }
+        // B6: reject components starting with '-' — a refname like
+        // `refs/heads/-rf` interpolated into a shell command without
+        // `--` is a CLI-confusion vector for any downstream tool.
+        // gyt's own CLI uses explicit `--` separators, but the wire
+        // side validates here, so we close the gap once at the
+        // server's seam rather than trusting every consumer.
+        if comp.starts_with('-') {
+            return Err(GytError::Refs(format!(
+                "ref name component starts with '-': {name:?}"
+            )));
+        }
         // Case-insensitive: case-insensitive filesystems (e.g. APFS,
         // exFAT, Windows NTFS by default) treat `.LOCK` and `.lock` as
         // the same file, so a `.LOCK`-suffixed refname would still
@@ -99,6 +110,14 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     }
     if name.contains("..") {
         return Err(GytError::Refs(format!("ref name contains '..': {name:?}")));
+    }
+    // B5: `@{` is git's revspec sigil (HEAD@{0}, branch@{upstream}).
+    // A refname containing it would confuse any future revspec parser
+    // and would shadow the canonical interpretation. Reject up front.
+    if name.contains("@{") {
+        return Err(GytError::Refs(format!(
+            "ref name contains '@{{': {name:?}"
+        )));
     }
     Ok(())
 }
@@ -411,6 +430,38 @@ mod tests {
         assert!(write_ref(&gyt, "refs//heads/main", &id).is_err());
         // Trailing slash.
         assert!(write_ref(&gyt, "refs/heads/", &id).is_err());
+    }
+
+    // ── B5: reject '@{' sequence (git revspec sigil) ─────────────
+    #[test]
+    fn rejects_at_brace_in_ref_name() {
+        let (_t, gyt) = setup();
+        let id = dummy_id(0);
+        // Plain `@{` anywhere.
+        assert!(write_ref(&gyt, "refs/heads/feature@{0}", &id).is_err());
+        // Inside a path component too.
+        assert!(write_ref(&gyt, "refs/heads/foo/@{upstream}", &id).is_err());
+        // Standalone validate_ref_name path.
+        assert!(validate_ref_name("refs/heads/x@{0}").is_err());
+        // Sanity: a refname containing '@' but NOT '@{' is fine.
+        assert!(validate_ref_name("refs/heads/alice@x").is_ok());
+    }
+
+    // ── B6: reject component starting with '-' ───────────────────
+    #[test]
+    fn rejects_leading_dash_component_in_ref_name() {
+        let (_t, gyt) = setup();
+        let id = dummy_id(0);
+        // The classic CLI-confusion case.
+        assert!(write_ref(&gyt, "refs/heads/-rf", &id).is_err());
+        // Any component starting with '-' anywhere in the path.
+        assert!(write_ref(&gyt, "refs/-tags/v1", &id).is_err());
+        assert!(write_ref(&gyt, "refs/heads/dir/-bad", &id).is_err());
+        // Standalone validate_ref_name path.
+        assert!(validate_ref_name("refs/heads/-rf").is_err());
+        // Sanity: a dash mid-component is fine (alice-feature, v1-beta).
+        assert!(validate_ref_name("refs/heads/alice-feature").is_ok());
+        assert!(validate_ref_name("refs/tags/v1-beta").is_ok());
     }
 
     #[test]
