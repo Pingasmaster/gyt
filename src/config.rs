@@ -192,17 +192,26 @@ fn quote(s: &str) -> String {
     out
 }
 
+// B16: recognised top-level section names. Anything else is
+// refused at parse time — we'd rather an explicit error than let
+// a typo (e.g. `[Commit]` instead of `[commit]`) silently downgrade
+// a security setting like sign_required.
+const KNOWN_SECTIONS: &[&str] = &["user", "remote", "init", "commit"];
+
 /// Tiny TOML subset parser.
 /// Supports: `[section]`, `[section.subsection]` (one level deep, used for remote.NAME),
 /// `key = "value"` with the same escapes as `quote`. Line comments with `#`.
 #[expect(
     clippy::indexing_slicing,
-    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+    reason = "section[0] indexing is gated by `section.len() == 1` check on a preceding line"
 )]
 pub fn parse(bytes: &[u8]) -> Result<Config> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| GytError::Parse("config.toml is not utf-8".into()))?;
     let mut cfg = Config::default();
+    // B16: section names are kept lowercased so that `[Commit]`
+    // and `[commit]` route to the same code path; the unknown-
+    // section gate below catches actually-unknown sections.
     let mut section: Vec<String> = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
@@ -210,16 +219,33 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
             continue;
         }
         if let Some(rest) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = rest
+            let raw_section: Vec<String> = rest
                 .trim()
                 .split('.')
                 .map(|s| s.trim().to_string())
                 .collect();
-            for part in &section {
+            section = raw_section
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            for (i, part) in section.iter().enumerate() {
                 if part.is_empty() {
                     return Err(GytError::Parse(format!(
                         "config.toml line {}: empty section component",
                         lineno + 1
+                    )));
+                }
+                // B16: only the top-level (i == 0) is gated against
+                // the known list. Subsections (e.g. `remote.<name>`)
+                // are user-named.
+                if i == 0 && !KNOWN_SECTIONS.contains(&part.as_str()) {
+                    return Err(GytError::Parse(format!(
+                        "config.toml line {}: unknown section [{}] \
+                         (known: {}). A typo here can silently downgrade \
+                         security settings like sign_required.",
+                        lineno + 1,
+                        raw_section.first().map_or("", String::as_str),
+                        KNOWN_SECTIONS.join(", ")
                     )));
                 }
             }
@@ -231,7 +257,8 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
                 lineno + 1
             ))
         })?;
-        let key = key.trim();
+        let raw_key = key.trim();
+        let key = raw_key.to_ascii_lowercase();
         let trimmed_value = value.trim();
         // Boolean keys are written by Config::write as bare `true` /
         // `false` literals. Accept those without requiring quoting so a
@@ -248,7 +275,7 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
                     Some(s) if s.eq_ignore_ascii_case("false") => false,
                     _ => {
                         return Err(GytError::Parse(format!(
-                            "config.toml line {}: expected boolean for {key}",
+                            "config.toml line {}: expected boolean for {raw_key}",
                             lineno + 1
                         )));
                     }
@@ -268,15 +295,48 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
             ))
         })?;
         match section.as_slice() {
-            [s] if s == "user" => match key {
+            [s] if s == "user" => match key.as_str() {
                 "name" => cfg.user_name = Some(raw_value),
                 "email" => cfg.user_email = Some(raw_value),
-                _ => {}
+                _ => {
+                    return Err(GytError::Parse(format!(
+                        "config.toml line {}: unknown key {raw_key} in [user]",
+                        lineno + 1
+                    )));
+                }
             },
-            [s, name] if s == "remote" && key == "url" => {
-                cfg.remotes.insert(name.clone(), raw_value);
+            [s, name] if s == "remote" => match key.as_str() {
+                "url" => {
+                    cfg.remotes.insert(name.clone(), raw_value);
+                }
+                _ => {
+                    return Err(GytError::Parse(format!(
+                        "config.toml line {}: unknown key {raw_key} in [remote.{name}]",
+                        lineno + 1
+                    )));
+                }
+            },
+            [s] if s == "init" => {
+                return Err(GytError::Parse(format!(
+                    "config.toml line {}: unknown key {raw_key} in [init]",
+                    lineno + 1
+                )));
             }
-            _ => {}
+            [s] if s == "commit" => {
+                return Err(GytError::Parse(format!(
+                    "config.toml line {}: unknown key {raw_key} in [commit]",
+                    lineno + 1
+                )));
+            }
+            _ => {
+                // Should be unreachable because KNOWN_SECTIONS gate
+                // above already rejected unknown top-levels, but be
+                // defensive: refuse anything that slipped past.
+                return Err(GytError::Parse(format!(
+                    "config.toml line {}: stray key {raw_key} outside a known section",
+                    lineno + 1
+                )));
+            }
         }
     }
     Ok(cfg)
@@ -440,6 +500,50 @@ email = "b@x"
         // Repo overrides email; name still from global.
         assert_eq!(base.user_name.as_deref(), Some("Alice"));
         assert_eq!(base.user_email.as_deref(), Some("alice@work"));
+    }
+
+    /// B16 regression. A misspelled section header in a repo
+    /// config could silently downgrade a security setting from the
+    /// global config. Previously `[Commit] sign_required = true` (or
+    /// any other case variant) was silently dropped because the
+    /// match arms below were case-sensitive and the unknown branch
+    /// fell through `_ => {}`. Now the parser case-folds known
+    /// sections and refuses unknowns at parse time.
+    #[test]
+    fn parser_accepts_case_variant_of_known_section() {
+        // [Commit] and [COMMIT] must route to [commit].
+        for header in ["[Commit]", "[COMMIT]", "[commit]"] {
+            let body = format!("{header}\nsign_required = true\n");
+            let cfg = parse(body.as_bytes()).unwrap();
+            assert!(
+                cfg.sign_required,
+                "header {header} must enable sign_required"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_unknown_section_typo() {
+        // The whole point: a typo in [commit] (e.g. [comit]) must
+        // raise an explicit error, never silently produce
+        // sign_required = false.
+        let toml = "[comit]\nsign_required = true\n";
+        let err = parse(toml.as_bytes());
+        assert!(err.is_err(), "unknown section must error, got: {err:?}");
+    }
+
+    #[test]
+    fn parser_rejects_unknown_key_in_commit_section() {
+        // A typo on the key (e.g. sign_requried) must fail loud.
+        let toml = "[commit]\nsign_requried = true\n";
+        assert!(parse(toml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn parser_accepts_case_variant_of_known_key() {
+        let toml = "[commit]\nSign_Required = true\n";
+        let cfg = parse(toml.as_bytes()).unwrap();
+        assert!(cfg.sign_required);
     }
 
     #[test]
