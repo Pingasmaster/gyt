@@ -442,6 +442,60 @@ fn gc(repo: &Repo) -> Result<usize> {
             }
         }
     }
+
+    // Sweep orphaned packfiles. `object::pack::write_pack` writes the
+    // `pack-<hex>.pack` file first and then the matching `pack-<hex>.idx`
+    // via two separate atomic_writes. A crash between the two leaves a
+    // `.pack` on disk that no `.idx` references — invisible to readers
+    // (the read path only enumerates `.idx` files) and therefore never
+    // reclaimed without an explicit sweep. Apply the same GC_GRACE_SECS
+    // window as loose objects so a `.pack` whose `.idx` is still being
+    // written never gets prematurely removed.
+    let pack_dir = objects_dir.join("pack");
+    if pack_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&pack_dir)
+    {
+        // Collect idx stems first so we can membership-check in O(1).
+        let mut idx_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(es) = std::fs::read_dir(&pack_dir) {
+            for e in es.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("idx")
+                    && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                {
+                    idx_stems.insert(stem.to_string());
+                }
+            }
+        }
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("pack") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !stem.starts_with("pack-") {
+                continue;
+            }
+            if idx_stems.contains(stem) {
+                continue;
+            }
+            // No matching .idx; honour the grace window so a pack
+            // whose .idx is still being written by a concurrent pack
+            // operation isn't reaped under us.
+            if let Ok(meta) = std::fs::metadata(&p)
+                && let Ok(mtime) = meta.modified()
+                && let Ok(since_epoch) = mtime.duration_since(std::time::UNIX_EPOCH)
+                && now.saturating_sub(since_epoch) < grace
+            {
+                continue;
+            }
+            let _ = std::fs::remove_file(&p);
+            pruned += 1;
+        }
+    }
+
     Ok(pruned)
 }
 
