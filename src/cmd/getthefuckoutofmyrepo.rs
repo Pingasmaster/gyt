@@ -186,6 +186,26 @@ pub fn run(args: &[String]) -> Result<()> {
     if let Ok(stash_id) = refs::read_ref(&repo.gyt_dir, "refs/stash") {
         head_refs.push(("refs/stash".to_string(), stash_id));
     }
+    // B27: refs/issues/*, refs/prs/*, refs/incidents/* are reachability
+    // seeds for `gc::compute_reachable` (see gc.rs). The corresponding
+    // blobs are TOML payloads (not commits), so the commit/tag walk
+    // below will harmlessly ignore them, BUT they keep the original
+    // commit OIDs reachable via PR `source_ref`/`target_ref` strings
+    // AND prevent gc from pruning the metadata itself. For the rewrite
+    // to actually purge secret-bearing commits we have to take their
+    // tips into the walk so any rewritten ancestor is followed. We
+    // intentionally do NOT rewrite the TOML blob bodies — those carry
+    // operator-chosen text and may legitimately mention now-rewritten
+    // OIDs in their event log. The user-facing warning printed at the
+    // end of `run` tells the operator to inspect / re-author those
+    // records if needed.
+    for prefix in ["refs/issues", "refs/prs", "refs/incidents"] {
+        if let Ok(list) = refs::list_refs(&repo.gyt_dir, prefix) {
+            for (name, oid) in list {
+                head_refs.push((name, oid));
+            }
+        }
+    }
 
     let mut commits: HashMap<ObjectId, Commit> = HashMap::new();
     let mut queue: Vec<ObjectId> = Vec::new();
@@ -319,6 +339,35 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
+    // B29: expire the reflog AFTER recording our rewrite breadcrumb
+    // (above). Without this step the original commit OIDs remain
+    // listed in `<gyt>/logs/HEAD` and `<gyt>/logs/refs/*`, AND `gc`
+    // uses reflog entries as reachability seeds (see reflog.rs
+    // header comment) — so the "purged" objects are never pruned and
+    // a `gyt cat-file <old-oid>` recovers the secret-bearing content
+    // in one command. Expiring with days=0 drops everything except
+    // the single rewrite entry we just appended.
+    //
+    // (We expire after recording so the rewrite entry survives — it
+    // was written before this call, with a ts == now, so the
+    // days=0 special-case in expire_reflog is what actually preserves
+    // it: that branch wipes EVERY entry. We therefore re-record the
+    // rewrite entry post-expiry so the operator's audit trail keeps
+    // exactly one reflog line per ref documenting the rewrite.)
+    let _expired = crate::cmd::gc::expire_reflog(&repo.gyt_dir, 0);
+    for (name, old_oid) in &head_refs {
+        if let Some(&new_oid) = seen.get(old_oid) {
+            crate::reflog::record(
+                &repo.gyt_dir,
+                name,
+                Some(old_oid),
+                &new_oid,
+                "getthefuckoutofmyrepo",
+                "history rewrite",
+            );
+        }
+    }
+
     eprintln!("history rewritten. {} commit(s) affected.", seen.len());
 
     // M13: NOW that the rewrite has succeeded and the refs have
@@ -339,6 +388,16 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     eprintln!("WARNING: hard-reset your working directory: gyt reset --hard HEAD");
+    // B29: the old loose objects remain on disk for >= GC_GRACE_SECS
+    // (60s default) and packed copies remain until the next `gyt gc`
+    // run. Without this hint the operator may believe the secret has
+    // been "purged" while it still sits in `objects/` and can be
+    // recovered by hash. The reflog has already been expired above,
+    // so a `gc --prune-now` is now sufficient to actually evict the
+    // old blobs.
+    eprintln!(
+        "WARNING: run 'gyt gc --expire-reflog 0 --prune-now' to actually remove the old objects from disk"
+    );
 
     Ok(())
 }
@@ -386,9 +445,18 @@ fn rewrite_tree_entries(
             let target_path = cwd.join(subpath).join(fs_bytes(&e.name));
             !targets.iter().any(|t| t == &target_path)
         })
-        .map(|mut e| {
+        .map(|mut e| -> Result<TreeEntry> {
             if e.mode == MODE_DIR {
                 let child_subpath = subpath.join(fs_bytes(&e.name));
+                // B28: propagate the error rather than silently keeping
+                // the old subtree hash. The previous `.ok().unwrap_or`
+                // pattern meant any IO/parse failure during recursion
+                // produced a "rewritten" tree that still referenced the
+                // unchanged secret-bearing subtree — a silent partial
+                // rewrite that defeats the whole purpose of the command.
+                // F-D9-01 already protects against budget-exhausted
+                // partial rewrites at the outer walk; this closes the
+                // inner-recursion variant.
                 e.hash = rewrite_tree_entries(
                     repo_path,
                     &e.hash,
@@ -396,13 +464,11 @@ fn rewrite_tree_entries(
                     cwd,
                     &child_subpath,
                     seen,
-                )
-                .ok()
-                .unwrap_or(e.hash);
+                )?;
             }
-            e
+            Ok(e)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let new_oid = tree::write(repo_path, &new_entries)?;
     if subpath.as_os_str().is_empty() {

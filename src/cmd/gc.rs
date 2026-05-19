@@ -273,7 +273,7 @@ fn pack_target_bytes() -> usize {
 /// Drop every reflog entry whose timestamp is older than `days` days.
 /// `days == 0` truncates every reflog. Returns the number of entries
 /// removed (across all refs). Best-effort: per-ref I/O errors are skipped.
-fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
+pub(crate) fn expire_reflog(gyt_dir: &Path, days: u64) -> usize {
     let Ok(all) = crate::reflog::list_all(gyt_dir) else {
         return 0;
     };
