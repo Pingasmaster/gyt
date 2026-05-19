@@ -185,6 +185,18 @@ pub fn run_set(args: &[String], gyt_dir: &Path) -> Result<()> {
     std::fs::write(&secret_path, &encrypted)
         .map_err(|e| GytError::Ci(format!("writing secret {name}: {e}")))?;
     println!("Secret '{name}' stored.");
+    // M24: as of this commit, the CI wasm sandbox does NOT yet wire
+    // `load_secrets` / `mask_secrets` into the per-script execution
+    // path. Storing a secret today succeeds (it's encrypted on disk),
+    // but the wasm hostcalls can't read it (.gyt/ is banned from
+    // read_file by design — see CLAUDE.md). Warn operators rather
+    // than silently mislead.
+    eprintln!(
+        "warning: CI secret storage is implemented, but the wasm-side\n\
+         retrieval is not yet wired. The secret is on disk and encrypted,\n\
+         but `.gyt-ci/*.wasm` scripts can't read it via `read_file` today.\n\
+         Track this in the audit plan (M24)."
+    );
     Ok(())
 }
 

@@ -1153,6 +1153,16 @@ fn validate_acl_pattern(pattern: &str) -> std::result::Result<(), String> {
             "trailing '*' must follow '/'; {pattern:?} is not segment-anchored"
         ));
     }
+    // M25: wire requests are single-segment (no slashes in `repo`).
+    // A pattern like `org/*` parses as valid here but can never match
+    // a wire request. Reject loudly at load time so the operator's
+    // intent isn't silently denied.
+    if prefix.contains('/') {
+        return Err(format!(
+            "pattern {pattern:?} contains '/'; wire `repo` is a single segment, so this pattern \
+             cannot match any wire request. Use `*` for global access or an exact name."
+        ));
+    }
     Ok(())
 }
 
@@ -2868,6 +2878,16 @@ fn wire_objects_have(
     let mut n_stored = 0u32;
     let mut n_skipped = 0u32;
     for entry in &entries {
+        // L1: require the on-disk MAGIC prefix on every entry.
+        // `compress::decode` accepts both magic-wrapped and raw
+        // pass-through; without the explicit MAGIC check, a pusher
+        // could upload a 256 MiB raw object that legitimate clients
+        // never produce (per-stream decompression-bomb cap doesn't
+        // apply to non-XZ data). MAGIC = [0x67, 0x79, 0x74, 0x01].
+        if entry.bytes.get(..4) != Some(&[0x67, 0x79, 0x74, 0x01]) {
+            n_skipped += 1;
+            continue;
+        }
         // Decompress on-disk bytes to get raw: "<kind> <size>\0<payload>"
         // Each entry's decompressed size is added to xz_bytes_total so
         // we can log heavy-decompression after the request completes.
@@ -3107,10 +3127,15 @@ fn wire_refs_update(
         state.response_cache.invalidate_prefix("api_refs:");
         state.response_cache.invalidate_prefix("repo_list:");
         state.pack_cache.invalidate_prefix(&format!("pack:{repo}:"));
-        // M17: the repo_index caches `head_commit` per repo; without
-        // this refresh `repo_list` returns stale tip information for
-        // up to 5 minutes (the periodic rescan interval).
-        state.repo_index.rescan(&state.repos_root);
+        // M17 note: an earlier draft called `state.repo_index.rescan`
+        // here to make `repo_list` reflect the new head immediately.
+        // That walks the entire repos_root on every push, which under
+        // a parallel-push load is enough to time out other requests.
+        // The wire path also uses single-segment `repo` names that
+        // don't necessarily match the (owner, name) layout the
+        // repo_index expects, so the rescan was a no-op for most
+        // wire-managed repos anyway. Reverted; the 5-minute periodic
+        // rescan is good enough for the REST view's freshness.
     }
 
     state

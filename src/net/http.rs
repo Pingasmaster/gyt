@@ -130,6 +130,19 @@ impl HttpClient {
             Some((tok, host)) => (Some(tok.to_string()), host),
             None => (None, authority),
         };
+        // M18: refuse any URL whose authority contains control bytes,
+        // including the embedded bearer token. A `\r\n` in the token
+        // would otherwise be format!'d into the Authorization header
+        // and inject arbitrary HTTP headers downstream.
+        for s in [authority, bearer_token.as_deref().unwrap_or("")] {
+            for b in s.bytes() {
+                if b < 0x20 || b == 0x7f {
+                    return Err(GytError::Net(format!(
+                        "url: control byte 0x{b:02x} in authority"
+                    )));
+                }
+            }
+        }
 
         // Split path/query.
         let (path, query) = match path_and_query.find('?') {

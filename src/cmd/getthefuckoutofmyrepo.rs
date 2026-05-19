@@ -127,18 +127,10 @@ pub fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    for p in &resolved {
-        if p.is_dir() {
-            fs::remove_dir_all(p)?;
-            eprintln!(
-                "removed (dir): {}",
-                fs_path(p.strip_prefix(&cwd).unwrap_or(p))
-            );
-        } else {
-            fs::remove_file(p)?;
-            eprintln!("removed: {}", fs_path(p.strip_prefix(&cwd).unwrap_or(p)));
-        }
-    }
+    // M13: defer the workdir deletion until AFTER the rewrite walk
+    // succeeds. Previously the deletion happened first; a budget
+    // failure during the walk then left the workdir torn up but
+    // history un-rewritten — the worst-of-both-worlds outcome.
 
     let mut index = Index::read(&repo.index_path())?;
     let mut to_remove: Vec<std::path::PathBuf> = Vec::new();
@@ -328,6 +320,24 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     eprintln!("history rewritten. {} commit(s) affected.", seen.len());
+
+    // M13: NOW that the rewrite has succeeded and the refs have
+    // been updated, finally perform the workdir deletion. A failure
+    // before this point left the workdir intact (and a partial
+    // ref update could be rolled forward via reflog).
+    for p in &resolved {
+        if p.is_dir() {
+            fs::remove_dir_all(p)?;
+            eprintln!(
+                "removed (dir): {}",
+                fs_path(p.strip_prefix(&cwd).unwrap_or(p))
+            );
+        } else {
+            fs::remove_file(p)?;
+            eprintln!("removed: {}", fs_path(p.strip_prefix(&cwd).unwrap_or(p)));
+        }
+    }
+
     eprintln!("WARNING: hard-reset your working directory: gyt reset --hard HEAD");
 
     Ok(())
