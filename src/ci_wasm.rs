@@ -147,6 +147,12 @@ pub struct CiPolicy {
     pub fuel: u64,
     /// Wall-time cap. Enforced via `epoch_interruption` + a ticker.
     pub wall_time_secs: u64,
+    /// Cumulative bytes a wasm module may emit via the `log` hostcall.
+    /// Default `CI_MAX_LOG_BYTES`. The trap path is loud: once a call
+    /// would push the total past this cap, the host returns an error
+    /// and the run fails. Lowered in tests to make the cap-trip path
+    /// exercisable without printing 256 MiB.
+    pub log_max: usize,
 }
 
 impl Default for CiPolicy {
@@ -161,6 +167,7 @@ impl Default for CiPolicy {
             memory_max: CI_DEFAULT_MEMORY_BYTES,
             fuel: CI_DEFAULT_FUEL,
             wall_time_secs: CI_DEFAULT_WALL_TIME_SECS,
+            log_max: CI_MAX_LOG_BYTES,
         }
     }
 }
@@ -245,6 +252,7 @@ pub fn run_ci_wasm_with_policy(
         write_roots,
         repo_gyt_meta: canon_repo.join(".gyt"),
         log_used: 0,
+        log_max: policy.log_max,
         limiter: CiLimits {
             memory_max: policy.memory_max,
             mem_high_water: 0,
@@ -270,9 +278,10 @@ pub fn run_ci_wasm_with_policy(
              -> std::result::Result<(), wasmtime::Error> {
                 let len_us = len.max(0) as usize;
                 let already = caller.data().log_used;
-                if already.saturating_add(len_us) > CI_MAX_LOG_BYTES {
+                let cap = caller.data().log_max;
+                if already.saturating_add(len_us) > cap {
                     return Err(wasmtime::Error::msg(format!(
-                        "ci log output exceeds {CI_MAX_LOG_BYTES}-byte cap"
+                        "ci log output exceeds {cap}-byte cap"
                     )));
                 }
                 caller.data_mut().log_used = already + len_us;
@@ -555,6 +564,10 @@ struct Sandbox {
     /// secrets and signing keys.
     repo_gyt_meta: PathBuf,
     log_used: usize,
+    /// Mirror of `CiPolicy::log_max`. Capacity-trip check in the `log`
+    /// hostcall reads this instead of the global constant so the cap
+    /// is exercisable in tests without spending 256 MiB.
+    log_max: usize,
     limiter: CiLimits,
 }
 
@@ -587,9 +600,18 @@ fn read_caller_string(caller: &mut Caller<'_, Sandbox>, ptr: i32, len: i32) -> O
     reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
 )]
 fn read_bytes(slice: &[u8], ptr: i32, len: i32) -> Vec<u8> {
-    let start = ptr.max(0) as usize;
-    let end = (start as i64 + len as i64) as usize;
-    if end > slice.len() {
+    // Guest-supplied len must be non-negative and within the per-call
+    // file cap. A negative len with non-zero ptr would otherwise produce
+    // `end < start`, and the slice index below panics on inverted
+    // ranges. Treat any out-of-range len as "guest bug, no data" so the
+    // hostcall caller sees an empty body and returns its own error
+    // code rather than trapping out of wasmtime.
+    if !(0..=CI_MAX_FILE_BYTES as i32).contains(&len) || ptr < 0 {
+        return vec![];
+    }
+    let start = ptr as usize;
+    let end = start.saturating_add(len as usize);
+    if end > slice.len() || end < start {
         return vec![];
     }
     slice[start..end].to_vec()
@@ -722,6 +744,7 @@ pub fn sandbox_repo_read(repo_dir: &Path, rel: &str) -> Option<PathBuf> {
         write_roots: vec![],
         repo_gyt_meta: canon.join(".gyt"),
         log_used: 0,
+        log_max: CI_MAX_LOG_BYTES,
         limiter: CiLimits {
             memory_max: CI_DEFAULT_MEMORY_BYTES,
             mem_high_water: 0,
@@ -738,6 +761,7 @@ pub fn sandbox_output(output_dir: &Path, rel: &str) -> Option<(PathBuf, String)>
         // No repo meta in a write-only-output context.
         repo_gyt_meta: PathBuf::from("/__never_match__"),
         log_used: 0,
+        log_max: CI_MAX_LOG_BYTES,
         limiter: CiLimits {
             memory_max: CI_DEFAULT_MEMORY_BYTES,
             mem_high_water: 0,
@@ -784,6 +808,7 @@ mod tests {
             write_roots: vec![],
             repo_gyt_meta: canonicalize_or_self(repo_dir).join(".gyt"),
             log_used: 0,
+            log_max: CI_MAX_LOG_BYTES,
             limiter: CiLimits {
                 memory_max: CI_DEFAULT_MEMORY_BYTES,
                 mem_high_water: 0,
@@ -840,6 +865,7 @@ mod tests {
             write_roots: vec![canon.clone()],
             repo_gyt_meta: canon.join(".gyt"),
             log_used: 0,
+            log_max: CI_MAX_LOG_BYTES,
             limiter: CiLimits {
                 memory_max: CI_DEFAULT_MEMORY_BYTES,
                 mem_high_water: 0,
@@ -867,6 +893,7 @@ mod tests {
             write_roots: vec![],
             repo_gyt_meta: canon.join(".gyt"),
             log_used: 0,
+            log_max: CI_MAX_LOG_BYTES,
             limiter: CiLimits {
                 memory_max: CI_DEFAULT_MEMORY_BYTES,
                 mem_high_water: 0,

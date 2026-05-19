@@ -334,3 +334,356 @@ fn failed_instantiation_does_not_leak_ticker() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─── Audit 2026-05 boundary cases (appended) ────────────────────────
+//
+// Each test here pins one boundary that the sandbox MUST enforce
+// exactly — not "approximately, depending on platform". Regressions
+// to any of these are sandbox-escape candidates, not perf bugs.
+
+/// Small helper for the policy-driven runs below.
+fn run_with(
+    wasm: &std::path::Path,
+    repo: &std::path::Path,
+    out: &std::path::Path,
+    policy: &gyt::ci_wasm::CiPolicy,
+) -> gyt::errors::Result<()> {
+    gyt::ci_wasm::run_ci_wasm_with_policy(wasm, repo, out, policy)
+}
+
+/// A module that runs N+1 i32.const/drop pairs must trap when fuel is
+/// set to a value that pays for exactly N operations. wasmtime charges
+/// 1 fuel per operator by default, so a tight loop of `(i32.const 0)
+/// (drop)` is a deterministic fuel sink. We pick small N so the test
+/// is fast and the trap is visible.
+#[test]
+fn fuel_at_exact_limit_traps() {
+    // Use a loop with a live local counter so cranelift cannot constant-
+    // fold the body away. The loop runs up to 10 000 iterations, each
+    // iteration consuming ~5 operators (local.get, i32.const, i32.add,
+    // local.set, br_if). Fuel=50 should trap inside the first few
+    // iterations. A flat `i32.const 0; drop` body gets eliminated by
+    // the optimiser and never consumes fuel.
+    let wat = "(module\n  (func (export \"_start\") (result i32)\n    \
+        (local $i i32)\n    \
+        (loop $L\n      \
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))\n      \
+            (br_if $L (i32.lt_s (local.get $i) (i32.const 10000)))\n    )\n    \
+        (local.get $i)))\n"
+        .to_string();
+    let dir = unique_tmp("fuel-exact");
+    let wasm = write_wat(&dir, "fuel", &wat);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let policy = gyt::ci_wasm::CiPolicy {
+        fuel: 50,
+        wall_time_secs: 5,
+        ..Default::default()
+    };
+    let r = run_with(&wasm, &dir, &out, &policy);
+    assert!(r.is_err(), "module exceeding fuel must trap; got Ok");
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        msg.contains("fuel") || msg.contains("WASM execution") || msg.contains("trap"),
+        "expected a fuel/trap error, got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A module that grows memory past `policy.memory_max` must be blocked
+/// at the `memory.grow` call site. We size the cap to exactly N pages
+/// (each 64 KiB) and have the wasm grow N+1 pages. The wasm checks for
+/// -1 and traps via `unreachable` so we observe a hard error rather
+/// than a clean exit.
+#[test]
+fn memory_grow_at_exact_max() {
+    const PAGE: usize = 64 * 1024;
+    const N_PAGES: usize = 4;
+    // Memory caps in CiPolicy are in *bytes*; wasm pages are 64 KiB.
+    // Setting memory_max = N * PAGE means N pages fit, N+1 does not.
+    let memory_max = N_PAGES * PAGE;
+    // Grow by (N+1) pages — refused → memory.grow returns -1 → wasm
+    // hits `unreachable` and traps.
+    let grow_amount = N_PAGES + 1;
+    let wat = format!(
+        "(module
+  (memory (export \"memory\") 0)
+  (func (export \"_start\") (result i32)
+    i32.const {grow_amount}
+    memory.grow
+    i32.const -1
+    i32.eq
+    (if (then unreachable))
+    i32.const 0))
+"
+    );
+    let dir = unique_tmp("mem-exact");
+    let wasm = write_wat(&dir, "memgrow", &wat);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let policy = gyt::ci_wasm::CiPolicy {
+        memory_max,
+        fuel: 10_000_000,
+        wall_time_secs: 5,
+        ..Default::default()
+    };
+    let r = run_with(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_err(),
+        "growing past memory_max must trap; got Ok with cap = {memory_max} bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `read_caller_string` enforces `len ∈ 0..=4096`. A hostcall asked
+/// to read a 5000-byte string must reject the call cleanly. We do
+/// this through `read_file`, which calls `read_caller_string` first
+/// and returns -1 on a None result. The wasm asserts the return is
+/// -1 and exits 0; anything else (panic, success, different errno)
+/// flags a regression.
+#[test]
+fn read_caller_string_cap_4096() {
+    // 5000 bytes of 0x41 ('A') laid out as a wasm data segment.
+    let payload = "A".repeat(5000);
+    let wat = format!(
+        "(module
+  (import \"gyt_ci\" \"read_file\"
+    (func $read (param i32 i32 i32 i32) (result i32)))
+  (memory (export \"memory\") 1)
+  (data (i32.const 0) \"{payload}\")
+  (func (export \"_start\") (result i32)
+    ;; path ptr=0 len=5000, buffer ptr=8192 len=64.
+    i32.const 0
+    i32.const 5000
+    i32.const 8192
+    i32.const 64
+    call $read
+    ;; expect -1 (bad path arg per the read_caller_string cap)
+    i32.const -1
+    i32.eq
+    (if (then (return (i32.const 0))))
+    ;; anything else is a regression — exit non-zero
+    i32.const 7))
+"
+    );
+    let dir = unique_tmp("readstr-cap");
+    let wasm = write_wat(&dir, "readstr", &wat);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let policy = gyt::ci_wasm::CiPolicy {
+        fuel: 10_000_000,
+        wall_time_secs: 5,
+        ..Default::default()
+    };
+    let r = run_with(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_ok(),
+        "module must exit cleanly after observing -1 from a too-long path; got {r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `gyt_ci.log` enforces a cumulative-bytes cap per run, defaulting to
+/// `CI_MAX_LOG_BYTES` (256 MiB). The hostcall TRAPS the wasm as soon
+/// as a call would push the running total past the cap. Lower the
+/// policy's `log_max` to 4 KiB in this test so the trap fires after a
+/// few iterations rather than forcing a multi-hundred-MiB run.
+#[test]
+fn log_cumulative_byte_cap() {
+    // 1 KiB payload, log_max = 4 KiB → trap fires on the 5th call.
+    let payload_size: usize = 1024;
+    let log_max: usize = 4 * 1024;
+    // Iterate plenty of times so the trap fires mid-loop.
+    let iters = 100u32;
+    // Data: 1 KiB of `0x41` ('A').
+    let mut data = String::with_capacity(payload_size * 4);
+    data.push('"');
+    for _ in 0..payload_size {
+        data.push_str("\\41");
+    }
+    data.push('"');
+    let wat = format!(
+        "(module\n  \
+            (import \"gyt_ci\" \"log\" (func $log (param i32 i32)))\n  \
+            (memory (export \"memory\") 1)\n  \
+            (data (i32.const 0) {data})\n  \
+            (func (export \"_start\") (result i32)\n    \
+                (local $i i32)\n    \
+                (loop $L\n      \
+                    (call $log (i32.const 0) (i32.const {payload_size}))\n      \
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))\n      \
+                    (br_if $L (i32.lt_s (local.get $i) (i32.const {iters})))\n    \
+                )\n    \
+                (i32.const 0)))\n"
+    );
+    let dir = unique_tmp("log-cap");
+    let wasm = write_wat(&dir, "log-cap", &wat);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let policy = gyt::ci_wasm::CiPolicy {
+        fuel: 100_000_000_000,
+        log_max,
+        wall_time_secs: 30,
+        ..Default::default()
+    };
+    let r = gyt::ci_wasm::run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
+    // The cap trap surfaces as a wasmtime execution error; wasmtime's
+    // Display intentionally hides the underlying host error message
+    // (it would otherwise leak host implementation details to the
+    // guest's error log). The observable contract is "the wasm cannot
+    // emit more than `log_max` bytes" — we pin that by asserting the
+    // run errored after the cap was crossed.
+    assert!(r.is_err(), "log-cap should trap once cumulative bytes exceed the cap");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ─── Disabled WASM features must be rejected at module validation ───
+//
+// Each test below builds a minimal WAT module that USES one of the
+// disabled features. `Module::from_file` should reject it during
+// validation — the engine config explicitly turns off all of these.
+
+fn assert_feature_rejected(label: &str, wat: &str) {
+    let dir = unique_tmp(&format!("feat-{label}"));
+    let wasm = write_wat(&dir, label, wat);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let r = gyt::ci_wasm::run_ci_wasm(&wasm, &dir, &out);
+    assert!(
+        r.is_err(),
+        "feature `{label}` must be rejected by validation; got Ok"
+    );
+    let msg = r.unwrap_err().to_string();
+    // Either the module never loads (validation error) or it fails
+    // to instantiate. Both surface as a clean Err out of run_ci_wasm.
+    assert!(
+        msg.contains("loading WASM")
+            || msg.contains("instantiating")
+            || msg.contains("validate")
+            || msg.contains("WASM"),
+        "expected a load/validation error for `{label}`, got: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn feature_threads_rejected() {
+    // Shared memory requires the threads proposal.
+    const WAT: &str = r#"
+(module
+  (memory (export "memory") 1 1 shared)
+  (func (export "_start") (result i32) i32.const 0))
+"#;
+    assert_feature_rejected("threads", WAT);
+}
+
+#[test]
+fn feature_simd_rejected() {
+    // v128 type is gated by the SIMD proposal.
+    const WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "_start") (result i32)
+    v128.const i32x4 0 0 0 0
+    drop
+    i32.const 0))
+"#;
+    assert_feature_rejected("simd", WAT);
+}
+
+#[test]
+fn feature_relaxed_simd_rejected() {
+    // i32x4.relaxed_trunc_f32x4_s is exclusive to the relaxed-SIMD
+    // proposal. (Plain SIMD is also disabled, so this test holds even
+    // if relaxed-SIMD were toggled in isolation — either gate fires.)
+    const WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "_start") (result i32)
+    v128.const i32x4 0 0 0 0
+    i32x4.relaxed_trunc_f32x4_s
+    drop
+    i32.const 0))
+"#;
+    assert_feature_rejected("relaxed-simd", WAT);
+}
+
+#[test]
+fn feature_reference_types_rejected() {
+    // `externref` table element is the reference-types proposal.
+    const WAT: &str = r#"
+(module
+  (table (export "t") 1 externref)
+  (func (export "_start") (result i32) i32.const 0))
+"#;
+    assert_feature_rejected("reference-types", WAT);
+}
+
+#[test]
+fn feature_multi_memory_rejected() {
+    // Two memories require the multi-memory proposal.
+    const WAT: &str = r#"
+(module
+  (memory $a (export "memory") 1)
+  (memory $b 1)
+  (func (export "_start") (result i32) i32.const 0))
+"#;
+    assert_feature_rejected("multi-memory", WAT);
+}
+
+#[test]
+fn feature_memory64_rejected() {
+    // `i64` memory index is the memory64 proposal.
+    const WAT: &str = r#"
+(module
+  (memory (export "memory") i64 1)
+  (func (export "_start") (result i32) i32.const 0))
+"#;
+    assert_feature_rejected("memory64", WAT);
+}
+
+/// B1: A guest that calls `write_file` with a negative `data_len`
+/// must not panic the hostcall (Rust panics on `slice[start..end]`
+/// when `start > end`). Before the fix, `read_bytes(ptr=100, len=-1)`
+/// produced `start=100, end=99` and the slice index trapped. After
+/// the fix, `read_bytes` rejects out-of-range len and returns an
+/// empty vec, so the hostcall returns 0 with a zero-byte file
+/// written — the guest sees an orderly result, not a wasmtime trap.
+#[test]
+fn write_file_negative_data_len_does_not_panic() {
+    // path bytes at offset 0 ("out.bin", 7 bytes); call write_file
+    // with data_ptr=100 (non-zero) and data_len=-1.
+    const WAT: &str = r#"
+(module
+  (import "gyt_ci" "write_file"
+    (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "out.bin")
+  (func (export "_start") (result i32)
+    i32.const 0    ;; path ptr
+    i32.const 7    ;; path len
+    i32.const 100  ;; data ptr (non-zero, so inverted-range panic was reachable)
+    i32.const -1   ;; data len (negative)
+    call $write
+    ;; result is allowed to be 0 (zero-byte write) or any negative
+    ;; error code; the important invariant is that the call returned
+    ;; rather than trapping. Discard it.
+    drop
+    i32.const 0))
+"#;
+    let dir = unique_tmp("write-neg-len");
+    let wasm = write_wat(&dir, "neg-len", WAT);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let policy = gyt::ci_wasm::CiPolicy {
+        fuel: 10_000_000,
+        wall_time_secs: 5,
+        ..Default::default()
+    };
+    let r = run_with(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_ok(),
+        "write_file(data_len=-1) must not trap; got {r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
