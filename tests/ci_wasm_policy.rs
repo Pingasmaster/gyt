@@ -376,3 +376,124 @@ fn explicit_short_wall_time_terminates_infinite_loop() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─── 9. B9: case-insensitive `.GYT/` rejection (H15) ─────────────────
+//
+// The sandbox already implements `path_contains_gyt_component` to defend
+// against case-insensitive filesystems (APFS, NTFS, casefolded ext4)
+// where `.GYT/` would otherwise bypass the byte-prefix `.gyt/` check.
+// These tests pin the behavior so a future refactor can't silently
+// regress the defense. They run on every CI host regardless of the
+// underlying filesystem — the check is lexical, so it fires even on
+// case-sensitive Linux ext4.
+
+// Tries to read ".GYT/secret" — must always fail.
+const READ_DOTGYT_UPPER_WAT: &str = r#"
+(module
+  (import "gyt_ci" "read_file"
+    (func $read (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) ".GYT/secret")
+  (func (export "_start") (result i32)
+    (local $n i32)
+    (local.set $n
+      (call $read (i32.const 0) (i32.const 11)
+                  (i32.const 64) (i32.const 1024)))
+    (if (i32.lt_s (local.get $n) (i32.const 0))
+      (then (return (i32.const 0))))    ;; expected: read failed
+    (i32.const 1)))                     ;; unexpected: read succeeded
+"#;
+
+// Tries to write ".GYT/x" — must always fail.
+const WRITE_DOTGYT_UPPER_WAT: &str = r#"
+(module
+  (import "gyt_ci" "write_file"
+    (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) ".GYT/x")
+  (data (i32.const 32) "hi")
+  (func (export "_start") (result i32)
+    (local $n i32)
+    (local.set $n
+      (call $write (i32.const 0) (i32.const 6)
+                   (i32.const 32) (i32.const 2)))
+    (if (i32.lt_s (local.get $n) (i32.const 0))
+      (then (return (i32.const 0))))    ;; expected: write failed
+    (i32.const 1)))                     ;; unexpected: write succeeded
+"#;
+
+// Tries to write "a/.Gyt/x" (mixed case, mid-component).
+const WRITE_DOTGYT_MIXED_WAT: &str = r#"
+(module
+  (import "gyt_ci" "write_file"
+    (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "a/.Gyt/x")
+  (data (i32.const 32) "hi")
+  (func (export "_start") (result i32)
+    (local $n i32)
+    (local.set $n
+      (call $write (i32.const 0) (i32.const 8)
+                   (i32.const 32) (i32.const 2)))
+    (if (i32.lt_s (local.get $n) (i32.const 0))
+      (then (return (i32.const 0))))
+    (i32.const 1)))
+"#;
+
+#[test]
+fn dot_gyt_uppercase_read_is_denied() {
+    let (dir, out) = setup_repo_with_tag("dotgyt-upper-read");
+    std::fs::create_dir_all(dir.join(".gyt")).unwrap();
+    std::fs::write(dir.join(".gyt").join("secret"), b"top secret").unwrap();
+    let wasm = write_wat(&dir, "read_DOTGYT", READ_DOTGYT_UPPER_WAT);
+    // The operator points --ci-read at the repo (broadest grant); the
+    // case-insensitive defense must still reject `.GYT/`.
+    let policy = CiPolicy {
+        extra_read: vec![dir.clone()],
+        ..Default::default()
+    };
+    let r = run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_ok(),
+        ".GYT (uppercase) read must always be denied: {r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dot_gyt_uppercase_write_is_denied() {
+    let dir = unique_tmp("dotgyt-upper-write");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let wasm = write_wat(&dir, "write_DOTGYT", WRITE_DOTGYT_UPPER_WAT);
+    // Even with repo writes granted, .GYT/ must be denied lexically.
+    let policy = CiPolicy {
+        repo_write: true,
+        ..Default::default()
+    };
+    let r = run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_ok(),
+        ".GYT (uppercase) write must be denied: {r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dot_gyt_mixed_case_anywhere_in_path_denied() {
+    let dir = unique_tmp("dotgyt-mixed-anywhere");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let wasm = write_wat(&dir, "write_a_dotGyt", WRITE_DOTGYT_MIXED_WAT);
+    // .Gyt anywhere in the path must trip the component check.
+    let policy = CiPolicy {
+        repo_write: true,
+        ..Default::default()
+    };
+    let r = run_ci_wasm_with_policy(&wasm, &dir, &out, &policy);
+    assert!(
+        r.is_ok(),
+        ".Gyt mid-component write must be denied: {r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

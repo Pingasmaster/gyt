@@ -266,6 +266,43 @@ fn issue_blob_survives_gc() {
 }
 
 #[test]
+fn incident_blob_survives_gc() {
+    // B9: mirror issue_blob_survives_gc and pr_blob_survives_gc for
+    // refs/incidents/*. compute_reachable seeds these at src/cmd/gc.rs:
+    // 478; the test pins that seeding by aging the incident blob past
+    // the grace window and asserting it survives.
+    let env = Env::new("incident-survives");
+    let repo = env.path("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    env.ok_in(&repo, &["init"]);
+    std::fs::write(repo.join("a.txt"), b"x").unwrap();
+    env.ok_in(&repo, &["add", "a.txt"]);
+    env.ok_in(&repo, &["commit", "-m", "first"]);
+
+    env.ok_in(
+        &repo,
+        &[
+            "incident", "new", "Outage",
+            "--severity", "sev1",
+            "--type", "ops",
+            "-m", "details",
+        ],
+    );
+    let ref_path = repo.join(".gyt").join("refs").join("incidents").join("1");
+    let hex = std::fs::read_to_string(&ref_path).unwrap().trim().to_string();
+    let objects = repo.join(".gyt").join("objects");
+    let fpath = objects.join(&hex[..2]).join(&hex[2..]);
+    assert!(fpath.exists(), "incident blob must exist: {fpath:?}");
+    set_mtime(&fpath, std::time::SystemTime::now() - Duration::from_secs(60 * 60));
+
+    env.ok_in(&repo, &["gc"]);
+    assert!(
+        fpath.exists(),
+        "incident blob must survive gc (seeded as reachable)"
+    );
+}
+
+#[test]
 fn pr_blob_survives_gc() {
     let env = Env::new("pr-survives");
     let repo = env.path("r");

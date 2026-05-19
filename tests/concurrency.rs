@@ -98,6 +98,40 @@ fn two_issue_new_race_each_gets_distinct_number() {
 }
 
 #[test]
+fn two_incident_new_race_each_gets_distinct_number() {
+    // B9: incidents have their own counter at `meta/incidents_next`
+    // (independent of `meta/issues_next`). Parallel `gyt incident new`
+    // invocations must serialize through repo.lock() and each get a
+    // distinct number — none reused, none dropped. Mirrors the
+    // existing issue/PR tests.
+    let env = Arc::new(Env::new("conc-incidents"));
+    let r = env.fresh_repo("r");
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let r = r.clone();
+        let env = env.clone();
+        handles.push(std::thread::spawn(move || {
+            env.ok_in(
+                &r,
+                &[
+                    "incident", "new", &format!("inc{i}"),
+                    "--severity", "sev2",
+                    "--type", "ops",
+                    "-m", "body",
+                ],
+            );
+        }));
+    }
+    join_all(handles);
+    let list = env.ok_in(&r, &["incident", "list"]);
+    let n = list.matches("inc0").count()
+        + list.matches("inc1").count()
+        + list.matches("inc2").count()
+        + list.matches("inc3").count();
+    assert_eq!(n, 4, "all four incidents should land: {list}");
+}
+
+#[test]
 fn two_pr_new_race_each_gets_distinct_number() {
     let env = Arc::new(Env::new("conc-prs"));
     let r = env.fresh_repo("r");
