@@ -336,8 +336,9 @@ pub fn evaluate_with_mode(
         // the monotonic-append invariant here: an rw client can
         // otherwise upload a blob with `events = []` and silently
         // erase the whole audit trail.
-        let is_metadata_ref =
-            u.name.starts_with("refs/issues/") || u.name.starts_with("refs/prs/");
+        let is_metadata_ref = u.name.starts_with("refs/issues/")
+            || u.name.starts_with("refs/prs/")
+            || u.name.starts_with("refs/incidents/");
         if is_metadata_ref {
             if let Err(e) = enforce_metadata_monotonic(gyt_dir, &u.name, u.old.as_ref(), &u.new) {
                 blocked.push((u.name.clone(), e));
@@ -449,7 +450,10 @@ fn enforce_target_kind(
         obj.kind == ObjectKind::Commit
     } else if refname.starts_with("refs/tags/") {
         obj.kind == ObjectKind::Commit || obj.kind == ObjectKind::Tag
-    } else if refname.starts_with("refs/issues/") || refname.starts_with("refs/prs/") {
+    } else if refname.starts_with("refs/issues/")
+        || refname.starts_with("refs/prs/")
+        || refname.starts_with("refs/incidents/")
+    {
         obj.kind == ObjectKind::Blob
     } else {
         // Other refs/ namespaces are server-controlled; require Commit
@@ -517,6 +521,19 @@ fn enforce_metadata_monotonic(
             let old_pr = crate::prs::decode(&old_obj.payload)
                 .map_err(|e| PolicyError::Internal(format!("decode old pr: {e}")))?;
             crate::prs::validate_extends(&old_pr, &new_pr)
+                .map_err(|e| PolicyError::Internal(e.to_string()))?;
+        }
+    } else if refname.starts_with("refs/incidents/") {
+        let new_inc = crate::incidents::decode(&new_obj.payload)
+            .map_err(|e| PolicyError::Internal(format!("decode new incident: {e}")))?;
+        if let Some(oid) = old_id {
+            let old_obj = match crate::object::store::read(gyt_dir, oid) {
+                Ok(o) => o,
+                Err(_) => return Ok(()),
+            };
+            let old_inc = crate::incidents::decode(&old_obj.payload)
+                .map_err(|e| PolicyError::Internal(format!("decode old incident: {e}")))?;
+            crate::incidents::validate_extends(&old_inc, &new_inc)
                 .map_err(|e| PolicyError::Internal(e.to_string()))?;
         }
     }

@@ -162,13 +162,14 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         });
     }
 
-    // Push metadata refs (issues, discussions, PRs) on every push.
-    // They live in dedicated namespaces and travel with the repository.
-    // We never "force" updates on these — the server should already be
-    // applying the same fast-forward gate, and a force here would silently
-    // discard concurrent comments. If someone explicitly passes --force,
-    // it propagates to the wire (?force=1 below), which we accept.
-    for prefix in &["refs/issues", "refs/prs"] {
+    // Push metadata refs (issues, discussions, PRs, incidents) on every
+    // push. They live in dedicated namespaces and travel with the
+    // repository. We never "force" updates on these — the server should
+    // already be applying the same fast-forward gate, and a force here
+    // would silently discard concurrent comments. If someone explicitly
+    // passes --force, it propagates to the wire (?force=1 below), which
+    // we accept.
+    for prefix in &["refs/issues", "refs/prs", "refs/incidents"] {
         let local_aux = match refs::list_refs(&repo.gyt_dir, prefix) {
             Ok(v) => v,
             Err(_) => continue,
