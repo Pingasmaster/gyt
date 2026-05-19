@@ -22,7 +22,7 @@ use crate::cmd::signing;
 use crate::errors::{GytError, Result};
 use crate::hash::ObjectId;
 use crate::object::commit;
-use ed25519_dalek::{Verifier, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -235,7 +235,13 @@ fn verify_commit_signed(
         .map_err(|_| PolicyError::BadSignature { commit: *id })?;
     let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
     for key in allowed {
-        if key.verify(&payload, &sig).is_ok() {
+        // B17: use verify_strict (not verify) to match the client-side
+        // hardening at signing.rs (M35 closed Ed25519 signature
+        // malleability there). The server enforcing sign_required must
+        // be at least as strict as the client verifier, otherwise an
+        // attacker could push a non-canonical (R, S) variant the server
+        // accepts but `gyt verify` later rejects on the same commit.
+        if key.verify_strict(&payload, &sig).is_ok() {
             return Ok(());
         }
     }

@@ -107,8 +107,12 @@ impl HttpClient {
             }
             (Scheme::Http, rest)
         } else {
+            // B19: never echo the raw URL in errors — it may carry a
+            // bearer token in the userinfo. Show only the prefix the
+            // scheme detector saw.
+            let safe = redact_url_userinfo(base_url);
             return Err(GytError::Net(format!(
-                "unsupported url scheme: {base_url:?}"
+                "unsupported url scheme: {safe:?}"
             )));
         };
 
@@ -118,7 +122,10 @@ impl HttpClient {
             None => (rest, "/"),
         };
         if authority.is_empty() {
-            return Err(GytError::Net(format!("missing host in url: {base_url:?}")));
+            // B19: redact userinfo from the error to avoid leaking a
+            // bearer token into logs / panics / telemetry.
+            let safe = redact_url_userinfo(base_url);
+            return Err(GytError::Net(format!("missing host in url: {safe:?}")));
         }
 
         // `user@host` syntax: treat the user portion as a bearer token.
@@ -370,19 +377,76 @@ impl HttpClient {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "ASCII '[' and ']' are at char boundaries by construction; the rsplit_once path operates on ASCII colon"
+)]
 fn parse_authority(authority: &str, scheme: Scheme) -> Result<(String, u16)> {
+    let default_port = match scheme {
+        Scheme::Https => 443,
+        Scheme::Http => 80,
+    };
+    // B20: handle bracketed IPv6 literals per RFC 3986 §3.2.2.
+    // `[::1]` (no port), `[::1]:443` (with port), and `[2001:db8::1]`
+    // all need the closing `]` located before splitting the port, or
+    // rsplit_once(':') splits inside the address.
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some(close) = rest.find(']') else {
+            return Err(GytError::Net(
+                "invalid IPv6 literal in authority: missing ']'".into(),
+            ));
+        };
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        if after.is_empty() {
+            return Ok((host.to_string(), default_port));
+        }
+        if let Some(port_s) = after.strip_prefix(':') {
+            let port: u16 = port_s.parse().map_err(|_| {
+                GytError::Net(format!("invalid port after IPv6 literal: {port_s:?}"))
+            })?;
+            return Ok((host.to_string(), port));
+        }
+        return Err(GytError::Net(format!(
+            "trailing junk after IPv6 literal: {after:?}"
+        )));
+    }
     if let Some((h, p)) = authority.rsplit_once(':') {
         let port: u16 = p
             .parse()
             .map_err(|_| GytError::Net(format!("invalid port in authority: {authority:?}")))?;
         Ok((h.to_string(), port))
     } else {
-        let port = match scheme {
-            Scheme::Https => 443,
-            Scheme::Http => 80,
-        };
-        Ok((authority.to_string(), port))
+        Ok((authority.to_string(), default_port))
     }
+}
+
+/// B19: strip the `userinfo@` portion of a URL so error messages built
+/// from raw input strings don't leak a bearer token. Only the userinfo
+/// segment is removed; everything else (scheme, host, port, path) is
+/// preserved verbatim so the operator can still debug the malformed URL.
+#[expect(
+    clippy::string_slice,
+    reason = "`at` is an ASCII '@' position found via rfind; the +1 offset lands on a char boundary"
+)]
+fn redact_url_userinfo(url: &str) -> String {
+    // Find the scheme separator first so we don't redact an `@` that
+    // appears in the path component.
+    let (prefix, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https://", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http://", r)
+    } else {
+        return url.to_string();
+    };
+    // Authority ends at the first `/`, `?`, `#`, or end of string.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (auth, tail) = rest.split_at(auth_end);
+    let Some(at) = auth.rfind('@') else {
+        return url.to_string();
+    };
+    let host = &auth[at + 1..];
+    format!("{prefix}<redacted>@{host}{tail}")
 }
 
 // ---------- response parsing ----------
@@ -560,6 +624,22 @@ fn chunked_decode<R: BufRead>(reader: &mut R) -> Result<Vec<u8>> {
         }
         let size = usize::from_str_radix(hex, 16)
             .map_err(|_| GytError::Net(format!("chunked: bad hex size: {hex:?}")))?;
+        // B21: cap per-chunk size AND cumulative-body size BEFORE
+        // allocating. Without this a malicious server could declare a
+        // chunk size of usize::MAX and force the client to attempt a
+        // multi-TB allocation, OR drip many small chunks summing past
+        // the body cap and rely on the post-loop check to fire only
+        // after the full buffer was already committed.
+        if size > MAX_RESPONSE_BODY_BYTES {
+            return Err(GytError::Net(format!(
+                "chunked: chunk size {size} exceeds body cap {MAX_RESPONSE_BODY_BYTES}"
+            )));
+        }
+        if out.len().saturating_add(size) > MAX_RESPONSE_BODY_BYTES {
+            return Err(GytError::Net(format!(
+                "chunked: cumulative body exceeds cap {MAX_RESPONSE_BODY_BYTES}"
+            )));
+        }
         if size == 0 {
             // Read trailers until empty line.
             loop {
@@ -713,5 +793,111 @@ mod tests {
         let mut cur = std::io::Cursor::new(input);
         let out = chunked_decode(&mut cur).unwrap();
         assert_eq!(out, b"abc");
+    }
+
+    // B21: a malicious server declaring a single chunk far larger than
+    // the body cap must be rejected before any allocation, not after the
+    // alloc completes. We use FFFFFFFFFFFFFFFF (usize::MAX on 64-bit)
+    // to make the bug observable as a hang/OOM if the cap is not
+    // pre-checked.
+    #[test]
+    fn chunked_decode_rejects_oversize_chunk_before_alloc() {
+        let input: &[u8] = b"FFFFFFFFFFFFFFFF\r\n";
+        let mut cur = std::io::Cursor::new(input);
+        let err = chunked_decode(&mut cur).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chunk size") && msg.contains("exceeds"),
+            "expected oversize-chunk error, got: {msg}"
+        );
+    }
+
+    // B21: many small chunks that together exceed the cap should also
+    // be rejected mid-stream, not buffered up.
+    #[test]
+    fn chunked_decode_rejects_cumulative_over_cap() {
+        // Build a stream that would, if accepted, fill past the cap.
+        // Use a chunk size just below the per-chunk cap so the
+        // per-chunk check passes; cumulative check must then trigger.
+        let big = MAX_RESPONSE_BODY_BYTES;
+        // First chunk fills the budget exactly; second chunk pushes us over.
+        let first_size = format!("{big:x}");
+        let mut input = first_size.into_bytes();
+        input.extend_from_slice(b"\r\n");
+        input.extend(std::iter::repeat_n(b'x', big));
+        input.extend_from_slice(b"\r\n");
+        // Tiny second chunk (must trigger the cumulative check).
+        input.extend_from_slice(b"1\r\ny\r\n0\r\n\r\n");
+        let mut cur = std::io::Cursor::new(input);
+        let err = chunked_decode(&mut cur).unwrap_err();
+        assert!(
+            err.to_string().contains("cumulative"),
+            "expected cumulative-cap error, got: {err}"
+        );
+    }
+
+    // B20: bracketed IPv6 authorities (with and without port) parse
+    // correctly without splitting inside the address.
+    #[test]
+    fn parse_authority_ipv6_no_port() {
+        let (h, p) = parse_authority("[::1]", Scheme::Https).unwrap();
+        assert_eq!(h, "::1");
+        assert_eq!(p, 443);
+        let (h, p) = parse_authority("[2001:db8::1]", Scheme::Http).unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 80);
+    }
+
+    #[test]
+    fn parse_authority_ipv6_with_port() {
+        let (h, p) = parse_authority("[::1]:8080", Scheme::Http).unwrap();
+        assert_eq!(h, "::1");
+        assert_eq!(p, 8080);
+    }
+
+    #[test]
+    fn parse_authority_ipv6_unclosed_rejected() {
+        assert!(parse_authority("[::1", Scheme::Http).is_err());
+    }
+
+    // B19: error messages built from a URL with `<token>@host` userinfo
+    // must NOT include the raw token; only the host portion may leak.
+    #[test]
+    fn missing_host_error_redacts_userinfo() {
+        let r = HttpClient::new("https://secret-token@/repo");
+        assert!(r.is_err(), "expected error for missing host");
+        let msg = format!("{}", r.err().unwrap());
+        assert!(
+            !msg.contains("secret-token"),
+            "URL token leaked into error: {msg}"
+        );
+        assert!(msg.contains("<redacted>"), "expected redaction marker: {msg}");
+    }
+
+    #[test]
+    fn redact_userinfo_helper_strips_token() {
+        assert_eq!(
+            redact_url_userinfo("https://tokenABC@host:8080/repo"),
+            "https://<redacted>@host:8080/repo"
+        );
+        assert_eq!(
+            redact_url_userinfo("http://tok@h/p?q=1"),
+            "http://<redacted>@h/p?q=1"
+        );
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_url_userinfo("https://host/p"),
+            "https://host/p"
+        );
+        // Non-http scheme → leave alone (caller's other guards apply).
+        assert_eq!(
+            redact_url_userinfo("ftp://x@h/p"),
+            "ftp://x@h/p"
+        );
+        // `@` in the path is NOT in the authority — keep it intact.
+        assert_eq!(
+            redact_url_userinfo("https://host/path/with@symbol"),
+            "https://host/path/with@symbol"
+        );
     }
 }
