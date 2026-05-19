@@ -545,6 +545,22 @@ pub fn validate_extends(old: &Issue, new: &Issue) -> Result<()> {
             )));
         }
     }
+    // B4: timestamps must be non-decreasing across the chain. Without
+    // this, a client can push events with `ts = 0` or with ts going
+    // backwards, and the renderer (which orders by file position, not
+    // timestamp) shows them in the wrong order. The check is non-strict
+    // — same-second events are legitimate (a script can `gyt issue
+    // comment` twice within the same wall-clock second).
+    for w in new.events.windows(2) {
+        if let [a, b] = w
+            && b.ts < a.ts
+        {
+            return Err(GytError::Refs(format!(
+                "issue event ts not monotonic: {} -> {}",
+                a.ts, b.ts
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -804,5 +820,66 @@ mod tests {
         let mut m = vec![12u64];
         merge_mentions(&mut m, &[42, 13, 12], 42);
         assert_eq!(m, vec![12, 13]); // 42 (self) dropped, 12 dedupes
+    }
+
+    // ── B4: ts monotonicity in validate_extends ──────────────────
+
+    #[test]
+    fn validate_extends_rejects_non_monotonic_appended_event() {
+        // Append an event whose ts is BEFORE the most-recent existing
+        // event's ts. The prefix-equality check still passes, but the
+        // monotonicity check must catch the inversion.
+        let old = fixture();
+        let mut new = old.clone();
+        new.events.push(Event {
+            kind: EventKind::Comment,
+            author: "Mallory <m@x>".into(),
+            ts: 100, // way before any prior event's ts
+            body: "ts forged backward".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+        });
+        let err = validate_extends(&old, &new).unwrap_err();
+        assert!(
+            matches!(&err, GytError::Refs(m) if m.contains("ts not monotonic")),
+            "expected Refs(ts not monotonic ...), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_extends_accepts_same_second_appended_event() {
+        // Same-second appends are legitimate; the check is non-strict.
+        let old = fixture();
+        let mut new = old.clone();
+        let last_ts = new.events.last().unwrap().ts;
+        new.events.push(Event {
+            kind: EventKind::Comment,
+            author: "Bob <b@x>".into(),
+            ts: last_ts, // identical ts
+            body: "same second is fine".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+        });
+        validate_extends(&old, &new).unwrap();
+    }
+
+    #[test]
+    fn validate_extends_rejects_zero_ts_after_real_event() {
+        // A `ts = 0` event after a real one is the simplest attack
+        // ("erase visible chronology"). Must be rejected.
+        let old = fixture();
+        let mut new = old.clone();
+        new.events.push(Event {
+            kind: EventKind::Comment,
+            author: "Mallory <m@x>".into(),
+            ts: 0,
+            body: "zeroed ts".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+        });
+        assert!(validate_extends(&old, &new).is_err());
     }
 }

@@ -466,6 +466,18 @@ pub fn validate_extends(old: &Pr, new: &Pr) -> Result<()> {
             )));
         }
     }
+    // B4: timestamps must be non-decreasing across the chain. See
+    // `issues::validate_extends` for the full rationale.
+    for w in new.events.windows(2) {
+        if let [a, b] = w
+            && b.ts < a.ts
+        {
+            return Err(GytError::Refs(format!(
+                "pr event ts not monotonic: {} -> {}",
+                a.ts, b.ts
+            )));
+        }
+    }
     // State transitions
     #[expect(
         clippy::unnested_or_patterns,
@@ -640,5 +652,54 @@ mod tests {
         assert_eq!(PrState::parse("closed").unwrap(), PrState::Closed);
         assert_eq!(PrState::parse("merged").unwrap(), PrState::Merged);
         assert!(PrState::parse("garbage").is_err());
+    }
+
+    // ── B4: ts monotonicity in validate_extends ──────────────────
+
+    #[test]
+    fn pr_validate_extends_rejects_non_monotonic_appended_event() {
+        // The fixture has a Merge event at the tail; appending after
+        // merged would already be rejected on the state-transition
+        // rule. Build a fresh "open" PR with two events and try to
+        // append an out-of-order event.
+        let mut old = fixture();
+        old.state = PrState::Open;
+        old.events.truncate(2); // drop the Merge tail
+        let mut new = old.clone();
+        new.events.push(PrEvent {
+            kind: PrEventKind::Comment,
+            author: "Mallory <m@x>".into(),
+            ts: 100, // before the prior event's ts
+            body: "ts forged".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+            result: String::new(),
+        });
+        let err = validate_extends(&old, &new).unwrap_err();
+        assert!(
+            matches!(&err, GytError::Refs(m) if m.contains("ts not monotonic")),
+            "expected Refs(ts not monotonic ...), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pr_validate_extends_accepts_monotonic_appended_event() {
+        let mut old = fixture();
+        old.state = PrState::Open;
+        old.events.truncate(2);
+        let mut new = old.clone();
+        let last_ts = new.events.last().unwrap().ts;
+        new.events.push(PrEvent {
+            kind: PrEventKind::Comment,
+            author: "Bob <b@x>".into(),
+            ts: last_ts + 10,
+            body: "later".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+            result: String::new(),
+        });
+        validate_extends(&old, &new).unwrap();
     }
 }

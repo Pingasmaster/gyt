@@ -610,6 +610,18 @@ pub fn validate_extends(old: &Incident, new: &Incident) -> Result<()> {
             )));
         }
     }
+    // B4: timestamps must be non-decreasing across the chain. See
+    // `issues::validate_extends` for the full rationale.
+    for w in new.events.windows(2) {
+        if let [a, b] = w
+            && b.ts < a.ts
+        {
+            return Err(GytError::Refs(format!(
+                "incident event ts not monotonic: {} -> {}",
+                a.ts, b.ts
+            )));
+        }
+    }
     if old.state != new.state && !is_allowed_transition(old.state, new.state) {
         return Err(GytError::Refs(format!(
             "incident rewind: invalid state transition {} -> {}",
@@ -829,5 +841,52 @@ mod tests {
         let bytes = encode(&inc);
         let back = decode(&bytes).unwrap();
         assert_eq!(back.fields.get("note").map(String::as_str), Some("has \"quoted\" text"));
+    }
+
+    // ── B4: ts monotonicity in validate_extends ──────────────────
+
+    #[test]
+    fn incident_validate_extends_rejects_non_monotonic_appended_event() {
+        let old = fixture();
+        let mut new = old.clone();
+        new.events.push(Event {
+            kind: EventKind::Comment,
+            author: "Mallory <m@x>".into(),
+            ts: 100, // earlier than every prior event
+            body: "ts forged".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+            new_state: String::new(),
+            new_severity: String::new(),
+            field_key: String::new(),
+            field_value: String::new(),
+        });
+        let err = validate_extends(&old, &new).unwrap_err();
+        assert!(
+            matches!(&err, GytError::Refs(m) if m.contains("ts not monotonic")),
+            "expected Refs(ts not monotonic ...), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn incident_validate_extends_accepts_same_second_appended_event() {
+        let old = fixture();
+        let mut new = old.clone();
+        let last_ts = new.events.last().unwrap().ts;
+        new.events.push(Event {
+            kind: EventKind::Comment,
+            author: "Bob <b@x>".into(),
+            ts: last_ts,
+            body: "same second".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+            new_state: String::new(),
+            new_severity: String::new(),
+            field_key: String::new(),
+            field_value: String::new(),
+        });
+        validate_extends(&old, &new).unwrap();
     }
 }
