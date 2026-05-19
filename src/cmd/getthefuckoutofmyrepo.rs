@@ -64,7 +64,18 @@ pub fn run(args: &[String]) -> Result<()> {
         if !abs.exists() {
             return Err(GytError::NotFound(format!("path {p} does not exist")));
         }
-        resolved.push(abs.canonicalize()?);
+        let canon = abs.canonicalize()?;
+        // M12: refuse paths that resolve outside the workdir. Without
+        // this, `gyt getthefuckoutofmyrepo ../../etc/somefile` after
+        // typing DESTROY twice would delete a file outside the repo.
+        let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        if !canon.starts_with(&cwd_canon) {
+            return Err(GytError::InvalidArgument(format!(
+                "path {p} resolves outside the repository ({}); refusing",
+                canon.display()
+            )));
+        }
+        resolved.push(canon);
     }
 
     let summary: Vec<String> = resolved
@@ -263,6 +274,10 @@ pub fn run(args: &[String]) -> Result<()> {
                 .map(|p| seen.get(p).copied().unwrap_or(*p))
                 .collect();
 
+            // M14: drop any existing signature — it was computed over
+            // the OLD payload, so it would deserialize as BAD on the
+            // new payload. Silently keeping it would mislead `verify`
+            // and `log --show-signature` consumers.
             let new_commit = Commit {
                 tree: new_tree,
                 parents: new_parents,
@@ -270,7 +285,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 committer: c.committer.clone(),
                 ai_assists: c.ai_assists.clone(),
                 reviewers: c.reviewers.clone(),
-                signature: c.signature.clone(),
+                signature: None,
                 message: c.message.clone(),
             };
 

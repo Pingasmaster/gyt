@@ -280,6 +280,19 @@ fn three_way_merge(
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
 
+        // M3: write MERGE_HEAD BEFORE we splatter workdir conflict
+        // markers. A crash after the markers but before MERGE_HEAD
+        // left the workdir dirty with no "merge in progress" marker —
+        // `gyt status` would report the repo clean. With this order,
+        // a crash after MERGE_HEAD-and-no-markers is observable as
+        // an in-progress merge; a crash before MERGE_HEAD leaves the
+        // workdir matching the pre-merge state (the index write at
+        // the top of this block doesn't touch the workdir).
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("MERGE_HEAD"),
+            format!("{}\n", theirs.to_hex()).as_bytes(),
+        )?;
+
         let content_set: std::collections::HashSet<&PathBuf> =
             conflicted_paths.iter().map(|(p, _)| p).collect();
 
@@ -312,12 +325,8 @@ fn three_way_merge(
             std::fs::write(&abs, bytes)?;
         }
 
-        // M2: atomic_write so a crash mid-write doesn't leave a torn
-        // MERGE_HEAD that breaks rebase-continue / merge-abort flows.
-        crate::fs_util::atomic_write(
-            &repo.gyt_dir.join("MERGE_HEAD"),
-            format!("{}\n", theirs.to_hex()).as_bytes(),
-        )?;
+        // (M2/M3: MERGE_HEAD already atomic_write'd above, BEFORE the
+        // workdir conflict markers.)
         std::fs::write(repo.gyt_dir.join("MERGE_MSG"), message.as_bytes())?;
         let conflict_list = tm
             .conflicts

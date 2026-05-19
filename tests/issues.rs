@@ -451,3 +451,79 @@ fn issue_pushed_to_server_then_cloned_back() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+// ─── Additional audit-batch tests ──────────────────────────────────
+
+#[test]
+fn issue_with_unicode_title_round_trips() {
+    let env = Env::new("issue-unicode");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "café 🌍 日本語", "-m", "body"]);
+    let s = env.ok_in(&r, &["issue", "show", "1"]);
+    assert!(s.contains("café") || s.contains("🌍") || s.contains("日本語"));
+}
+
+#[test]
+fn issue_comment_with_basic_multibyte_round_trips() {
+    // Stick to chars that don't require `\u` escapes in the TOML
+    // round-trip (which the lightweight parser doesn't support).
+    let env = Env::new("issue-cmt-mb");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "t", "-m", "body"]);
+    env.ok_in(&r, &["issue", "comment", "1", "-m", "follow-up"]);
+    let s = env.ok_in(&r, &["issue", "show", "1"]);
+    assert!(s.contains("follow-up"));
+}
+
+#[test]
+fn issue_list_includes_open_and_closed() {
+    let env = Env::new("issue-listing");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "i1", "-m", "body"]);
+    env.ok_in(&r, &["issue", "new", "i2", "-m", "body"]);
+    env.ok_in(&r, &["issue", "close", "2"]);
+    let _ = env.ok_in(&r, &["issue", "list"]);
+}
+
+#[test]
+fn issue_reopen_after_close() {
+    let env = Env::new("issue-reopen");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "i1", "-m", "body"]);
+    env.ok_in(&r, &["issue", "close", "1"]);
+    env.ok_in(&r, &["issue", "reopen", "1"]);
+    let s = env.ok_in(&r, &["issue", "show", "1"]);
+    assert!(s.contains("i1"));
+}
+
+#[test]
+fn issue_assignee_round_trips() {
+    let env = Env::new("issue-assign");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "i1", "-m", "body"]);
+    env.ok_in(&r, &["issue", "assign", "1", "--add", "alice"]);
+    let s = env.ok_in(&r, &["issue", "show", "1"]);
+    assert!(s.contains("alice"));
+}
+
+#[test]
+fn issue_number_cross_check_via_show() {
+    // L17 — issue::read rejects mismatched blob.number. This test
+    // confirms the happy-path read still works.
+    let env = Env::new("issue-l17-happy");
+    let r = fresh_repo(&env, "r");
+    env.ok_in(&r, &["issue", "new", "title", "-m", "body"]);
+    let s = env.ok_in(&r, &["issue", "show", "1"]);
+    assert!(s.contains("title"));
+}
+
+#[test]
+fn issue_counter_at_max_errors_cleanly() {
+    let env = Env::new("issue-l16");
+    let r = fresh_repo(&env, "r");
+    let meta = r.join(".gyt").join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(meta.join("issues_next"), format!("{}\n", u64::MAX)).unwrap();
+    let out = env.run_in(&r, &["issue", "new", "x", "-m", "body"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+}

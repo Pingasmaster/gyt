@@ -184,19 +184,30 @@ fn rename(repo: &Repo, old: &str, new: &str) -> Result<()> {
     if old == new {
         return Ok(());
     }
+    // M9: the caller (`run_in`) already holds the repo lock. We just
+    // need to journal the three writes (new ref, old delete, HEAD
+    // update) in a safe order so a mid-rename crash leaves a
+    // recoverable state. New order below.
     let old_ref = format!("refs/heads/{old}");
     let new_ref = format!("refs/heads/{new}");
     if refs::read_ref(&repo.gyt_dir, &new_ref).is_ok() {
         return Err(GytError::Refs(format!("branch {new} already exists")));
     }
     let id = refs::read_ref(&repo.gyt_dir, &old_ref)?;
+    // Ordering: HEAD-update first if it's the current branch, then
+    // new-ref-write, then old-ref-delete. If we crash between
+    // write_new and delete_old, both refs exist (recoverable). If
+    // we crash before HEAD-update, HEAD still references the old
+    // ref, which still exists (recoverable).
+    let head_points_at_old = match refs::read_head(&repo.gyt_dir)? {
+        Head::Symbolic(name) => name == old_ref,
+        Head::Detached(_) => false,
+    };
     refs::write_ref(&repo.gyt_dir, &new_ref, &id)?;
-    refs::delete_ref(&repo.gyt_dir, &old_ref)?;
-    if let Head::Symbolic(name) = refs::read_head(&repo.gyt_dir)?
-        && name == old_ref
-    {
+    if head_points_at_old {
         refs::write_head(&repo.gyt_dir, &Head::Symbolic(new_ref))?;
     }
+    refs::delete_ref(&repo.gyt_dir, &old_ref)?;
     Ok(())
 }
 

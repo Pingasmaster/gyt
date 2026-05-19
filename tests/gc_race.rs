@@ -388,3 +388,31 @@ fn concurrent_push_while_gc_runs_no_data_loss() {
     let _ = srv.kill();
     let _ = srv.wait();
 }
+
+// ─── Audit 2026-05 batch additions ─────────────────────────────────
+
+#[test]
+fn c1_index_blob_survives_gc_with_grace_zero() {
+    // Closes C1 regression: a `gyt add` blob with no commit must
+    // survive `gyt gc` even when the mtime grace is disabled.
+    let env = Env::new("c1-grace0");
+    let repo = env.path("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    env.ok_in(&repo, &["init"]);
+    std::fs::write(repo.join("seed.txt"), b"seed").unwrap();
+    env.ok_in(&repo, &["add", "seed.txt"]);
+    env.ok_in(&repo, &["commit", "-m", "seed"]);
+    // Stage a blob without committing.
+    std::fs::write(repo.join("staged.txt"), b"only-in-idx").unwrap();
+    env.ok_in(&repo, &["add", "staged.txt"]);
+    // Run gc with no grace — should still keep the staged blob.
+    let out = env.cmd_in(&repo)
+        .args(["gc"])
+        .env("GYT_GC_GRACE_SECS", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gc failed");
+    // We don't compute the blob hash here; just confirm the next
+    // commit succeeds (would fail if the blob were pruned).
+    env.ok_in(&repo, &["commit", "-m", "use staged"]);
+}

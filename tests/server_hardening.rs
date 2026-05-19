@@ -387,3 +387,20 @@ fn server_panic_payload_helper_returns_useful_string() {
     // green, which it is, indicating downcast_panic_payload compiles
     // and is exercised on every panic in production.
 }
+
+// ─── Audit 2026-05 batch additions ─────────────────────────────────
+
+#[test]
+fn rate_limiter_denies_after_capacity_exhausted() {
+    // H8 transitive: confirm the per-IP bucket actually denies once
+    // capacity is exhausted (cap=1, refill=0).
+    use gyt::net::rate_limit::{LimitConfig, RateLimiter};
+    use std::net::{IpAddr, Ipv4Addr};
+    let rl = RateLimiter::new(
+        LimitConfig { capacity: 1, refill_per_sec: 0 },
+        LimitConfig { capacity: 0, refill_per_sec: 0 },
+    );
+    let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+    assert!(rl.allow(Some(ip), None));
+    assert!(!rl.allow(Some(ip), None));
+}
