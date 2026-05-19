@@ -59,12 +59,31 @@ pub fn ensure_key() -> Result<[u8; 32]> {
 }
 
 /// Refuse to read a key whose file mode allows group or world access.
+///
+/// B23: also refuse symlinks. The previous `fs::metadata` followed
+/// links, so the mode check applied to the *target*, not the link.
+/// An attacker on a multi-tenant host can plant a 0600 file they own
+/// and symlink to it from the user's expected key path; gyt would
+/// happily encrypt the victim's secrets with the attacker's key.
+/// Switch to `symlink_metadata` and reject symlinks outright.
+///
+/// (An owner-uid check would also be nice, but the crate forbids
+/// `unsafe_code` and std doesn't expose `geteuid`. The symlink
+/// rejection closes the realistic attack — an attacker who can write
+/// a 0600 file at the user's actual key path already has the
+/// equivalent of full local access.)
 fn enforce_private_mode(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let md = std::fs::metadata(path)
+        let md = std::fs::symlink_metadata(path)
             .map_err(|e| GytError::Ci(format!("stat {}: {e}", path.display())))?;
+        if md.file_type().is_symlink() {
+            return Err(GytError::Ci(format!(
+                "CI key {} is a symlink (refusing to follow)",
+                path.display()
+            )));
+        }
         let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(GytError::Ci(format!(
@@ -165,7 +184,14 @@ pub fn run_set(args: &[String], gyt_dir: &Path) -> Result<()> {
         return Ok(());
     }
     let name = &args[0];
-    if name.contains('/') || name.contains('\\') || name.is_empty() {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
         return Err(GytError::InvalidArgument("invalid secret name".into()));
     }
     let key = ensure_key()?;

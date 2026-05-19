@@ -71,6 +71,22 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
                 "ref name contains backslash: {name:?}"
             )));
         }
+        // B24: reject git's revspec metacharacters (~ ^ ? * [ :). A
+        // refname containing any of these silently misparses through
+        // any future revspec implementation:
+        //   - `~` and `^` mean Nth parent (`branch^2`, `branch~1`)
+        //   - `?` `*` `[` are glob metacharacters (matched against
+        //     refs by `gyt branch --list pattern`)
+        //   - `:` is the source:dest separator in push refspecs AND
+        //     is an NTFS alternate-data-stream selector
+        // git's check-ref-format(1) forbids all six for the same
+        // reasons; gyt only inherits the closed-by-rejection list.
+        if matches!(b, b'~' | b'^' | b'?' | b'*' | b'[' | b':') {
+            return Err(GytError::Refs(format!(
+                "ref name contains revspec metacharacter {:?}: {name:?}",
+                b as char
+            )));
+        }
     }
     for comp in name.split('/') {
         if comp.is_empty() {
@@ -445,6 +461,35 @@ mod tests {
         assert!(validate_ref_name("refs/heads/x@{0}").is_err());
         // Sanity: a refname containing '@' but NOT '@{' is fine.
         assert!(validate_ref_name("refs/heads/alice@x").is_ok());
+    }
+
+    // ── B24: reject revspec metacharacters ────────────────────────
+    // `~ ^ ? * [ :` are all metacharacters in git's revspec / refspec
+    // grammar. Refnames containing them silently confuse any future
+    // revspec parser (`branch^2`, `branch~1`, glob matchers) and `:` is
+    // both the source:dest separator in push refspecs and an NTFS
+    // alternate-data-stream selector. Validator should reject up front.
+    #[test]
+    fn rejects_revspec_metacharacters_in_ref_name() {
+        for bad in [
+            "refs/heads/feature~1",
+            "refs/heads/feature^",
+            "refs/heads/main^2",
+            "refs/heads/glob?",
+            "refs/heads/glob*",
+            "refs/heads/glob[abc]",
+            "refs/heads/source:dest",
+            "refs/heads/dir/sub~name",
+        ] {
+            assert!(
+                validate_ref_name(bad).is_err(),
+                "expected reject for revspec-bearing refname {bad:?}"
+            );
+        }
+        // Sanity: refnames *without* those bytes still pass.
+        assert!(validate_ref_name("refs/heads/feature").is_ok());
+        assert!(validate_ref_name("refs/heads/alice-feature").is_ok());
+        assert!(validate_ref_name("refs/heads/v1.0").is_ok());
     }
 
     // ── B6: reject component starting with '-' ───────────────────

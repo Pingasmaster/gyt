@@ -4,9 +4,21 @@ use crate::object::{blob, tree};
 use crate::repo::Repo;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt grep <pattern> [<rev>]\n\n\
+         Search for a pattern in tracked files.\n\
+         If <rev> is given, search that commit tree; otherwise search working tree."
+    );
 }
 #[expect(
     clippy::indexing_slicing,
@@ -74,7 +86,15 @@ fn search_working_tree(repo: &Repo, pattern: &str) -> Result<()> {
         }
         let path_str = entry.path.to_string_lossy();
         for (line_num, line) in grep_lines(&content, pattern) {
-            println!("{path_str}:{line_num}:{line}");
+            // B22: blob content and on-disk paths can carry ANSI/CSI
+            // bytes. Sanitize before writing to the terminal so a
+            // hostile blob can't rewrite the operator's terminal
+            // title / set the clipboard via OSC 52.
+            println!(
+                "{}:{line_num}:{}",
+                crate::term::s(&path_str),
+                crate::term::s(line)
+            );
             found = true;
         }
     }
@@ -96,7 +116,12 @@ fn search_tree(repo: &Repo, tree_id: &ObjectId, pattern: &str) -> Result<()> {
             continue;
         }
         for (line_num, line) in grep_lines(&payload, pattern) {
-            println!("{path}:{line_num}:{line}");
+            // B22: same sanitization as the workdir search path.
+            println!(
+                "{}:{line_num}:{}",
+                crate::term::s(&path),
+                crate::term::s(line)
+            );
             found = true;
         }
     }

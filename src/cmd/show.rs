@@ -51,8 +51,14 @@ fn show(repo: &Repo, id: &ObjectId, show_sig: bool) -> Result<()> {
         ObjectKind::Tree => {
             let entries = tree::read(&repo.gyt_dir, id)?;
             for e in entries {
+                // B22: tree entry names are attacker-controlled bytes
+                // (a malicious push can set arbitrary names that
+                // survive the tree canonicality gate). Route through
+                // term::s so ANSI/CSI/OSC bytes don't reach the
+                // terminal. Every other field in this renderer already
+                // uses term::s; this was the lone hole.
                 let name = String::from_utf8_lossy(&e.name);
-                println!("{:06o} {}  {name}", e.mode, e.hash);
+                println!("{:06o} {}  {}", e.mode, e.hash, term::s(&name));
             }
         }
         ObjectKind::Commit => {

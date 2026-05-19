@@ -53,7 +53,16 @@ pub fn run(args: &[String]) -> Result<()> {
                     );
                     return Ok(());
                 }
-                "--" => after_dashes = true,
+                "--" => {
+                    // If a positional was already taken as the path, it
+                    // was actually the rev — paths come AFTER `--`.
+                    // Demote the prior positional to rev so subsequent
+                    // positionals fill the path slot.
+                    if rev.is_none() && path.is_some() {
+                        rev = path.take();
+                    }
+                    after_dashes = true;
+                }
                 other if !other.starts_with('-') => {
                     // First positional that's a path-existing file wins as
                     // <path>; an earlier positional becomes <rev>.
@@ -273,8 +282,15 @@ fn print_blame(lines: &[BlameLine]) {
     for (i, l) in lines.iter().enumerate() {
         let hex = l.commit.to_hex();
         let short = &hex[..hex.len().min(8)];
-        let author = truncate(&short_author(&l.author), 20);
-        let text = String::from_utf8_lossy(&l.line);
+        // B22: blame author and the blob line are both attacker-
+        // controlled. Without term::s a commit author / blob line
+        // containing OSC/CSI bytes rewrites the operator's terminal.
+        // Every other renderer in this codebase (show, log, reflog)
+        // already routes these through term::s; this was the hole.
+        let author_raw = truncate(&short_author(&l.author), 20);
+        let author = crate::term::s(&author_raw);
+        let text_raw = String::from_utf8_lossy(&l.line);
+        let text = crate::term::s(&text_raw);
         println!(
             "{short} ({author:<author_w$} {ts}) {n}: {text}",
             ts = l.timestamp,

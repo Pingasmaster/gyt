@@ -181,16 +181,26 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             &repo.gyt_dir.join("CHERRY_PICK_HEAD"),
             format!("{}\n", target_id.to_hex()).as_bytes(),
         )?;
-        std::fs::write(repo.gyt_dir.join("MERGE_MSG"), target_commit.message.as_bytes())?;
+        // B25: MERGE_MSG was written via std::fs::write (open with
+        // O_TRUNC then write), which is non-atomic. A crash mid-write
+        // leaves a torn/empty file that `gyt commit` (resumption) takes
+        // verbatim. Use atomic_write to match the CHERRY_PICK_HEAD
+        // write above and the same fix applied to merge.rs.
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("MERGE_MSG"),
+            target_commit.message.as_bytes(),
+        )?;
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
         for (path, bytes) in &conflict_blobs {
-            // H5: refuse if any ancestor is a symlink.
-            let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&abs, bytes)?;
+            // B26: safe_workdir_write removes the leaf if it is a
+            // symlink before writing, closing the case where a tracked
+            // file has been replaced in the workdir by a symlink to an
+            // outside file (e.g. ~/.ssh/authorized_keys). The previous
+            // `std::fs::write` on a path produced by `safe_workdir_path`
+            // (which only checks ancestors) would follow the leaf
+            // symlink and clobber the outside target.
+            crate::workdir::safe_workdir_write(&repo.workdir, path, bytes)?;
         }
         let conflict_list = tm
             .conflicts

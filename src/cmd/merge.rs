@@ -25,9 +25,21 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt merge [<rev>] [--ff-only] [--no-ff] [-m <msg>]\n\n\
+         Merge <rev> into HEAD. Without --ff-only, falls back to a real \
+         three-way merge when histories have diverged."
+    );
 }
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -297,13 +309,17 @@ fn three_way_merge(
             conflicted_paths.iter().map(|(p, _)| p).collect();
 
         for (path, render) in &conflicted_paths {
-            // H5: refuse if any ancestor is a symlink.
-            let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            // B26: safe_workdir_write handles parent + leaf-symlink
+            // removal in one shot. The prior code path-validated
+            // ancestors via safe_workdir_path but then used
+            // std::fs::write directly on the joined path, which
+            // follows the leaf symlink. A tracked file replaced in the
+            // workdir by `symlink foo -> /etc/passwd` would receive
+            // the conflict marker by way of /etc/passwd.
             match render {
-                ConflictRender::Content(bytes) => std::fs::write(&abs, bytes)?,
+                ConflictRender::Content(bytes) => {
+                    crate::workdir::safe_workdir_write(&repo.workdir, path, bytes)?;
+                }
             }
         }
         for c in &tm.conflicts {
@@ -317,17 +333,20 @@ fn three_way_merge(
             // on the other".
             let bytes =
                 render_tree_conflict_marker(repo, &c.path, c.kind, c.base, c.ours, c.theirs);
-            // H5: refuse if any ancestor is a symlink.
-            let abs = crate::workdir::safe_workdir_path(&repo.workdir, &c.path)?;
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&abs, bytes)?;
+            // B26: same fix — use safe_workdir_write rather than a raw
+            // std::fs::write on the join'd path.
+            crate::workdir::safe_workdir_write(&repo.workdir, &c.path, &bytes)?;
         }
 
-        // (M2/M3: MERGE_HEAD already atomic_write'd above, BEFORE the
-        // workdir conflict markers.)
-        std::fs::write(repo.gyt_dir.join("MERGE_MSG"), message.as_bytes())?;
+        // B25: MERGE_HEAD is atomic_write'd above (M2/M3). The prior
+        // std::fs::write of MERGE_MSG was the lone non-atomic
+        // companion write — a crash mid-write would leave a torn or
+        // empty MERGE_MSG, and `gyt commit` would record an empty
+        // merge message. Use atomic_write for symmetry.
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("MERGE_MSG"),
+            message.as_bytes(),
+        )?;
         let conflict_list = tm
             .conflicts
             .iter()
