@@ -331,6 +331,21 @@ pub fn evaluate_with_mode(
             blocked.push((u.name.clone(), e));
             continue;
         }
+        // B10: read the on-disk current value ONCE per update and use
+        // that as the "old" for both the metadata-monotonic gate AND
+        // the signature gate. Previously both paths trusted the
+        // client-supplied `u.old`. Two real attacks closed by this:
+        //   1. Under Mode::Force the FF gate is skipped, so the
+        //      client could pass `u.old == u.new`. `commits_new_since`
+        //      then seeded the excluded set with `new` itself, made
+        //      the new-commits list empty, and the signature loop
+        //      iterated nothing — every commit landed unsigned.
+        //   2. For metadata refs (refs/issues/*, refs/prs/*,
+        //      refs/incidents/*) the FF gate is bypassed entirely.
+        //      A client could pass a bogus `u.old` id; the read in
+        //      enforce_metadata_monotonic failed and returned Ok(()),
+        //      letting the pusher truncate the events array.
+        let cur_on_disk = read_ref(gyt_dir, &u.name).unwrap_or_default();
         // F-D8-01 / C3: issue/PR refs back blob objects (canonical
         // TOML), not commits. Skip the commit-DAG FF gate. Enforce
         // the monotonic-append invariant here: an rw client can
@@ -340,7 +355,7 @@ pub fn evaluate_with_mode(
             || u.name.starts_with("refs/prs/")
             || u.name.starts_with("refs/incidents/");
         if is_metadata_ref {
-            if let Err(e) = enforce_metadata_monotonic(gyt_dir, &u.name, u.old.as_ref(), &u.new) {
+            if let Err(e) = enforce_metadata_monotonic(gyt_dir, &u.name, cur_on_disk.as_ref(), &u.new) {
                 blocked.push((u.name.clone(), e));
             }
             continue;
@@ -350,11 +365,9 @@ pub fn evaluate_with_mode(
         let force = mode == Mode::Force;
         let with_lease = mode == Mode::ForceWithLease;
         if !force && let Some(old) = u.old {
-            // Resolve the current on-disk value of the ref; if it doesn't
-            // exist or doesn't match `old`, the client is racing — return a
-            // distinct error.
-            let cur = read_ref(gyt_dir, &u.name).unwrap_or_default();
-            match cur {
+            // Compare client-supplied old against the on-disk value; if
+            // it doesn't exist or doesn't match, the client is racing.
+            match cur_on_disk {
                 None => {
                     blocked.push((
                         u.name.clone(),
@@ -395,12 +408,15 @@ pub fn evaluate_with_mode(
         }
 
         // Signature check for new commits brought in by this update.
+        // B10: use the on-disk old, not u.old — under Mode::Force, a
+        // pusher claiming u.old == u.new would otherwise zero out the
+        // new-commit set and bypass the signature loop entirely.
         if sign_required {
             if allowed_signers.is_empty() {
                 blocked.push((u.name.clone(), PolicyError::MissingAllowedSigners));
                 continue;
             }
-            let new_commits = match commits_new_since(gyt_dir, u.old.as_ref(), &u.new) {
+            let new_commits = match commits_new_since(gyt_dir, cur_on_disk.as_ref(), &u.new) {
                 Ok(c) => c,
                 Err(e) => {
                     blocked.push((u.name.clone(), PolicyError::Internal(e.to_string())));
@@ -497,14 +513,22 @@ fn enforce_metadata_monotonic(
             )));
         }
     };
+    // B10: `old_id` is now the on-disk current ref id (read by the
+    // caller via read_ref), not a client-supplied value. If the blob
+    // it names cannot be read, the object store is internally
+    // inconsistent — refuse the push rather than fall through to
+    // create-mode (which would let the new blob land without any
+    // extension check, indistinguishable from genuine first-write).
     if refname.starts_with("refs/issues/") {
         let new_iss = crate::issues::decode(&new_obj.payload)
             .map_err(|e| PolicyError::Internal(format!("decode new issue: {e}")))?;
         if let Some(oid) = old_id {
-            let old_obj = match crate::object::store::read(gyt_dir, oid) {
-                Ok(o) => o,
-                Err(_) => return Ok(()),  // old ref vanished between reads; create-mode.
-            };
+            let old_obj = crate::object::store::read(gyt_dir, oid).map_err(|e| {
+                PolicyError::Internal(format!(
+                    "on-disk old metadata blob {} unreadable: {e}",
+                    oid.to_hex()
+                ))
+            })?;
             let old_iss = crate::issues::decode(&old_obj.payload)
                 .map_err(|e| PolicyError::Internal(format!("decode old issue: {e}")))?;
             crate::issues::validate_extends(&old_iss, &new_iss)
@@ -514,10 +538,12 @@ fn enforce_metadata_monotonic(
         let new_pr = crate::prs::decode(&new_obj.payload)
             .map_err(|e| PolicyError::Internal(format!("decode new pr: {e}")))?;
         if let Some(oid) = old_id {
-            let old_obj = match crate::object::store::read(gyt_dir, oid) {
-                Ok(o) => o,
-                Err(_) => return Ok(()),
-            };
+            let old_obj = crate::object::store::read(gyt_dir, oid).map_err(|e| {
+                PolicyError::Internal(format!(
+                    "on-disk old metadata blob {} unreadable: {e}",
+                    oid.to_hex()
+                ))
+            })?;
             let old_pr = crate::prs::decode(&old_obj.payload)
                 .map_err(|e| PolicyError::Internal(format!("decode old pr: {e}")))?;
             crate::prs::validate_extends(&old_pr, &new_pr)
@@ -527,10 +553,12 @@ fn enforce_metadata_monotonic(
         let new_inc = crate::incidents::decode(&new_obj.payload)
             .map_err(|e| PolicyError::Internal(format!("decode new incident: {e}")))?;
         if let Some(oid) = old_id {
-            let old_obj = match crate::object::store::read(gyt_dir, oid) {
-                Ok(o) => o,
-                Err(_) => return Ok(()),
-            };
+            let old_obj = crate::object::store::read(gyt_dir, oid).map_err(|e| {
+                PolicyError::Internal(format!(
+                    "on-disk old metadata blob {} unreadable: {e}",
+                    oid.to_hex()
+                ))
+            })?;
             let old_inc = crate::incidents::decode(&old_obj.payload)
                 .map_err(|e| PolicyError::Internal(format!("decode old incident: {e}")))?;
             crate::incidents::validate_extends(&old_inc, &new_inc)
@@ -1008,6 +1036,116 @@ mod tests {
             e.blocked[0].1,
             PolicyError::MissingAllowedSigners
         ));
+    }
+
+    /// B10 regression: under Mode::Force the signature gate must use
+    /// the on-disk current ref, not the client-supplied `u.old`. If
+    /// it trusted `u.old`, a pusher could set `u.old == u.new` to
+    /// make `commits_new_since` return an empty list, and every
+    /// commit in the force-push would land unsigned despite
+    /// `sign_required = true`.
+    #[test]
+    fn evaluate_force_mode_signature_uses_on_disk_old_not_client_old() {
+        let r = TestRepo::new("gyt-policy-force-sig-bypass");
+        let repo = r.open();
+        // Establish an existing ref on disk pointing at `a`.
+        let a = make_commit(&repo, vec![], "a");
+        let b = make_commit(&repo, vec![a], "b"); // unsigned descendant
+        std::fs::create_dir_all(repo.gyt_dir.join("refs/heads")).unwrap();
+        std::fs::write(
+            repo.gyt_dir.join("refs/heads/main"),
+            format!("{}\n", a.to_hex()),
+        )
+        .unwrap();
+        // Need a non-empty allowed-signers set so we distinguish a
+        // bypass (PASS, len=0) from MissingAllowedSigners.
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let keys = vec![sk.verifying_key()];
+        // Attacker claims old=new=b. Under the previous logic, that
+        // would make excluded={b,…parents…} and new_commits=[], so the
+        // signature loop ran on nothing and accepted the push. Now we
+        // use the on-disk cur (=a) as the basis, so new_commits=[b]
+        // and the unsigned-commit gate fires.
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: Some(b),
+            new: b,
+            name: "refs/heads/main".into(),
+        }];
+        let e = evaluate_with_mode(&repo.gyt_dir, &upd, Mode::Force, true, &keys);
+        assert!(!e.is_clean(), "Force-mode signature bypass: blocked={:?}", e.blocked);
+        assert!(
+            matches!(e.blocked[0].1, PolicyError::UnsignedCommit { .. }),
+            "expected UnsignedCommit, got {:?}",
+            e.blocked[0].1
+        );
+    }
+
+    /// B10 regression: enforce_metadata_monotonic now uses the on-disk
+    /// current ref as `old`, not the client-supplied `u.old`. Without
+    /// this, an rw client could provide a bogus old_id whose read
+    /// failed, causing the previous code to return Ok(()) and let an
+    /// arbitrary new blob bypass `validate_extends` (e.g. truncating
+    /// the events array).
+    #[test]
+    fn evaluate_metadata_uses_on_disk_old_not_client_old() {
+        use crate::issues::{Event, EventKind, Issue, IssueKind, IssueState};
+        let r = TestRepo::new("gyt-policy-meta-bypass");
+        let repo = r.open();
+        let mut iss = Issue {
+            number: 1,
+            kind: IssueKind::Issue,
+            title: "x".into(),
+            state: IssueState::Open,
+            author: "a".into(),
+            created_ts: 1,
+            labels: vec![],
+            assignees: vec![],
+            mentions: vec![],
+            events: vec![Event {
+                kind: EventKind::Comment,
+                author: "a".into(),
+                ts: 1,
+                body: "c1".into(),
+                add: vec![],
+                remove: vec![],
+                reason: String::new(),
+            }],
+        };
+        let old_bytes = crate::issues::encode(&iss);
+        let old_blob = crate::object::blob::write(&repo.gyt_dir, &old_bytes).unwrap();
+        std::fs::create_dir_all(repo.gyt_dir.join("refs/issues")).unwrap();
+        std::fs::write(
+            repo.gyt_dir.join("refs/issues/1"),
+            format!("{}\n", old_blob.to_hex()),
+        )
+        .unwrap();
+        // Attacker prepares a NEW blob that truncates the events array
+        // — would never pass validate_extends against the real old.
+        iss.events.clear();
+        iss.events.push(Event {
+            kind: EventKind::Comment,
+            author: "a".into(),
+            ts: 2,
+            body: "evil-overwrite".into(),
+            add: vec![],
+            remove: vec![],
+            reason: String::new(),
+        });
+        let new_bytes = crate::issues::encode(&iss);
+        let new_blob = crate::object::blob::write(&repo.gyt_dir, &new_bytes).unwrap();
+        // Pusher lies about old_id (a never-uploaded hash).
+        let bogus_old = ObjectId([0xaa; 32]);
+        let upd = vec![crate::net::protocol::RefUpdate {
+            old: Some(bogus_old),
+            new: new_blob,
+            name: "refs/issues/1".into(),
+        }];
+        let e = evaluate(&repo.gyt_dir, &upd, false, false, &[]);
+        assert!(
+            !e.is_clean(),
+            "metadata-monotonic bypass: bogus old_id should have been rejected; got: {:?}",
+            e.blocked
+        );
     }
 
     #[test]
