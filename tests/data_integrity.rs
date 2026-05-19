@@ -169,59 +169,82 @@ impl Env {
     }
 
     fn start_server(&mut self, extra_args: &[&str]) -> (String, PathBuf) {
-        let port = pick_port();
         let repos = self.path("server_repos");
         std::fs::create_dir_all(&repos).unwrap();
         let webroot = self.path("empty_webroot");
         std::fs::create_dir_all(&webroot).unwrap();
-        let mut c = self.cmd_in(&self.dir);
-        c.args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--repos",
-            &repos.to_string_lossy(),
-            "--webroot",
-            &webroot.to_string_lossy(),
-        ])
-        .args(extra_args)
-        // Burst-tests drive hundreds of requests from 127.0.0.1; the
-        // production rate-limit defaults (60 req/IP, 10 rps refill)
-        // would throttle them and produce 429s the test code reads
-        // as "push failed". Disable both buckets for tests.
-        .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
-        .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
-        .env("GYT_SERVE_CACHE_TTL_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        let url = format!("http://127.0.0.1:{port}/");
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            if let Ok(Some(status)) = child.try_wait() {
-                let mut buf = String::new();
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut buf);
+        // B33: harness fix — retry the (pick_port + spawn + wait-for-
+        // ready) sequence on bind collisions. The previous code did
+        // pick_port once and panicked if the child exited early; under
+        // --test-threads=16 the ephemeral port pick_port returned can
+        // already be in use by the next test by the time the child
+        // tries to bind it. Three attempts is enough to make the race
+        // statistically irrelevant; each attempt uses a fresh port.
+        for attempt in 0..3 {
+            let port = pick_port();
+            let mut c = self.cmd_in(&self.dir);
+            c.args([
+                "serve",
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--repos",
+                &repos.to_string_lossy(),
+                "--webroot",
+                &webroot.to_string_lossy(),
+            ])
+            .args(extra_args)
+            // Burst-tests drive hundreds of requests from 127.0.0.1; the
+            // production rate-limit defaults (60 req/IP, 10 rps refill)
+            // would throttle them and produce 429s the test code reads
+            // as "push failed". Disable both buckets for tests.
+            .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
+            .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
+            .env("GYT_SERVE_CACHE_TTL_MS", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+            let mut child = c.spawn().unwrap();
+            let url = format!("http://127.0.0.1:{port}/");
+            let start = Instant::now();
+            let mut early_exit_reason: Option<String> = None;
+            while start.elapsed() < Duration::from_secs(5) {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    let mut buf = String::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        let _ = s.read_to_string(&mut buf);
+                    }
+                    early_exit_reason = Some(buf);
+                    break;
                 }
-                panic!("server exited early ({status}): {buf}");
+                if std::net::TcpStream::connect_timeout(
+                    &format!("127.0.0.1:{port}").parse().unwrap(),
+                    Duration::from_millis(100),
+                )
+                .is_ok()
+                {
+                    self.server = Some((child, port, repos.clone()));
+                    return (url, repos);
+                }
+                std::thread::sleep(Duration::from_millis(40));
             }
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().unwrap(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                self.server = Some((child, port, repos.clone()));
-                return (url, repos);
+            if let Some(reason) = early_exit_reason {
+                // Bind collision is the recoverable case; everything
+                // else is a real failure on this attempt and we still
+                // try again in case the next port works.
+                if attempt < 2 {
+                    let _ = child.kill();
+                    continue;
+                }
+                panic!(
+                    "server failed to start after {} attempts: stderr={reason}",
+                    attempt + 1
+                );
             }
-            std::thread::sleep(Duration::from_millis(40));
+            let _ = child.kill();
+            if attempt < 2 {
+                continue;
+            }
         }
-        let mut buf = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut buf);
-        }
-        let _ = child.kill();
-        panic!("server didn't start within 5s: stderr={buf}");
+        panic!("server didn't start within 5s after 3 retries");
     }
 }
 
