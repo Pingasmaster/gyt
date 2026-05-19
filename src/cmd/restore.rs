@@ -5,10 +5,23 @@ use crate::repo::Repo;
 use std::path::PathBuf;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     repo.require_worktree()?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!("gyt restore [--staged] [--worktree] [--source=<rev>] <path>...");
+    println!("  --staged       restore from --source (or HEAD) to the index (unstages)");
+    println!("  --worktree     restore from --source (or the index) to the working tree (default)");
+    println!("  --source <rev> pull blobs from <rev>'s tree instead of HEAD/index");
+    println!("  If neither --staged nor --worktree is given, --worktree is implied.");
+    println!("  If both are given, both operations are performed.");
 }
 
 #[expect(
@@ -79,6 +92,11 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         ));
     }
 
+    // B12: take the repo lock for the entire index RMW. Without it,
+    // two concurrent `gyt restore` calls (or restore racing with add
+    // or rm) can lose mutations the same way `gyt add` did before
+    // its lock was added.
+    let _lock = repo.lock()?;
     let mut idx = Index::read(&repo.index_path())?;
 
     // If --source <rev> is given, resolve its tree once and use it as the

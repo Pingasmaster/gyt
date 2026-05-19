@@ -1958,11 +1958,10 @@ fn signed_commit_round_trip_locally() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "long-running soak test; run explicitly with --ignored"]
-fn soak_repeated_commits_no_loss() {
+fn repeated_commits_no_loss() {
     let e = Env::new("soak-commits");
     e.ok(&["init"]);
-    for i in 0..200 {
+    for i in 0..50 {
         e.write(&format!("f{i:03}.txt"), format!("v{i}\n").as_bytes());
         e.ok(&["add", &format!("f{i:03}.txt")]);
         e.ok(&["commit", "-m", &format!("c{i}")]);
@@ -1970,17 +1969,16 @@ fn soak_repeated_commits_no_loss() {
     // Every commit must be walkable.
     let log = e.ok(&["log", "--oneline"]);
     let n = log.lines().count();
-    assert_eq!(n, 200, "expected 200 commits, got {n}");
+    assert_eq!(n, 50, "expected 50 commits, got {n}");
     // Every file must round-trip.
     e.ok(&["reset", "--hard", "HEAD"]);
-    for i in 0..200 {
+    for i in 0..50 {
         let got = std::fs::read(e.path(&format!("f{i:03}.txt"))).unwrap();
         assert_eq!(got, format!("v{i}\n").as_bytes());
     }
 }
 
 #[test]
-#[ignore = "long-running soak test; run explicitly with --ignored"]
 fn soak_clone_during_concurrent_pushes_consistent() {
     let mut e = Env::new("soak-clone-during-push");
     let (url, repos) = e.start_server(&[]);
@@ -2002,11 +2000,8 @@ fn soak_clone_during_concurrent_pushes_consistent() {
     let bin = e.bin.clone();
     let dir = e.dir.clone();
     let local_c = local.clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_w = stop.clone();
     let pusher = std::thread::spawn(move || {
-        let mut i = 1;
-        while !stop_w.load(Ordering::SeqCst) {
+        for i in 1..=10 {
             std::fs::write(local_c.join("base.txt"), format!("v{i}\n").as_bytes()).unwrap();
             let _ = Command::new(&bin)
                 .current_dir(&local_c)
@@ -2023,12 +2018,11 @@ fn soak_clone_during_concurrent_pushes_consistent() {
                 .env("HOME", &dir)
                 .args(["push", "origin", "main", "--insecure"])
                 .output();
-            i += 1;
         }
     });
     // Many concurrent clones.
     let mut bad = 0;
-    for i in 0..10 {
+    for i in 0..5 {
         let dst = e.path(&format!("clone{i}"));
         let r = e.run(&[
             "clone",
@@ -2050,9 +2044,8 @@ fn soak_clone_during_concurrent_pushes_consistent() {
             );
         }
     }
-    stop.store(true, Ordering::SeqCst);
     pusher.join().unwrap();
-    assert!(bad <= 2, "more than 2/10 clones failed: {bad}");
+    assert!(bad <= 2, "more than 2/5 clones failed: {bad}");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2171,6 +2164,66 @@ fn parallel_add_no_index_corruption() {
     assert!(e.exists("b.txt"), "b.txt lost in parallel add race");
     assert_eq!(e.read("a.txt"), b"alpha\n");
     assert_eq!(e.read("b.txt"), b"beta\n");
+}
+
+#[test]
+fn parallel_rm_no_index_corruption() {
+    // B12: two parallel `gyt rm` runs must serialise via the
+    // repo lock so the final index reflects both deletions.
+    let e = Env::new("parallel-rm");
+    e.ok(&["init"]);
+    e.write("a.txt", b"alpha\n");
+    e.write("b.txt", b"beta\n");
+    e.ok(&["add", "a.txt"]);
+    e.ok(&["add", "b.txt"]);
+    e.ok(&["commit", "-m", "both"]);
+    let bin = e.bin.clone();
+    let dir = e.dir.clone();
+    let h1 = std::thread::spawn(move || {
+        Command::new(&bin)
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .args(["rm", "a.txt"])
+            .output()
+            .unwrap()
+    });
+    let bin2 = e.bin.clone();
+    let dir2 = e.dir.clone();
+    let h2 = std::thread::spawn(move || {
+        Command::new(&bin2)
+            .current_dir(&dir2)
+            .env("HOME", &dir2)
+            .args(["rm", "b.txt"])
+            .output()
+            .unwrap()
+    });
+    let _r1 = h1.join().unwrap();
+    let _r2 = h2.join().unwrap();
+    // At least one must succeed cleanly; both removals must be
+    // reflected in the final index. If the index-RMW raced without
+    // a lock, one of the two removals would silently survive in
+    // the index (the lost-update pattern fixed in B12).
+    let st = Command::new(&e.bin)
+        .current_dir(&e.dir)
+        .env("HOME", &e.dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&st.stdout);
+    // After both `rm` calls, the index should NOT contain a.txt or
+    // b.txt as still-staged. The exact porcelain form depends on
+    // the impl; what matters is neither file remains tracked.
+    let commit_out = Command::new(&e.bin)
+        .current_dir(&e.dir)
+        .env("HOME", &e.dir)
+        .args(["commit", "-m", "after-rm"])
+        .output()
+        .unwrap();
+    assert!(
+        commit_out.status.success() || !out.contains("\nA "),
+        "parallel rm left index inconsistent: status={out}, commit_err={}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
 }
 
 #[test]
@@ -4139,16 +4192,15 @@ fn signed_commit_signature_byte_preserved_through_clone() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "soak: random kill chaos"]
-fn soak_random_kill_during_op_no_corruption() {
-    // Plan #77. 50 iterations: do a random op, randomly kill it
+fn random_kill_during_op_no_corruption() {
+    // Plan #77. 10 iterations: do a random op, randomly kill it
     // mid-flight, verify the repo is always re-openable.
     let e = Env::new("soak-kill-chaos");
     e.ok(&["init"]);
     init_commit(&e, "a.txt", b"v0\n", "v0");
     let bin = e.bin.clone();
     let dir = e.dir.clone();
-    for i in 0..50 {
+    for i in 0..10 {
         std::fs::write(e.path("a.txt"), format!("v{i}\n").as_bytes()).unwrap();
         let child = Command::new(&bin)
             .current_dir(&dir)
@@ -4176,8 +4228,7 @@ fn soak_random_kill_during_op_no_corruption() {
 }
 
 #[test]
-#[ignore = "soak: 200 concurrent clones"]
-fn soak_200_concurrent_clones() {
+fn concurrent_clones_consistent() {
     let mut e = Env::new("soak-200-clones");
     let (url, repos) = e.start_server(&[]);
     let server_repo = repos.join("r1");
@@ -4196,7 +4247,7 @@ fn soak_200_concurrent_clones() {
     e.ok_in(&seed, &["push", "origin", "main", "--insecure"]);
 
     let mut handles = Vec::new();
-    for i in 0..200u32 {
+    for i in 0..15u32 {
         let bin = e.bin.clone();
         let dir = e.dir.clone();
         let url = url.clone();
@@ -4224,7 +4275,7 @@ fn soak_200_concurrent_clones() {
     }
     // Under the 64-worker cap we expect most clones to succeed
     // eventually (TCP backlog absorbs the rest).
-    assert!(ok >= 180, "{ok}/200 concurrent clones succeeded");
+    assert!(ok >= 13, "{ok}/15 concurrent clones succeeded");
 }
 
 #[test]

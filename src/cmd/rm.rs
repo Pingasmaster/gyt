@@ -5,9 +5,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt rm [-f|--force] <path>...\n\n\
+         Remove files from the index and working tree. Use `.` to remove all staged files."
+    );
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -40,6 +51,12 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         ));
     }
 
+    // B12: take the repo lock for the entire index RMW. Without it,
+    // two concurrent `gyt rm` calls (or `rm` racing with `add`) can
+    // each read a snapshot of the index, mutate, and write — losing
+    // the other side's mutations. This mirrors the fix `gyt add`
+    // received in `parallel_add_no_index_corruption`.
+    let _lock = repo.lock()?;
     let mut index = Index::read(&repo.index_path())?;
     let mut removed: Vec<PathBuf> = Vec::new();
     // M6: collect planned workdir unlinks; perform them AFTER the
