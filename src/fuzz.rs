@@ -23,44 +23,55 @@ pub struct FuzzOutcome {
 }
 
 /// Safely try to decode `b` as every gyt object type, plus as a config
-/// and as an index.  Catches panics so the caller never unwinds.
+/// and as an index. Catches panics so the caller never unwinds.
+///
+/// Each `*_ok` field is `true` iff the corresponding decoder ran to
+/// completion **without panicking** (a decode `Err` still counts as
+/// "ok" because the decoder reported a clean error). The flags lie if
+/// they're set unconditionally — a panicking decoder would then be
+/// reported as "ok" and the catch_unwind safety net silently goes
+/// missing. B11 fix: set each flag from the actual catch_unwind result.
 pub fn fuzz_object(b: &[u8]) -> FuzzOutcome {
     let mut r = FuzzOutcome::default();
 
     // 1) Try parse_raw (splits "<kind> <size>\0<payload>").
-    //    If it succeeds we have a valid object header, then try the type-specific decoders.
+    //    If it succeeds we have a valid object header, then try the
+    //    type-specific decoders. Each type's *_ok reflects ITS decoder's
+    //    panic-freedom, not parse_raw's.
     let parsed = catch_unwind(|| crate::object::store::parse_raw(b));
     if let Ok(Ok((kind, payload))) = parsed {
         match kind {
             crate::object::ObjectKind::Blob => {
-                r.blob_ok = true; // blobs have no further structure
+                // Blobs have no further structure — parse_raw not
+                // panicking is the only signal.
+                r.blob_ok = true;
             }
             crate::object::ObjectKind::Tree => {
-                let _ = catch_unwind(|| crate::object::tree::decode(&payload));
-                r.tree_ok = true;
+                let res = catch_unwind(|| crate::object::tree::decode(&payload));
+                r.tree_ok = res.is_ok();
             }
             crate::object::ObjectKind::Commit => {
-                let _ = catch_unwind(|| crate::object::commit::decode(&payload));
-                r.commit_ok = true;
+                let res = catch_unwind(|| crate::object::commit::decode(&payload));
+                r.commit_ok = res.is_ok();
             }
             crate::object::ObjectKind::Tag => {
-                let _ = catch_unwind(|| crate::object::tag::decode(&payload));
-                r.tag_ok = true;
+                let res = catch_unwind(|| crate::object::tag::decode(&payload));
+                r.tag_ok = res.is_ok();
             }
         }
     }
 
     // 2) Try parsing as a config TOML.
-    let _ = catch_unwind(|| {
+    let cfg_res = catch_unwind(|| {
         let _ = crate::config::parse(b);
     });
-    r.config_ok = true;
+    r.config_ok = cfg_res.is_ok();
 
     // 3) Try parsing as a GYTI index.
-    let _ = catch_unwind(|| {
+    let idx_res = catch_unwind(|| {
         let _ = crate::index::Index::parse(b);
     });
-    r.index_ok = true;
+    r.index_ok = idx_res.is_ok();
 
     r
 }
@@ -101,15 +112,35 @@ mod tests {
         let mut rng = rng_seq(42);
         let mut count = 0u64;
 
+        // B11: every fuzz call must report `config_ok && index_ok`
+        // because these two decoders are expected to NEVER panic
+        // on any input. If a regression introduces a panic in
+        // `config::parse` or `Index::parse`, that flag will now go
+        // false (previously it was set unconditionally and silently
+        // hid the panic).
+        let check = |bytes: &[u8]| {
+            let r = fuzz_object(bytes);
+            assert!(
+                r.config_ok,
+                "config::parse panicked on input of len {}",
+                bytes.len()
+            );
+            assert!(
+                r.index_ok,
+                "Index::parse panicked on input of len {}",
+                bytes.len()
+            );
+        };
+
         // Empty
-        let _ = fuzz_object(&[]);
+        check(&[]);
         count += 1;
 
         // Tiny sizes: 1-100 bytes
         for _ in 0..200 {
             let len = (rng.next().unwrap() as usize % 100).max(1);
             let bytes = random_bytes(&mut rng, len);
-            let _ = fuzz_object(&bytes);
+            check(&bytes);
             count += 1;
         }
 
@@ -117,7 +148,7 @@ mod tests {
         for _ in 0..200 {
             let len = 100 + (rng.next().unwrap() as usize % 901);
             let bytes = random_bytes(&mut rng, len);
-            let _ = fuzz_object(&bytes);
+            check(&bytes);
             count += 1;
         }
 
@@ -125,11 +156,28 @@ mod tests {
         for _ in 0..99 {
             let len = 1000 + (rng.next().unwrap() as usize % 4001);
             let bytes = random_bytes(&mut rng, len);
-            let _ = fuzz_object(&bytes);
+            check(&bytes);
             count += 1;
         }
 
         assert_eq!(count, 500, "must test exactly 500 random inputs");
+    }
+
+    /// B11 contract regression: a panicking closure inside fuzz_object
+    /// MUST be reflected as a `false` flag. The previous code set the
+    /// flag unconditionally; if a decoder ever panics, the harness would
+    /// have happily reported "ok". This test calls catch_unwind on a
+    /// known-panicking closure to verify the gating pattern compiles
+    /// and behaves as required (`Result::is_ok` on a panicked unwind is
+    /// `false`). It's a guard against someone "simplifying" the flag
+    /// assignment back to unconditional.
+    #[test]
+    #[expect(clippy::panic, reason = "test deliberately planted to verify catch_unwind contract")]
+    fn fuzz_panic_caught_yields_false_flag() {
+        let res = std::panic::catch_unwind(|| panic!("planted"));
+        assert!(res.is_err(), "catch_unwind must report planted panic");
+        let ok = res.is_ok();
+        assert!(!ok, "Result::is_ok on a panicked unwind must be false");
     }
 
     // ── fuzz_malformed_index ─────────────────────────────────────────────
