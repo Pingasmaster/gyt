@@ -222,6 +222,7 @@ pub fn is_user_visible_ref(name: &str) -> bool {
         || name.starts_with("refs/tags/")
         || name.starts_with("refs/issues/")
         || name.starts_with("refs/prs/")
+        || name.starts_with("refs/incidents/")
 }
 
 fn pick_head(server_refs: &[RefEntry]) -> Option<String> {

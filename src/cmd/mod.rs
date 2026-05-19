@@ -14,6 +14,7 @@ pub mod fetch;
 pub mod gc;
 pub mod getthefuckoutofmyrepo;
 pub mod grep_cmd;
+pub mod incident;
 pub mod init;
 pub mod issue;
 pub mod pr;
