@@ -30,9 +30,17 @@ use std::path::{Path, PathBuf};
 const ANCESTRY_LOOKBACK: usize = 64;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!("gyt cherry-pick <commit>");
 }
 #[expect(
     clippy::string_slice,
@@ -161,6 +169,19 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     });
 
     if !tm.conflicts.is_empty() {
+        // B13: write CHERRY_PICK_HEAD + MERGE_MSG BEFORE we splatter
+        // conflict markers across the workdir. Mirrors M3 in
+        // cmd/merge.rs — a crash after the markers but before the
+        // state files would leave a dirty workdir with no in-progress
+        // marker, so `gyt status` reports a clean cherry-pick state
+        // while the workdir is half-merged. With this ordering a
+        // crash before the state files leaves the workdir untouched.
+        // M2: atomic_write so a crash mid-write doesn't tear the state.
+        crate::fs_util::atomic_write(
+            &repo.gyt_dir.join("CHERRY_PICK_HEAD"),
+            format!("{}\n", target_id.to_hex()).as_bytes(),
+        )?;
+        std::fs::write(repo.gyt_dir.join("MERGE_MSG"), target_commit.message.as_bytes())?;
         apply_files_to_workdir(repo, &tm.merged)?;
         write_index_from_map(repo, &tm.merged)?;
         for (path, bytes) in &conflict_blobs {
@@ -171,12 +192,6 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             }
             std::fs::write(&abs, bytes)?;
         }
-        // M2: atomic_write so a crash doesn't leave a torn state file.
-        crate::fs_util::atomic_write(
-            &repo.gyt_dir.join("CHERRY_PICK_HEAD"),
-            format!("{}\n", target_id.to_hex()).as_bytes(),
-        )?;
-        std::fs::write(repo.gyt_dir.join("MERGE_MSG"), target_commit.message.as_bytes())?;
         let conflict_list = tm
             .conflicts
             .iter()

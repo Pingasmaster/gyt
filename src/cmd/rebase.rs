@@ -25,9 +25,26 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    // Commit 07131c2 made `serve --help` not launch the server before
+    // printing help; this is the same fix for `rebase`: short-circuit
+    // --help before opening the repo so help works outside any repo.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt rebase [--ff-only] [--abort] [--continue] <upstream>\n\n\
+         Replay commits from merge-base..HEAD on top of <upstream>.\n\n\
+         --continue   resume a paused rebase: replays REBASE_TODO after the\n\
+                      user has resolved conflicts and staged the result.\n\
+         --abort      discard a paused rebase, restoring HEAD."
+    );
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -198,20 +215,28 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         });
 
         if !tm.conflicts.is_empty() {
-            // Apply merged + markers, leave rebase state.
-            apply_files_to_workdir(repo, &tm.merged)?;
-            write_index_from_map(repo, &tm.merged)?;
-            for (path, bytes) in &conflict_blobs {
-                // H5: refuse if any ancestor is a symlink.
-                let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
-                if let Some(parent) = abs.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&abs, bytes)?;
-            }
+            // B13: write REBASE_HEAD/ONTO/TODO BEFORE splattering
+            // conflict markers in the workdir. This mirrors the M3
+            // fix in cmd/merge.rs — a crash after the markers but
+            // before the state files would otherwise leave a dirty
+            // workdir with NO in-progress marker, so `gyt status`
+            // reports no rebase in progress while the workdir is
+            // half-merged. With this ordering a crash after state-file
+            // write but before markers is observable as an in-progress
+            // rebase; a crash before state-file write leaves the
+            // workdir untouched.
+            //
+            // Include the CONFLICTING commit (`idx`) so `--continue`
+            // can reuse its message / authors / ai_assists when
+            // committing the user's resolution. Previously we wrote
+            // only the commits AFTER the conflict, which meant
+            // `run_continue` consumed the next commit's metadata for
+            // the resolved one and "swallowed" that next commit (its
+            // diff was folded into the resolved tree, then never
+            // replayed).
             let remaining: Vec<String> = commits
                 .iter()
-                .skip(idx + 1)
+                .skip(idx)
                 .map(|c| c.to_hex())
                 .collect();
             // M2: atomic_write so a crash mid-write doesn't tear the state.
@@ -227,6 +252,19 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
                 &repo.gyt_dir.join("REBASE_TODO"),
                 remaining.join("\n").as_bytes(),
             )?;
+            // Now apply merged + markers — state files exist so any
+            // crash from here on is recoverable via `gyt rebase
+            // --abort` / `--continue`.
+            apply_files_to_workdir(repo, &tm.merged)?;
+            write_index_from_map(repo, &tm.merged)?;
+            for (path, bytes) in &conflict_blobs {
+                // H5: refuse if any ancestor is a symlink.
+                let abs = crate::workdir::safe_workdir_path(&repo.workdir, path)?;
+                if let Some(parent) = abs.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs, bytes)?;
+            }
             return Err(GytError::Repo(format!(
                 "rebase: conflicts replaying {}. Resolve files and re-commit, then run `gyt rebase --abort` to give up.",
                 short(c)
@@ -241,10 +279,12 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let stamped = format!("{identity} {secs} +0000");
+        // Preserve the original commit's author(s); only the committer
+        // is rewritten to the rebaser's identity. Mirrors `git rebase`.
         let new_commit = commit_obj::Commit {
             tree: new_tree,
             parents: vec![cursor],
-            authors: vec![stamped.clone()],
+            authors: pc.authors.clone(),
             committer: stamped,
             ai_assists: pc.ai_assists.clone(),
             reviewers: pc.reviewers.clone(),
@@ -338,10 +378,12 @@ fn run_continue(repo: &Repo) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let stamped = format!("{identity} {secs} +0000");
+    // Preserve the conflicting commit's original authors; rewrite only
+    // the committer. Mirrors `git rebase --continue`.
     let new_commit = commit_obj::Commit {
         tree: resolved_tree,
         parents: vec![cursor],
-        authors: vec![stamped.clone()],
+        authors: first_pc.authors.clone(),
         committer: stamped,
         ai_assists: first_pc.ai_assists.clone(),
         reviewers: first_pc.reviewers.clone(),
@@ -483,10 +525,11 @@ fn replay_one(repo: &Repo, cursor: &ObjectId, c: &ObjectId) -> Result<ReplayOutc
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let stamped = format!("{identity} {secs} +0000");
+    // Preserve picked commit's authors; only rewrite committer. Mirrors git.
     let new_commit = commit_obj::Commit {
         tree: new_tree,
         parents: vec![*cursor],
-        authors: vec![stamped.clone()],
+        authors: pc.authors.clone(),
         committer: stamped,
         ai_assists: pc.ai_assists.clone(),
         reviewers: pc.reviewers.clone(),
