@@ -20,6 +20,10 @@ use crate::repo::{GYT_DIR, Repo};
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let (sub, rest) = match args.split_first() {
         Some((s, r)) => (s.as_str(), r),
         None => {
@@ -36,6 +40,15 @@ pub fn run(args: &[String]) -> Result<()> {
             "worktree: unknown subcommand {other:?}"
         ))),
     }
+}
+
+fn print_help() {
+    println!(
+        "gyt worktree <add|list|remove> [args...]\n\n\
+         add [-b <branch>] <path> [<base-rev>]   create a new worktree at <path>\n\
+         list                                    list registered worktrees\n\
+         remove <path>                           detach a worktree"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -134,6 +147,33 @@ fn do_add(repo: &Repo, args: &[String]) -> Result<()> {
     // Create the worktree directory.
     std::fs::create_dir_all(&path)?;
     let abs_path = path.canonicalize()?;
+    // B32: refuse to register a worktree whose canonical path is
+    // inside the main `.gyt/` directory (or inside the main workdir
+    // tree at a path that would shadow tracked content). Without this
+    // check, `gyt worktree add .gyt/inside` would land its HEAD /
+    // tree materialization on top of the repository's own metadata —
+    // overwriting refs, indices, or the worktrees registry itself.
+    // The main workdir overlap is also rejected because two
+    // simultaneous checkouts of different branches at the same files
+    // produce undefined behavior (gc would walk one's HEAD but the
+    // other's index, etc.).
+    let canon_gyt = repo.gyt_dir.canonicalize().unwrap_or_else(|_| repo.gyt_dir.clone());
+    let canon_workdir = repo
+        .workdir
+        .canonicalize()
+        .unwrap_or_else(|_| repo.workdir.clone());
+    if abs_path.starts_with(&canon_gyt) {
+        return Err(GytError::InvalidArgument(format!(
+            "worktree add: refusing path inside the repository's .gyt/ directory: {}",
+            abs_path.display()
+        )));
+    }
+    if abs_path == canon_workdir {
+        return Err(GytError::InvalidArgument(format!(
+            "worktree add: path is the main workdir itself: {}",
+            abs_path.display()
+        )));
+    }
     let wt_name = abs_path
         .file_name()
         .ok_or_else(|| GytError::InvalidArgument("worktree add: empty basename".into()))?

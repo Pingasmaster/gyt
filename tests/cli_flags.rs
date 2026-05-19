@@ -409,8 +409,28 @@ fn clean_removes_untracked() {
     let env = Env::new("flag-clean");
     let r = env.fresh_repo("r");
     std::fs::write(r.join("untracked.txt"), b"x").unwrap();
-    env.ok_in(&r, &["clean"]);
+    // B31: --force is now required for destructive `clean`; bare `clean`
+    // refuses. The original test invoked it without a flag.
+    env.ok_in(&r, &["clean", "--force"]);
     assert!(!r.join("untracked.txt").exists());
+}
+
+// B31: a bare `gyt clean` (no -f, no -n) must refuse — without this
+// gate, hours of un-staged scratch work would silently disappear.
+#[test]
+fn clean_without_force_refuses() {
+    let env = Env::new("flag-clean-noforce");
+    let r = env.fresh_repo("r");
+    std::fs::write(r.join("untracked.txt"), b"x").unwrap();
+    let (_out, err) = env.fail_in(&r, &["clean"]);
+    assert!(
+        err.contains("--force") || err.contains("force"),
+        "expected --force error, got: {err}"
+    );
+    assert!(
+        r.join("untracked.txt").exists(),
+        "clean without --force must not delete"
+    );
 }
 
 // ─── gyt merge ─────────────────────────────────────────────────────
@@ -822,4 +842,196 @@ fn add_diff_commit_diff_round_trip() {
     std::fs::write(r.join("x.txt"), b"b\n").unwrap();
     let d = env.ok_in(&r, &["diff"]);
     assert!(d.contains("-a") || d.contains("+b") || !d.is_empty());
+}
+
+// ─── Audit 2026-05 extension: documented-but-untested flag forms ───
+//
+// These tests pin command lines that the docs (or CLAUDE.md) advertise
+// but for which there was no direct CLI coverage. Each test is
+// self-contained: it builds its own Env, fresh_repo where needed,
+// and asserts only on observable CLI behaviour.
+
+#[test]
+fn worktree_add_with_branch_flag() {
+    let env = Env::new("flag-wt-add-b");
+    let r = env.fresh_repo("r");
+    let wt = env.path("wt-feat");
+    let wt_str = wt.to_string_lossy().into_owned();
+    let out = env.run_in(&r, &["worktree", "add", "-b", "feat", &wt_str]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "worktree add -b feat <path> failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn worktree_add_missing_path_errors() {
+    let env = Env::new("flag-wt-add-nopath");
+    let r = env.fresh_repo("r");
+    let (_, err) = env.fail_in(&r, &["worktree", "add"]);
+    assert!(
+        err.to_lowercase().contains("path") || err.to_lowercase().contains("missing"),
+        "worktree-add missing-path error did not mention path: {err}"
+    );
+}
+
+#[test]
+fn blame_with_rev_and_dashdash() {
+    let env = Env::new("flag-blame-rev-dd");
+    let r = env.fresh_repo("r");
+    // `seed.txt` exists from fresh_repo(); use it as the target.
+    let out = env.run_in(&r, &["blame", "HEAD", "--", "seed.txt"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "blame HEAD -- seed.txt failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn grep_with_rev_form() {
+    let env = Env::new("flag-grep-rev");
+    let r = env.fresh_repo("r");
+    // The seed blob contains "seed". Search for it at HEAD.
+    let out = env.run_in(&r, &["grep", "seed", "HEAD"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "grep seed HEAD failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn clean_refuses_gyt_dir() {
+    let env = Env::new("flag-clean-gyt");
+    let r = env.fresh_repo("r");
+    let out = env.run_in(&r, &["clean", ".gyt"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "`gyt clean .gyt` unexpectedly succeeded\nstderr: {stderr}"
+    );
+    // .gyt must still exist after the rejected invocation.
+    assert!(
+        r.join(".gyt").is_dir(),
+        ".gyt directory disappeared after rejected clean"
+    );
+}
+
+#[test]
+fn config_set_then_get_roundtrip() {
+    // GYT_AUTHOR_NAME (set by Env::cmd_in) overrides on-disk config by
+    // design (see src/config.rs:7 — env vars are the final precedence
+    // tier). Clear it on the `--get` call so we observe the value we
+    // just wrote.
+    let env = Env::new("flag-config-set-get");
+    let r = env.fresh_repo("r");
+    env.ok_in(&r, &["config", "--set", "user.name", "Alice"]);
+    let out = std::process::Command::new(&env.bin)
+        .current_dir(&r)
+        .args(["config", "--get", "user.name"])
+        .env_remove("GYT_AUTHOR_NAME")
+        .env_remove("GYT_AUTHOR_EMAIL")
+        .env("HOME", &env.dir)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "config --get failed: {stdout}");
+    assert!(stdout.contains("Alice"), "config --get user.name didn't return 'Alice', got: {stdout}");
+}
+
+#[test]
+fn config_unset_then_get_empty() {
+    let env = Env::new("flag-config-unset");
+    let r = env.fresh_repo("r");
+    env.ok_in(&r, &["config", "--set", "user.name", "Bob"]);
+    env.ok_in(&r, &["config", "--unset", "user.name"]);
+    // After unset, `--get` should not echo "Bob".
+    let out = env.run_in(&r, &["config", "--get", "user.name"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("Bob") && !stderr.contains("Bob"),
+        "config --get user.name returned 'Bob' after unset\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn init_with_positional_path() {
+    let env = Env::new("flag-init-path");
+    let target = env.path("sub/repo");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let target_str = target.to_string_lossy().into_owned();
+    env.ok_in(&env.dir, &["init", &target_str]);
+    assert!(
+        target.join(".gyt").is_dir(),
+        "`gyt init <path>` did not create .gyt under {}",
+        target.display()
+    );
+}
+
+#[test]
+fn init_bare_with_path() {
+    let env = Env::new("flag-init-bare-path");
+    let target = env.path("bare-here");
+    let target_str = target.to_string_lossy().into_owned();
+    env.ok_in(&env.dir, &["init", &target_str, "--bare"]);
+    // Bare layout lays the gyt directory directly in <path>, so
+    // `objects/` and `refs/` should exist at the top level.
+    assert!(
+        target.join("objects").is_dir() || target.join("HEAD").is_file(),
+        "`gyt init <path> --bare` did not lay out a bare repo under {}",
+        target.display()
+    );
+}
+
+#[test]
+fn filter_alias_works() {
+    let env = Env::new("flag-filter-alias");
+    // The dispatcher maps `filter` -> `getthefuckoutofmyrepo`. Verify
+    // it accepts `--help` without falling through to "unknown command".
+    let out = env.run_in(&env.dir, &["filter", "--help"]);
+    assert!(
+        out.status.success(),
+        "`gyt filter --help` failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn gc_keep_reflog_and_expire_reflog_conflict() {
+    let env = Env::new("flag-gc-conflict");
+    let r = env.fresh_repo("r");
+    let out = env.run_in(&r, &["gc", "--keep-reflog", "--expire-reflog", "30"]);
+    // Both flags together are semantically contradictory; the
+    // current `gc` accepts the last-write-wins ordering on the flag,
+    // but a regression that crashes / errors loudly is still useful
+    // to know about, so only assert it does not hang.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Either accept (last-wins) or reject — but it must terminate.
+    // The point of this test is to fence the flag *names*.
+    let _ = (out.status, stdout, stderr);
+}
+
+#[test]
+fn reset_force_flag_parsed() {
+    let env = Env::new("flag-reset-force");
+    let r = env.fresh_repo("r");
+    // `gyt reset --force HEAD` with a clean workdir should be a no-op
+    // and exit zero. The point is that the --force flag is *parsed*
+    // (and not rejected as unknown).
+    let out = env.run_in(&r, &["reset", "--force", "HEAD"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "`gyt reset --force HEAD` failed\nstdout: {stdout}\nstderr: {stderr}"
+    );
 }

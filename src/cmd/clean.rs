@@ -7,9 +7,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt clean [-n|--dry-run]\n\n\
+         Remove untracked files from the working tree."
+    );
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -18,23 +29,36 @@ fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
     // from the workdir.
     let _lock = repo.lock()?;
     let mut dry_run = false;
+    let mut force = false;
 
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "gyt clean [-n|--dry-run]\n\n\
-                     Remove untracked files from the working tree."
+                    "gyt clean [-n|--dry-run] [-f|--force]\n\n\
+                     Remove untracked files from the working tree.\n\
+                     Pass -n/--dry-run to preview, or -f/--force to actually delete."
                 );
                 return Ok(());
             }
             "-n" | "--dry-run" => dry_run = true,
+            "-f" | "--force" => force = true,
             other => {
                 return Err(GytError::InvalidArgument(format!(
                     "clean: unknown flag {other}"
                 )));
             }
         }
+    }
+    // B31: refuse to delete unless the operator explicitly opted in
+    // via --force OR asked for a dry-run preview. Matches git's
+    // default — `git clean` errors without `-f`. Without this gate,
+    // a bare `gyt clean` silently destroys hours of un-staged work.
+    if !dry_run && !force {
+        return Err(GytError::InvalidArgument(
+            "clean: refusing to delete without -f/--force (or -n/--dry-run to preview)"
+                .into(),
+        ));
     }
 
     let ignore = IgnoreSet::load_from_root(&repo.workdir)?;

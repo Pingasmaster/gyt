@@ -11,9 +11,23 @@ use crate::refs;
 use crate::repo::Repo;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt fetch [<remote>] [<ref>] [--insecure] [--prune|-p]\n\n\
+         Fetch objects and refs from the named remote (default origin).\n\
+         With <ref>, only refs whose short name matches are fetched\n\
+         (e.g. `gyt fetch origin main`). --prune deletes any local\n\
+         refs/remotes/<remote>/* that the server no longer advertises."
+    );
 }
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -130,16 +144,31 @@ pub fn fetch_with_refspec_inner(
     let n_objects = walk_and_fetch(&client, repo, &server_refs, true, None)?;
 
     // Update refs/remotes/<remote>/<name> for heads and tags.
+    // B30: also mirror the in-repo metadata namespaces
+    // (refs/issues/*, refs/prs/*, refs/incidents/*) 1-for-1 to local
+    // refs of the same name. These are the canonical refs (the project
+    // has a single shared counter per repo, not per-remote); without
+    // this mapping `gyt fetch` silently never picks up issues / PRs /
+    // incidents created on the server after the initial clone — only
+    // the very first `gyt clone` populates them. clone whitelists the
+    // same prefixes (see cmd/clone.rs::is_user_visible_ref) and
+    // `gyt push` already auto-pushes them; this closes the round-trip.
     let mut updated = 0usize;
     let mut advertised_local: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for r in &server_refs {
         let mapped = if let Some(rest) = r.name.strip_prefix("refs/heads/") {
             Some(format!("refs/remotes/{remote}/{rest}"))
+        } else if let Some(rest) = r.name.strip_prefix("refs/tags/") {
+            Some(format!("refs/remotes/{remote}/tags/{rest}"))
+        } else if r.name.starts_with("refs/issues/")
+            || r.name.starts_with("refs/prs/")
+            || r.name.starts_with("refs/incidents/")
+        {
+            // Canonical (non-namespaced) metadata refs.
+            Some(r.name.clone())
         } else {
-            r.name
-                .strip_prefix("refs/tags/")
-                .map(|rest| format!("refs/remotes/{remote}/tags/{rest}"))
+            None
         };
         if let Some(local) = mapped {
             // Only count as "updated" if it actually changes.
