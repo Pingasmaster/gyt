@@ -464,16 +464,18 @@ fn compute_reachable(gyt_dir: &Path) -> HashSet<ObjectId> {
     // Every user-visible ref namespace anchors its tips against pruning.
     //
     // refs/heads/, refs/tags/, refs/remotes/ are the version-control
-    // namespaces. refs/issues/ and refs/prs/ are the metadata namespaces
-    // (issues, discussions, pull requests) — without them in this list,
-    // gc would silently delete every issue/PR blob. refs/stash is a
-    // single ref outside any of these prefixes.
+    // namespaces. refs/issues/, refs/prs/, and refs/incidents/ are the
+    // metadata namespaces (issues, discussions, pull requests,
+    // incidents) — without them in this list, gc would silently delete
+    // every metadata blob. refs/stash is a single ref outside any of
+    // these prefixes.
     for prefix in [
         "refs/heads",
         "refs/tags",
         "refs/remotes",
         "refs/issues",
         "refs/prs",
+        "refs/incidents",
     ] {
         if let Ok(rs) = refs::list_refs(gyt_dir, prefix) {
             for (_, id) in rs {

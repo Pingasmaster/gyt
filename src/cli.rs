@@ -49,6 +49,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
         "issue" => crate::cmd::issue::run_issue(rest),
         "discussion" => crate::cmd::issue::run_discussion(rest),
         "pr" => crate::cmd::pr::run(rest),
+        "incident" => crate::cmd::incident::run(rest),
         "serve" => crate::cmd::serve::run(rest),
         "getthefuckoutofmyrepo" | "filter" => crate::cmd::getthefuckoutofmyrepo::run(rest),
         other => Err(GytError::InvalidArgument(format!(
@@ -145,6 +146,26 @@ PULL REQUESTS
                                  source ref, record the result
     pr label <N> [--add l1,l2] [--remove l3]
     pr assign <N> [--add \"Name <email>\"] [--remove ...]
+
+INCIDENTS
+    incident new <title> --severity sev1..sev4 --type TYPE
+                                 [--field K=V ...] [type-specific shortcuts]
+                                 [--label l1,l2] [--assign \"Name <e>\"] [-m <body>]
+    incident list [--state detected|investigating|mitigated|resolved|open|all]
+                  [--severity sev1..sev4] [--type T] [--label L]
+    incident show <N>
+    incident comment <N> -m <body>     (alias: incident update <N> -m <body>)
+    incident investigate <N>           detected/mitigated -> investigating
+    incident mitigate <N> [--note T]   -> mitigated
+    incident resolve <N> --reason T    -> resolved
+    incident reopen <N> [--reason T]   resolved/mitigated -> investigating
+    incident severity <N> sev1..sev4
+    incident label <N> [--add l1,l2] [--remove l3]
+    incident assign <N> [--add \"Name <email>\"] [--remove ...]
+    incident field <N> set KEY VAL | incident field <N> get KEY
+                                 known types (security, outage, bug, data-loss,
+                                 performance) get shortcut flags like --cve,
+                                 --cwe, --services, --affected-version, ...
 
 UTILITIES
     grep <pattern> [<rev>]
