@@ -364,6 +364,7 @@ pub fn serve(config: &ServeConfig) -> Result<()> {
         allow_force: config.allow_force,
         heavy_decompression_log: config.heavy_decompression_log.clone(),
         shutdown: Mutex::new(false),
+        shutdown_notify: tokio::sync::Notify::new(),
         metrics: Metrics::default(),
         listen_addr: addr,
         rate_limiter: RateLimiter::new(configured_ip_limit(), configured_actor_limit()),
@@ -610,6 +611,7 @@ async fn serve_conn_plain(
     peer_ip: std::net::IpAddr,
 ) {
     let io = hyper_util::rt::TokioIo::new(stream);
+    let shutdown_state = state.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let st = state.clone();
         async move { handle_async_request(req, st, peer_ip).await }
@@ -643,8 +645,23 @@ async fn serve_conn_plain(
     // HTTP Upgrade (no WebSocket, no h2c, no CONNECT). The matching
     // TLS path already omits it; the plain listener carried it for
     // no reason and only added Upgrade-header parser surface.
-    if let Err(e) = builder.serve_connection(io, service).await {
-        let _ = e; // peer reset / slow-loris not actionable
+    //
+    // tokio::select! between the connection future and the shutdown
+    // notify. When SIGTERM (or /admin/shutdown) flips the flag and
+    // notifies, we call `Connection::graceful_shutdown()` and await
+    // the connection's clean close. Without this, the runtime
+    // teardown yanks in-flight responses mid-stream — a pack
+    // download partway through becomes a corrupt XZ blob for the
+    // client.
+    let mut conn = std::pin::pin!(builder.serve_connection(io, service));
+    tokio::select! {
+        result = conn.as_mut() => {
+            if let Err(e) = result { let _ = e; }
+        }
+        () = shutdown_state.shutdown_notify.notified() => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        }
     }
 }
 
@@ -657,6 +674,7 @@ async fn serve_conn_tls(
     peer_ip: std::net::IpAddr,
 ) {
     let io = hyper_util::rt::TokioIo::new(stream);
+    let shutdown_state = state.clone();
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let st = state.clone();
         async move { handle_async_request(req, st, peer_ip).await }
@@ -670,8 +688,17 @@ async fn serve_conn_tls(
         .header_read_timeout(std::time::Duration::from_mins(1))
         .max_buf_size(64 * 1024);
     configure_h2(builder.http2());
-    if let Err(e) = builder.serve_connection(io, service).await {
-        let _ = e;
+    // See serve_conn_plain for the shutdown_notify rationale.
+    let conn = builder.serve_connection(io, service);
+    let mut conn = std::pin::pin!(conn);
+    tokio::select! {
+        result = conn.as_mut() => {
+            if let Err(e) = result { let _ = e; }
+        }
+        () = shutdown_state.shutdown_notify.notified() => {
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        }
     }
 }
 
@@ -980,6 +1007,13 @@ fn install_shutdown_signals(state: Arc<ServerState>, listen_addr: std::net::Sock
             if let Ok(mut g) = state.shutdown.lock() {
                 *g = true;
             }
+            // Wake every connection task waiting on the notify so
+            // they can call Connection::graceful_shutdown() on their
+            // own connection — finish the current request, then
+            // close — instead of being yanked when the runtime
+            // drops. `notify_waiters` is multi-wake; `notify_one`
+            // would only release the first listener.
+            state.shutdown_notify.notify_waiters();
             // Self-connect to unblock accept(). Connect-then-drop is
             // enough; we don't need to write or read.
             let _ = std::net::TcpStream::connect_timeout(
@@ -1012,6 +1046,14 @@ pub(crate) struct ServerState {
     /// `compress::HEAVY_DECOMPRESSION_LOG_BYTES`.
     heavy_decompression_log: Option<PathBuf>,
     pub(crate) shutdown: Mutex<bool>,
+    /// Async notify paired with the shutdown flag. The signal handler
+    /// calls `shutdown_notify.notify_waiters()` after flipping the
+    /// Mutex<bool>; every in-flight connection task is waiting on this
+    /// Notify alongside its connection future and uses the signal as
+    /// the trigger to call `Connection::graceful_shutdown()` — finish
+    /// the current request, then close. Without this an SIGTERM
+    /// truncates pack-stream responses mid-transfer.
+    pub(crate) shutdown_notify: tokio::sync::Notify,
     metrics: Metrics,
     /// Bound local address. Stored so the admin-shutdown handler can
     /// self-connect to unblock accept() — the signal handler does the
@@ -1570,6 +1612,9 @@ fn admin_shutdown_handler(state: &ServerState) -> (u16, String, Vec<u8>, String)
     if let Ok(mut g) = state.shutdown.lock() {
         *g = true;
     }
+    // Wake in-flight connection tasks so they call graceful_shutdown
+    // on their own connection. Matches the SIGTERM signal-handler path.
+    state.shutdown_notify.notify_waiters();
     // Best-effort self-connect to break accept(). Failure means the
     // listener already had something queued — accept will still
     // observe the flag on its next iteration.
@@ -3150,6 +3195,7 @@ mod tests {
             allow_force: true,
             heavy_decompression_log: None,
             shutdown: Mutex::new(false),
+            shutdown_notify: tokio::sync::Notify::new(),
             metrics: Metrics::default(),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             rate_limiter: RateLimiter::new(
