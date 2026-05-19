@@ -153,7 +153,8 @@ mod tests {
         fs::write(dir.join("untracked.txt"), b"untracked\n").unwrap();
         assert!(dir.join("untracked.txt").exists());
 
-        let r = run(&[]);
+        // B31: clean now requires -f/--force.
+        let r = run(&["--force".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
 
@@ -182,7 +183,8 @@ mod tests {
         // Create an untracked file.
         fs::write(dir.join("untracked.txt"), b"untracked\n").unwrap();
 
-        let r = run(&[]);
+        // B31: clean now requires -f/--force.
+        let r = run(&["--force".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
 
@@ -227,7 +229,8 @@ mod tests {
         crate::cmd::add::run(&[".".to_string()]).unwrap();
         crate::cmd::commit::run(&["-m".to_string(), "first".to_string()]).unwrap();
 
-        let r = run(&[]);
+        // B31: clean now requires -f/--force.
+        let r = run(&["--force".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
 
@@ -252,7 +255,8 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
-        let r = run(&[]);
+        // B31: clean now requires -f/--force.
+        let r = run(&["--force".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
 
@@ -279,7 +283,8 @@ mod tests {
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
-        let r = run(&[]);
+        // B31: clean now requires -f/--force.
+        let r = run(&["--force".to_string()]);
         std::env::set_current_dir(&prev).unwrap();
         r.unwrap();
 

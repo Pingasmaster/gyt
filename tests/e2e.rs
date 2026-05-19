@@ -1514,7 +1514,8 @@ fn clean_removes_untracked() {
     init_commit(&e, "a.txt", b"x\n", "c1");
     e.write("trash.log", b"trash\n");
     e.write("temp/scratch.txt", b"scratch\n");
-    e.ok(&["clean"]);
+    // B31: clean now requires -f/--force.
+    e.ok(&["clean", "--force"]);
     assert!(!e.exists("trash.log"));
     assert!(e.exists("a.txt"));
 }

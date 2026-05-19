@@ -61,7 +61,7 @@ fn key_file_mode_0644_rejected() {
     let mut child = c.spawn().unwrap();
     {
         use std::io::Write as _;
-        child.stdin.as_mut().unwrap().write_all(b"value\n").unwrap();
+        let _ = child.stdin.as_mut().unwrap().write_all(b"value\n");
     }
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -91,7 +91,10 @@ fn key_file_length_wrong_rejected() {
         let mut child = c.spawn().unwrap();
         {
             use std::io::Write as _;
-            child.stdin.as_mut().unwrap().write_all(b"v\n").unwrap();
+            // The child rejects the bad-length key in ensure_key()
+            // BEFORE it reads stdin, so the write may EPIPE — that's
+            // the success signal (process exited early). Swallow it.
+            let _ = child.stdin.as_mut().unwrap().write_all(b"v\n");
         }
         let out = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -181,7 +184,7 @@ fn secret_name_validation_rejects_dotdot() {
     let mut child = c.spawn().unwrap();
     {
         use std::io::Write as _;
-        child.stdin.as_mut().unwrap().write_all(b"v\n").unwrap();
+        let _ = child.stdin.as_mut().unwrap().write_all(b"v\n");
     }
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -222,7 +225,7 @@ fn secret_name_validation_rejects_control_byte() {
     let mut child = c.spawn().unwrap();
     {
         use std::io::Write as _;
-        child.stdin.as_mut().unwrap().write_all(b"v\n").unwrap();
+        let _ = child.stdin.as_mut().unwrap().write_all(b"v\n");
     }
     let out = child.wait_with_output().unwrap();
     assert!(
@@ -269,7 +272,7 @@ fn key_file_symlink_refused() {
     let mut child = c.spawn().unwrap();
     {
         use std::io::Write as _;
-        child.stdin.as_mut().unwrap().write_all(b"v\n").unwrap();
+        let _ = child.stdin.as_mut().unwrap().write_all(b"v\n");
     }
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -310,7 +313,7 @@ fn unset_home_refuses_no_root_fallback() {
     let mut child = c.spawn().unwrap();
     {
         use std::io::Write as _;
-        child.stdin.as_mut().unwrap().write_all(b"v\n").unwrap();
+        let _ = child.stdin.as_mut().unwrap().write_all(b"v\n");
     }
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

@@ -137,6 +137,15 @@ impl HttpClient {
             Some((tok, host)) => (Some(tok.to_string()), host),
             None => (None, authority),
         };
+        // B19 (post-userinfo): RFC 3986 §3.2.2 requires a non-empty host
+        // when authority is present. The previous code accepted
+        // `https://token@/repo` as host="" (the userinfo strip elided
+        // the only non-empty part). Redact the userinfo before echoing
+        // the URL into the error to avoid leaking the bearer token.
+        if authority.is_empty() {
+            let safe = redact_url_userinfo(base_url);
+            return Err(GytError::Net(format!("missing host in url: {safe:?}")));
+        }
         // M18: refuse any URL whose authority contains control bytes,
         // including the embedded bearer token. A `\r\n` in the token
         // would otherwise be format!'d into the Authorization header
