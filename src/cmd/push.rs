@@ -28,9 +28,23 @@ use crate::repo::Repo;
 use std::collections::{HashSet, VecDeque};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt push [<remote>] [<branch>] [--force | --force-with-lease] [--insecure] [--all]\n\n\
+         --force             rewrite the remote ref regardless of current state\n\
+         --force-with-lease  rewrite only if the remote ref still matches our cached\n\
+                             refs/remotes/<remote>/<branch> — refuses if it has moved\n\
+                             since the last fetch (catches over-write of someone else's work)"
+    );
 }
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -234,6 +248,30 @@ pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
         return Err(GytError::Net(format!(
             "POST /refs/update: status {} {}",
             resp.status, resp.reason
+        )));
+    }
+
+    // B14: the server returns 200 with body `updated=N failed=M`
+    // even when M>0 (per-ref FS write failures after policy passed —
+    // disk full, EIO, etc.). Without parsing M, the client prints
+    // "pushed ..." and the local remote-tracking refs go out of
+    // sync with the server. Treat any non-zero `failed=` as a hard
+    // error and tell the operator what to do.
+    let body_text = String::from_utf8_lossy(&resp.body);
+    let mut updated: u32 = 0;
+    let mut failed: u32 = 0;
+    for tok in body_text.split_ascii_whitespace() {
+        if let Some(n) = tok.strip_prefix("updated=") {
+            updated = n.parse().unwrap_or(0);
+        } else if let Some(n) = tok.strip_prefix("failed=") {
+            failed = n.parse().unwrap_or(0);
+        }
+    }
+    if failed > 0 {
+        return Err(GytError::Net(format!(
+            "POST /refs/update: server reported partial failure ({updated} updated, {failed} failed). \
+             Local refs/remotes/{remote}/* may be out of sync with the server; \
+             run `gyt fetch {remote}` before retrying."
         )));
     }
 
