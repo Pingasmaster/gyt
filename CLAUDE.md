@@ -67,6 +67,46 @@ shared `Mutex<()>`). A test that fails at `--test-threads=16` but
 passes at `--test-threads=1` is a real isolation bug in the test
 harness — fix it rather than dropping the parallelism.
 
+### No `#[ignore]`d tests — every test runs in CI
+
+`#[ignore]` removes a test from the default `cargo test` run. CI runs
+the default set, so ignored tests are effectively dead — they bit-rot,
+silently break, and stop catching regressions. They are NOT allowed in
+this project.
+
+If a test is expensive, redesign it for CI rather than ignoring it:
+
+- **Soak / large-input tests**: scale inputs down. A "100 MiB blob"
+  test becomes a 1–10 MiB blob test — same code path, same correctness
+  signal, finishes in seconds. The CI run is meant to catch
+  regressions in the algorithm, not stress the hardware.
+- **Timing / wall-clock tests**: pin the *upper bound* with a generous
+  margin (e.g. 30 s for a workload that normally runs in 2 s) so the
+  test is robust on a slow CI box but still catches O(N²)
+  regressions. Use `#[cfg(target_os = "linux")]` (or similar) to gate
+  platform-specific instrumentation; never `#[ignore]`.
+- **Tests that depend on missing scaffolding** (TLS fixtures, root
+  privileges, a tmpfs mount): generate the scaffolding in-test (e.g.
+  build a self-signed cert with rustls + ring at test setup time), or
+  delete the test. Do not check in a placeholder that's permanently
+  ignored.
+- **Tests that pin a "real hardening gap"** (i.e. the current code is
+  knowingly missing a check): FIX the code so the test passes. A
+  perpetually-ignored test asserting "we should reject X but don't" is
+  evidence the gap was discovered and then abandoned — close it.
+
+The only acceptable form of "skip" is `#[cfg(...)]` for genuinely
+platform-incompatible code (e.g. `#[cfg(unix)]` on a permissions
+test) or `cfg!(env...)`-style gates inside the test body that exit
+early when a *truly external* resource (a real Internet endpoint, a
+specific kernel feature) is unavailable. These exits must `eprintln!`
+the skip reason and the test must still pass — so the runner records
+"OK" with the explicit cause logged.
+
+This rule trumps the "tests are expensive" rule above. If a test is
+too slow for the default suite, redesign it. If it can't be
+redesigned, it doesn't belong in the repo.
+
 ### Never drop or weaken XZ compression
 
 XZ/LZMA (via `lzma-rust2`) is the project's mandated compression for both:
