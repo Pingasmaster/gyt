@@ -10,11 +10,25 @@ use crate::object::commit;
 use crate::refs;
 use crate::repo::Repo;
 
+fn print_help() {
+    println!("Usage: gyt verify [--pub <path>] [<commit-id>]");
+    println!();
+    println!("Verify the ed25519 signature on a commit.");
+    println!("If no commit-id is given, verifies HEAD.");
+    println!(
+        "If --pub is not given, uses GYT_SIGNING_PUB env or ~/.config/gyt/gyt-signing-pub"
+    );
+}
+
 #[expect(
     clippy::indexing_slicing,
     reason = "args[i] is gated by the `while i < args.len()` loop header"
 )]
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     let mut pub_key_path: Option<std::path::PathBuf> = None;

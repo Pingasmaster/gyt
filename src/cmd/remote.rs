@@ -8,6 +8,10 @@ use crate::repo::Repo;
     reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
 )]
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     // M30: `add` mutates per-repo config; reading the *merged*
@@ -18,9 +22,8 @@ pub fn run(args: &[String]) -> Result<()> {
     // per-repo file below.
     let cfg = Config::load(&repo)?;
 
-    if args.is_empty() || args[0] == "--help" {
-        eprintln!("usage: gyt remote -v");
-        eprintln!("       gyt remote add <name> <url>");
+    if args.is_empty() {
+        print_help();
         return Ok(());
     }
 
@@ -63,6 +66,11 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_help() {
+    eprintln!("usage: gyt remote -v");
+    eprintln!("       gyt remote add <name> <url>");
 }
 
 /// M30: read the per-repo `.gyt/config.toml` alone, NOT the merged

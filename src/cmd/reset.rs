@@ -13,9 +13,25 @@ enum Mode {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt reset [--soft | --mixed | --hard] [-f|--force] <rev>\n\n\
+         Move the current branch to <rev>.\n\n\
+         --soft       move HEAD only; leave index and workdir alone.\n\
+         --mixed      move HEAD and reset the index to <rev> (default).\n\
+         --hard       move HEAD, reset the index, and materialize <rev>'s\n\
+                      tree into the workdir (refuses on dirty workdir\n\
+                      unless --force is also passed)."
+    );
 }
 
 fn run_in(repo: &Repo, args: &[String]) -> Result<()> {

@@ -8,9 +8,23 @@ use crate::refs;
 use crate::repo::Repo;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt tag [-l|--list] | <name> [<rev>] | -a <name> -m <msg> [<rev>] | -d <name>\n\n\
+         With no arguments, lists tags.\n\
+         <name> [<rev>]         create a lightweight tag at <rev> (default HEAD).\n\
+         -a <name> -m <msg>     create an annotated tag with <msg>.\n\
+         -d <name>              delete tag <name>."
+    );
 }
 #[expect(
     clippy::indexing_slicing,

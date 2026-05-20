@@ -9,10 +9,23 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     repo.require_worktree()?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt switch [-c|--create <name>] <branch>\n\n\
+         Switch HEAD to <branch>, materializing its tree into the\n\
+         working directory. Refuses if local changes would be lost.\n\n\
+         -c <name>    create <name> at current HEAD before switching."
+    );
 }
 #[expect(
     clippy::indexing_slicing,

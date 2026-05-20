@@ -8,9 +8,24 @@ use std::collections::HashSet;
 use std::path::Path;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!(
+        "gyt branch [<name> | -d <name> | -D <name> | -m <old> <new>]\n\n\
+         With no arguments, lists branches and marks the current one.\n\
+         <name>            create a new branch at HEAD.\n\
+         -d <name>         delete a fully-merged branch.\n\
+         -D <name>         force-delete (no merge-safety check).\n\
+         -m <old> <new>    rename branch <old> to <new>."
+    );
 }
 #[expect(
     clippy::indexing_slicing,
