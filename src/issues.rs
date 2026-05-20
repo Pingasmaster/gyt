@@ -821,7 +821,8 @@ pub fn merge_mentions(into: &mut Vec<u64>, new: &[u64], self_number: u64) {
 mod tests {
     #![expect(
         clippy::unwrap_used,
-        reason = "test code: panicking on unexpected input is how a test signals failure"
+        clippy::indexing_slicing,
+        reason = "test code: panicking on unexpected input is how a test signals failure; fixture() guarantees events is non-empty"
     )]
     use super::*;
 

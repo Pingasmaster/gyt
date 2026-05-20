@@ -242,4 +242,107 @@ mod tests {
         // see a full bucket again.
         assert!(rl.allow(Some(a), None));
     }
+
+    // ── H8 cap: bucket-map size is bounded; new inserts deny ──────
+    //
+    // Without the cap, an IPv6 /64 attacker rotating source addresses
+    // would fill the map with millions of `Key::Ip` entries before the
+    // 5-minute idle GC sweeps. The 65_536 ceiling pins memory at ~5
+    // MiB even in the worst case and fails closed (new addrs are
+    // denied at the door) so the per-IP bucket is never a path to
+    // unbounded growth.
+    #[test]
+    fn cap_full_fail_closed() {
+        let rl = RateLimiter::new(
+            LimitConfig {
+                capacity: 1,
+                refill_per_sec: 0,
+            },
+            LimitConfig {
+                // Disable the actor side so the IP path is the only gate.
+                capacity: 0,
+                refill_per_sec: 0,
+            },
+        );
+        // 65_536 distinct IPv4 addresses fits cleanly in a /16: 256 ×
+        // 256 = 65_536 unique (b, c) pairs over 10.0.b.c.
+        for n in 0u32..65_536 {
+            let b = ((n >> 8) & 0xff) as u8;
+            let c = (n & 0xff) as u8;
+            let addr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, b, c));
+            // Every fill request consumes the bucket's only token but
+            // creates a new entry — all 65_536 must succeed.
+            assert!(rl.allow(Some(addr), None), "fill {n}");
+        }
+        // The 65_537th distinct IP cannot get an entry: map is full and
+        // the cap inserts a deny instead of growing the map further.
+        let overflow = IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 0, 0));
+        assert!(!rl.allow(Some(overflow), None));
+    }
+
+    // Verify the refill arithmetic by feeding a synthetic `now`
+    // directly to `take` — no sleep needed, so the test is fast and
+    // deterministic. `Instant` supports `+ Duration`, which is the only
+    // way to advance "now" without actually waiting.
+    #[test]
+    fn refill_advances_with_time() {
+        let cfg = LimitConfig {
+            capacity: 1,
+            refill_per_sec: 1,
+        };
+        let mut map: HashMap<Key, Bucket> = HashMap::new();
+        let t0 = Instant::now();
+        let key = Key::Ip(ip(1));
+        // Burst of 1 token: first take succeeds, second at the same
+        // instant is denied (no time has elapsed → no refill).
+        assert!(RateLimiter::take(&mut map, key.clone(), cfg, t0));
+        assert!(!RateLimiter::take(&mut map, key.clone(), cfg, t0));
+        // Advance 1.1 s. refill_per_sec=1 ⇒ 1100 millitokens added,
+        // capped at `capacity * 1000 = 1000`, so the bucket is full
+        // again and the next take must succeed.
+        let t1 = t0 + Duration::from_millis(1100);
+        assert!(RateLimiter::take(&mut map, key, cfg, t1));
+    }
+
+    // Both buckets are charged on every `allow`, but each bucket
+    // denies independently — exhausting one must NOT spend or shield
+    // the other. This is the property the "we charge both regardless"
+    // comment in `allow` claims.
+    #[test]
+    fn actor_and_ip_charged_independently() {
+        // Case 1: IP bucket exhausted, actor bucket plenty. Result:
+        // request denied even though the actor has tokens.
+        let rl = RateLimiter::new(
+            LimitConfig {
+                capacity: 1,
+                refill_per_sec: 0,
+            },
+            LimitConfig {
+                capacity: 1000,
+                refill_per_sec: 0,
+            },
+        );
+        let a = ip(1);
+        assert!(rl.allow(Some(a), Some("tok")));
+        assert!(!rl.allow(Some(a), Some("tok")), "IP empty → deny");
+
+        // Case 2: actor bucket exhausted, IP bucket plenty (fresh IP).
+        // Result: still denied — sharing an actor across IPs is the
+        // intended throttle vector for a noisy authenticated client.
+        let rl = RateLimiter::new(
+            LimitConfig {
+                capacity: 1000,
+                refill_per_sec: 0,
+            },
+            LimitConfig {
+                capacity: 1,
+                refill_per_sec: 0,
+            },
+        );
+        assert!(rl.allow(Some(ip(2)), Some("tok")));
+        // Same actor, different IP — actor bucket is the gate.
+        assert!(!rl.allow(Some(ip(3)), Some("tok")), "actor empty → deny");
+        // Different actor, same fresh IP — independent: succeeds.
+        assert!(rl.allow(Some(ip(3)), Some("other")));
+    }
 }

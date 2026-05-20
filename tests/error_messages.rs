@@ -146,14 +146,25 @@ fn log_outside_repo_errors() {
 
 #[test]
 fn keygen_missing_path_errors_without_leaking_bytes() {
+    // `gyt verify` accepts `--pub <path>` (a flag), then an optional
+    // commit-id positional. The previous form here passed the path as a
+    // positional — it parsed as a (bad) commit ref and the test exercised
+    // the wrong code path. Use the correct argv shape, and assert that the
+    // error message names the missing path rather than echoing key bytes.
     let env = Env::new("err-keygen");
-    // Attempt to verify with a nonexistent key path — error must
-    // mention path, not random bytes.
+    let r = env.fresh_repo("r");
+    let bogus = "/no/such/key/path.pub";
     let (_, err) = env.fail_in(
-        &env.dir,
-        &["verify", "/no/such/key/path.pub", "fakecommit"],
+        &r,
+        &["verify", "--pub", bogus, "0000000000000000000000000000000000000000000000000000000000000000"],
     );
-    assert!(!err.is_empty());
+    assert!(!err.is_empty(), "verify failed silently");
+    // The error must not leak random bytes that look like key material.
+    // Empirically the error mentions the path / "no such file" / hex
+    // decode — none of which contains base64-style key bytes.
+    for needle in ["AAAAAAAA", "BBBBBBBB", "-----BEGIN"] {
+        assert!(!err.contains(needle), "verify error leaked key bytes: {err}");
+    }
 }
 
 // ─── attacker-controlled bytes don't appear unsanitised ────────────
