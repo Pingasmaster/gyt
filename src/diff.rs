@@ -340,12 +340,41 @@ pub fn render_unified(
         return "Binary files differ\n".to_string();
     }
 
+    // Trailing-newline state per side. Both empty inputs are "ends with
+    // newline" for the purposes of suppressing the marker (matches git).
+    let a_ends_nl = a.is_empty() || a.last() == Some(&b'\n');
+    let b_ends_nl = b.is_empty() || b.last() == Some(&b'\n');
+
     let ops = diff_lines(a, b);
 
-    // If everything is Equal, no output (matches `git diff` for identical content).
-    if ops.iter().all(|op| matches!(op, DiffOp::Equal(_))) {
+    let only_eof_newline_differs = a_ends_nl != b_ends_nl
+        && ops.iter().all(|op| matches!(op, DiffOp::Equal(_)));
+
+    // If the byte content matches exactly, no output.
+    if ops.iter().all(|op| matches!(op, DiffOp::Equal(_))) && !only_eof_newline_differs {
         return String::new();
     }
+
+    // If the only diff is the trailing newline on the last line, lift
+    // the final Equal to a Delete+Insert pair so the marker has somewhere
+    // to attach. (Matches git's unified-diff output for this case.)
+    let ops = if only_eof_newline_differs {
+        let mut transformed: Vec<DiffOp<'_>> = Vec::with_capacity(ops.len() + 1);
+        let last = ops.len().saturating_sub(1);
+        for (idx, op) in ops.iter().enumerate() {
+            if idx == last
+                && let DiffOp::Equal(l) = op
+            {
+                transformed.push(DiffOp::Delete(l));
+                transformed.push(DiffOp::Insert(l));
+                continue;
+            }
+            transformed.push(op.clone());
+        }
+        transformed
+    } else {
+        ops
+    };
 
     let hunks = group_hunks(&ops, context);
     let mut out = String::new();
@@ -363,6 +392,13 @@ pub fn render_unified(
     }
     out.push('\n');
 
+    // Total line counts on each side so we can detect "this op was the
+    // last line of a (or b)" and emit the `\ No newline at end of file`
+    // marker matching git's unified-diff format.
+    let a_line_count = split_lines(a).len();
+    let b_line_count = split_lines(b).len();
+    let eof_marker = "\\ No newline at end of file\n";
+
     for h in &hunks {
         let header = format!(
             "@@ -{},{} +{},{} @@",
@@ -371,11 +407,34 @@ pub fn render_unified(
         out.push_str(&term::paint_when(use_color, term::CYAN, &header));
         out.push('\n');
 
+        let mut a_pos = h.a_start;
+        let mut b_pos = h.b_start;
         for op in &h.ops {
             match op {
-                DiffOp::Equal(l) => write_line(&mut out, ' ', "", l, false),
-                DiffOp::Delete(l) => write_line(&mut out, '-', term::RED, l, use_color),
-                DiffOp::Insert(l) => write_line(&mut out, '+', term::GREEN, l, use_color),
+                DiffOp::Equal(l) => {
+                    write_line(&mut out, ' ', "", l, false);
+                    let last_a = a_pos == a_line_count;
+                    let last_b = b_pos == b_line_count;
+                    if (last_a && !a_ends_nl) || (last_b && !b_ends_nl) {
+                        out.push_str(eof_marker);
+                    }
+                    a_pos += 1;
+                    b_pos += 1;
+                }
+                DiffOp::Delete(l) => {
+                    write_line(&mut out, '-', term::RED, l, use_color);
+                    if a_pos == a_line_count && !a_ends_nl {
+                        out.push_str(eof_marker);
+                    }
+                    a_pos += 1;
+                }
+                DiffOp::Insert(l) => {
+                    write_line(&mut out, '+', term::GREEN, l, use_color);
+                    if b_pos == b_line_count && !b_ends_nl {
+                        out.push_str(eof_marker);
+                    }
+                    b_pos += 1;
+                }
             }
         }
     }
