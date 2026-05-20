@@ -12,9 +12,17 @@ use crate::refs;
 use crate::repo::Repo;
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let repo = Repo::open(&cwd)?;
     run_in(&repo, args)
+}
+
+fn print_help() {
+    println!("gyt pull [<remote>] [--insecure]");
 }
 
 pub fn run_in(repo: &Repo, args: &[String]) -> Result<()> {
@@ -207,6 +215,8 @@ mod tests {
             remotes: Default::default(),
             create_default_gytignore: false,
             sign_required: false,
+            ci_mode: Default::default(),
+            ci_job_modes: Default::default(),
         };
         cfg.write(&repo.gyt_dir).unwrap();
         let err = run_in(&repo, &[]).unwrap_err();

@@ -3,7 +3,7 @@ use crate::errors::{GytError, Result};
 use crate::repo::Repo;
 
 pub fn run(args: &[String]) -> Result<()> {
-    if args.is_empty() {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return Ok(());
     }
@@ -188,6 +188,8 @@ mod tests {
             remotes: Default::default(),
             create_default_gytignore: false,
             sign_required: false,
+            ci_mode: Default::default(),
+            ci_job_modes: Default::default(),
         };
         cfg.write(&dir.join(".gyt")).unwrap();
 
@@ -210,6 +212,8 @@ mod tests {
             remotes: Default::default(),
             create_default_gytignore: false,
             sign_required: false,
+            ci_mode: Default::default(),
+            ci_job_modes: Default::default(),
         };
         cfg.write(&dir.join(".gyt")).unwrap();
 

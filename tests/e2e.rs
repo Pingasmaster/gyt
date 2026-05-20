@@ -174,59 +174,69 @@ impl Env {
     }
 
     fn start_server(&mut self, extra_args: &[&str]) -> (String, PathBuf) {
-        let port = pick_port();
         let repos = self.path("server_repos");
         std::fs::create_dir_all(&repos).unwrap();
         let webroot = self.path("empty_webroot");
         std::fs::create_dir_all(&webroot).unwrap();
-        let mut c = self.cmd_in(&self.dir);
-        c.args([
-            "serve",
-            "--listen",
-            &format!("127.0.0.1:{port}"),
-            "--repos",
-            &repos.to_string_lossy(),
-            "--webroot",
-            &webroot.to_string_lossy(),
-        ])
-        .args(extra_args)
-        .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
-        .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
-        .env("GYT_SERVE_CACHE_TTL_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        // Wait for the server to accept connections.
-        let url = format!("http://127.0.0.1:{port}/");
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            // If the child has already exited, surface the stderr so
-            // the test gets a real diagnostic instead of an opaque
-            // 5-second timeout.
-            if let Ok(Some(status)) = child.try_wait() {
-                let mut buf = String::new();
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut buf);
+        // Retry the (pick_port + spawn + wait-for-ready) sequence on bind
+        // collisions. pick_port closes its listener before the server
+        // binds, so under --test-threads=16 a parallel test can grab the
+        // port in between; the child then exits with EADDRINUSE. Three
+        // attempts with fresh ports makes the race statistically
+        // irrelevant. (Mirrors the data_integrity.rs harness fix.)
+        for attempt in 0..3 {
+            let port = pick_port();
+            let mut c = self.cmd_in(&self.dir);
+            c.args([
+                "serve",
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--repos",
+                &repos.to_string_lossy(),
+                "--webroot",
+                &webroot.to_string_lossy(),
+            ])
+            .args(extra_args)
+            .env("GYT_SERVE_RATE_IP_CAPACITY", "0")
+            .env("GYT_SERVE_RATE_ACTOR_CAPACITY", "0")
+            .env("GYT_SERVE_CACHE_TTL_MS", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+            let mut child = c.spawn().unwrap();
+            let url = format!("http://127.0.0.1:{port}/");
+            let start = Instant::now();
+            let mut early_exit: Option<String> = None;
+            while start.elapsed() < Duration::from_secs(5) {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    let mut buf = String::new();
+                    if let Some(mut s) = child.stderr.take() {
+                        let _ = s.read_to_string(&mut buf);
+                    }
+                    early_exit = Some(buf);
+                    break;
                 }
-                panic!("server exited early ({status}): {buf}");
+                if std::net::TcpStream::connect_timeout(
+                    &format!("127.0.0.1:{port}").parse().unwrap(),
+                    Duration::from_millis(100),
+                )
+                .is_ok()
+                {
+                    self.server = Some((child, port, repos.clone()));
+                    return (url, repos);
+                }
+                std::thread::sleep(Duration::from_millis(40));
             }
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().unwrap(),
-                Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                self.server = Some((child, port, repos.clone()));
-                return (url, repos);
+            if let Some(reason) = early_exit {
+                if attempt < 2 {
+                    let _ = child.kill();
+                    continue;
+                }
+                panic!("server failed to start after 3 attempts: stderr={reason}");
             }
-            std::thread::sleep(Duration::from_millis(40));
+            // Timed out without the child exiting: kill and retry.
+            let _ = child.kill();
         }
-        let mut buf = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut buf);
-        }
-        let _ = child.kill();
-        panic!("server didn't start within 5s: stderr={buf}");
+        panic!("server didn't start within 5s after 3 retries");
     }
 }
 

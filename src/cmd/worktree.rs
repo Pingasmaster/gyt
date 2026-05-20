@@ -748,6 +748,8 @@ mod tests {
             remotes: Default::default(),
             create_default_gytignore: false,
             sign_required: false,
+            ci_mode: Default::default(),
+            ci_job_modes: Default::default(),
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }

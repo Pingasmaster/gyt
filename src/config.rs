@@ -23,6 +23,16 @@
 //   [commit]
 //   sign_required = true  (opt-in, default false)
 //
+//   [ci]
+//   parallel_jobs = "lint,test"   (comma-separated job names — the
+//                                  .wasm file stem — that MAY run
+//                                  concurrently. Any job NOT listed is
+//                                  single-run: starting it preempts an
+//                                  in-progress run of the same job.
+//                                  Use "*" to allow every job to run
+//                                  in parallel. Default: empty, so all
+//                                  jobs are single-run.)
+//
 // Anything else is preserved syntactically but not surfaced via this API.
 
 use crate::errors::{GytError, Result};
@@ -45,6 +55,70 @@ pub struct Config {
     pub create_default_gytignore: bool,
     /// If true, `gyt commit` without `--sign` is rejected.
     pub sign_required: bool,
+    /// Global CI concurrency policy (`[ci] mode`). See [`CiConcurrency`].
+    pub ci_mode: CiConcurrency,
+    /// Per-job CI concurrency overrides (`[ci.<job>] mode`), keyed by the
+    /// `.wasm` file stem. Overrides the global default for that job.
+    pub ci_job_modes: std::collections::BTreeMap<String, CiJobMode>,
+}
+
+/// Global CI concurrency policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CiConcurrency {
+    /// Different CI jobs may run at the same time. Each job's own
+    /// behavior on a *repeat of the same job* is governed by its
+    /// per-job mode (default [`CiJobMode::Parallel`]). This is the
+    /// default.
+    #[default]
+    Parallel,
+    /// All CI jobs share a single concurrency domain: at most one CI run
+    /// at a time across every job. New runs queue behind the in-progress
+    /// one (default per-job mode becomes [`CiJobMode::Queue`]).
+    Serial,
+}
+
+/// What happens when a CI job is started while a run that contends with
+/// it (same domain) is already in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiJobMode {
+    /// Run concurrently — no coordination, any number in flight.
+    Parallel,
+    /// Wait for the in-progress run to finish, then run (FIFO-ish via an
+    /// exclusive domain lock).
+    Queue,
+    /// Preempt the in-progress run: it aborts immediately (no warning),
+    /// then this run proceeds.
+    Interrupt,
+}
+
+impl Config {
+    /// The effective concurrency mode for CI job `job` (the `.wasm` file
+    /// stem): the per-job override if one is set, otherwise the default
+    /// implied by the global [`CiConcurrency`] mode.
+    #[must_use]
+    pub fn effective_ci_job_mode(&self, job: &str) -> CiJobMode {
+        // Per-job section names are stored lowercased by the parser
+        // (`[ci.Build]` → key "build"), so look up case-insensitively.
+        if let Some(m) = self.ci_job_modes.get(&job.to_ascii_lowercase()) {
+            return *m;
+        }
+        match self.ci_mode {
+            CiConcurrency::Serial => CiJobMode::Queue,
+            CiConcurrency::Parallel => CiJobMode::Parallel,
+        }
+    }
+
+    /// The contention-domain key for `job`. Under [`CiConcurrency::Serial`]
+    /// every job shares the `"all"` domain (global single-run); under
+    /// [`CiConcurrency::Parallel`] each job is its own domain so distinct
+    /// jobs never block one another.
+    #[must_use]
+    pub fn ci_domain_key(&self, job: &str) -> String {
+        match self.ci_mode {
+            CiConcurrency::Serial => "all".to_string(),
+            CiConcurrency::Parallel => job.to_string(),
+        }
+    }
 }
 
 impl Config {
@@ -133,6 +207,21 @@ impl Config {
         if self.sign_required {
             s.push_str("\n[commit]\nsign_required = true\n");
         }
+        if self.ci_mode != CiConcurrency::default() {
+            let m = match self.ci_mode {
+                CiConcurrency::Parallel => "parallel",
+                CiConcurrency::Serial => "serial",
+            };
+            writeln!(s, "\n[ci]\nmode = {m:#?}").unwrap();
+        }
+        for (job, mode) in &self.ci_job_modes {
+            let m = match mode {
+                CiJobMode::Parallel => "parallel",
+                CiJobMode::Queue => "queue",
+                CiJobMode::Interrupt => "interrupt",
+            };
+            writeln!(s, "\n[ci.{job}]\nmode = {m:#?}").unwrap();
+        }
         fs_util::atomic_write(&gyt_dir.join("config.toml"), s.as_bytes())
     }
 }
@@ -167,6 +256,18 @@ fn merge_into(base: &mut Config, other: Config) {
     // Previously `sign_required` was a one-way `if other.sign_required
     // { true }`, so a repo could turn ON signing but never OFF.
     base.sign_required = other.sign_required;
+    // CI concurrency: the repo file (loaded second) wins on the global
+    // mode if it set one. We can't distinguish "explicitly set to the
+    // default" from "unset" for a non-Option enum, so the rule is: a
+    // repo whose [ci] mode differs from the default overrides; the
+    // common case (repo omits [ci]) leaves the global value intact.
+    if other.ci_mode != CiConcurrency::default() {
+        base.ci_mode = other.ci_mode;
+    }
+    // Per-job overrides union, with the repo file winning on collisions.
+    for (k, v) in other.ci_job_modes {
+        base.ci_job_modes.insert(k, v);
+    }
 }
 
 // TOML string quoting helper, used in tests only today. Exercised by
@@ -196,7 +297,7 @@ fn quote(s: &str) -> String {
 // refused at parse time — we'd rather an explicit error than let
 // a typo (e.g. `[Commit]` instead of `[commit]`) silently downgrade
 // a security setting like sign_required.
-const KNOWN_SECTIONS: &[&str] = &["user", "remote", "init", "commit"];
+const KNOWN_SECTIONS: &[&str] = &["user", "remote", "init", "commit", "ci"];
 
 /// Tiny TOML subset parser.
 /// Supports: `[section]`, `[section.subsection]` (one level deep, used for remote.NAME),
@@ -312,6 +413,53 @@ pub fn parse(bytes: &[u8]) -> Result<Config> {
                 _ => {
                     return Err(GytError::Parse(format!(
                         "config.toml line {}: unknown key {raw_key} in [remote.{name}]",
+                        lineno + 1
+                    )));
+                }
+            },
+            [s] if s == "ci" => match key.as_str() {
+                "mode" => {
+                    cfg.ci_mode = match raw_value.to_ascii_lowercase().as_str() {
+                        "parallel" => CiConcurrency::Parallel,
+                        "serial" | "queue" | "queued" => CiConcurrency::Serial,
+                        other => {
+                            return Err(GytError::Parse(format!(
+                                "config.toml line {}: [ci] mode must be \
+                                 \"parallel\" or \"serial\", got {other:?}",
+                                lineno + 1
+                            )));
+                        }
+                    };
+                }
+                _ => {
+                    return Err(GytError::Parse(format!(
+                        "config.toml line {}: unknown key {raw_key} in [ci] \
+                         (known: mode)",
+                        lineno + 1
+                    )));
+                }
+            },
+            [s, job] if s == "ci" => match key.as_str() {
+                "mode" => {
+                    let m = match raw_value.to_ascii_lowercase().as_str() {
+                        "parallel" => CiJobMode::Parallel,
+                        "queue" | "queued" | "serial" => CiJobMode::Queue,
+                        "interrupt" | "preempt" => CiJobMode::Interrupt,
+                        other => {
+                            return Err(GytError::Parse(format!(
+                                "config.toml line {}: [ci.{job}] mode must be \
+                                 \"interrupt\", \"queue\", or \"parallel\", \
+                                 got {other:?}",
+                                lineno + 1
+                            )));
+                        }
+                    };
+                    cfg.ci_job_modes.insert(job.clone(), m);
+                }
+                _ => {
+                    return Err(GytError::Parse(format!(
+                        "config.toml line {}: unknown key {raw_key} in \
+                         [ci.{job}] (known: mode)",
                         lineno + 1
                     )));
                 }
@@ -544,6 +692,85 @@ email = "b@x"
         let toml = "[commit]\nSign_Required = true\n";
         let cfg = parse(toml.as_bytes()).unwrap();
         assert!(cfg.sign_required);
+    }
+
+    #[test]
+    fn ci_global_mode_parses_and_defaults() {
+        // Default: no [ci] section → Parallel, all jobs default to Parallel.
+        let cfg = parse(b"").unwrap();
+        assert_eq!(cfg.ci_mode, CiConcurrency::Parallel);
+        assert_eq!(cfg.effective_ci_job_mode("anything"), CiJobMode::Parallel);
+
+        // Serial → every job defaults to Queue and shares the "all" domain.
+        let cfg = parse(b"[ci]\nmode = \"serial\"\n").unwrap();
+        assert_eq!(cfg.ci_mode, CiConcurrency::Serial);
+        assert_eq!(cfg.effective_ci_job_mode("build"), CiJobMode::Queue);
+        assert_eq!(cfg.ci_domain_key("build"), "all");
+        assert_eq!(cfg.ci_domain_key("test"), "all");
+    }
+
+    #[test]
+    fn ci_per_job_mode_overrides_global() {
+        let toml = "[ci]\nmode = \"serial\"\n\
+                    [ci.lint]\nmode = \"parallel\"\n\
+                    [ci.deploy]\nmode = \"interrupt\"\n";
+        let cfg = parse(toml.as_bytes()).unwrap();
+        // Global serial → unlisted jobs queue.
+        assert_eq!(cfg.effective_ci_job_mode("build"), CiJobMode::Queue);
+        // Per-job overrides win.
+        assert_eq!(cfg.effective_ci_job_mode("lint"), CiJobMode::Parallel);
+        assert_eq!(cfg.effective_ci_job_mode("deploy"), CiJobMode::Interrupt);
+        // Job-name lookup is case-insensitive (sections are lowercased).
+        assert_eq!(cfg.effective_ci_job_mode("Lint"), CiJobMode::Parallel);
+    }
+
+    #[test]
+    fn ci_under_parallel_global_per_job_queue_is_per_job_domain() {
+        let toml = "[ci.build]\nmode = \"queue\"\n";
+        let cfg = parse(toml.as_bytes()).unwrap();
+        assert_eq!(cfg.ci_mode, CiConcurrency::Parallel);
+        // Default jobs run parallel; the overridden one queues, scoped to
+        // its own per-job domain (distinct jobs never contend).
+        assert_eq!(cfg.effective_ci_job_mode("test"), CiJobMode::Parallel);
+        assert_eq!(cfg.effective_ci_job_mode("build"), CiJobMode::Queue);
+        assert_eq!(cfg.ci_domain_key("build"), "build");
+        assert_eq!(cfg.ci_domain_key("test"), "test");
+    }
+
+    #[test]
+    fn ci_invalid_modes_rejected() {
+        assert!(parse(b"[ci]\nmode = \"bogus\"\n").is_err());
+        assert!(parse(b"[ci.x]\nmode = \"bogus\"\n").is_err());
+        assert!(parse(b"[ci]\nunknown = \"x\"\n").is_err());
+    }
+
+    #[test]
+    #[expect(
+        clippy::field_reassign_with_default,
+        reason = "building the test fixture by mutating two fields of the default is clearer than a full literal"
+    )]
+    fn ci_config_round_trips_through_write() {
+        let mut cfg = Config::default();
+        cfg.ci_mode = CiConcurrency::Serial;
+        cfg.ci_job_modes
+            .insert("lint".to_string(), CiJobMode::Parallel);
+        cfg.ci_job_modes
+            .insert("deploy".to_string(), CiJobMode::Interrupt);
+        let dir = std::env::temp_dir().join(format!(
+            "gyt-cfg-ci-rt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        cfg.write(&dir).unwrap();
+        let back = parse(&fs_util::read_all(&dir.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(back.ci_mode, CiConcurrency::Serial);
+        assert_eq!(back.effective_ci_job_mode("lint"), CiJobMode::Parallel);
+        assert_eq!(back.effective_ci_job_mode("deploy"), CiJobMode::Interrupt);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

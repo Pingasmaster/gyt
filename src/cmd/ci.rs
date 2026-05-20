@@ -7,7 +7,7 @@
 // shared state. The wasmtime sandbox in `crate::ci_wasm` is the supported
 // execution path.
 
-use crate::ci_wasm::{CiPolicy, collect_wasm_scripts, run_ci_wasm_with_policy};
+use crate::ci_wasm::{CiPolicy, CiSlot, collect_wasm_scripts, run_ci_wasm_watched};
 use crate::cmd::{ci_env, ci_secret};
 use crate::errors::{GytError, Result};
 use std::path::PathBuf;
@@ -192,10 +192,39 @@ pub fn run(args: &[String]) -> Result<()> {
 
     println!("Running {} WASM CI scripts...", wasms.len());
     print_policy_summary(&policy);
+
+    // Per-job concurrency control, driven by `.gyt/config.toml` (local /
+    // operator-controlled, NOT part of a clone, so a malicious repo
+    // cannot flip it). The global `[ci] mode` picks the default and the
+    // contention domain (per-job vs one shared "all" domain); a
+    // `[ci.<job>] mode` override sets a specific job to interrupt /
+    // queue / parallel. CiSlot::enter blocks (queue), preempts
+    // (interrupt), or is inert (parallel) accordingly.
+    let cfg = crate::config::Config::load(&crate::repo::Repo::open(&cwd)?)?;
+
     for (idx, wasm) in wasms.iter().enumerate() {
         let name = wasm.file_name().unwrap().to_string_lossy();
-        println!("\n  [{}/{}] {name}", idx + 1, wasms.len());
-        match run_ci_wasm_with_policy(wasm, &cwd, &out, &policy) {
+        let job = wasm
+            .file_stem()
+            .map_or_else(|| name.clone().into_owned(), |s| s.to_string_lossy().into_owned());
+        let mode = cfg.effective_ci_job_mode(&job);
+        let domain = cfg.ci_domain_key(&job);
+        println!(
+            "\n  [{}/{}] {name} ({})",
+            idx + 1,
+            wasms.len(),
+            ci_mode_label(mode)
+        );
+
+        // Enter the concurrency domain. This may block (queue mode) or
+        // preempt the in-progress holder (interrupt mode) before we run.
+        let slot = CiSlot::enter(&gyt_dir, &domain, mode)?;
+        let watch = slot.watch();
+        let res = run_ci_wasm_watched(wasm, &cwd, &out, &policy, watch.as_ref());
+        // Release the slot before reporting so the domain is free the
+        // moment this job finishes.
+        drop(slot);
+        match res {
             Ok(()) => println!("  PASS"),
             Err(e) => {
                 println!("  FAIL: {e}");
@@ -205,6 +234,14 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     println!("\nAll WASM CI steps PASSED");
     Ok(())
+}
+
+const fn ci_mode_label(mode: crate::config::CiJobMode) -> &'static str {
+    match mode {
+        crate::config::CiJobMode::Parallel => "parallel",
+        crate::config::CiJobMode::Queue => "queue",
+        crate::config::CiJobMode::Interrupt => "interrupt",
+    }
 }
 
 #[expect(

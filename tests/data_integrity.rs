@@ -239,10 +239,9 @@ impl Env {
                     attempt + 1
                 );
             }
+            // Timed out without the child exiting (rare): kill it and
+            // let the loop retry with a fresh port.
             let _ = child.kill();
-            if attempt < 2 {
-                continue;
-            }
         }
         panic!("server didn't start within 5s after 3 retries");
     }

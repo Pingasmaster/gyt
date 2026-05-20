@@ -39,6 +39,10 @@ use std::path::{Path, PathBuf};
 const STASH_REF: &str = "refs/stash";
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     let (sub, rest) = args
         .split_first()
         .map_or(("push", &[][..]), |(s, r)| (s.as_str(), r));
@@ -52,6 +56,17 @@ pub fn run(args: &[String]) -> Result<()> {
             "stash: unknown subcommand {other:?} (expected push|list|pop|apply|drop)"
         ))),
     }
+}
+
+fn print_help() {
+    println!(
+        "gyt stash <push|list|pop|apply|drop> [args...]\n\n\
+         push [-m <msg>]   save the workdir + index as a stash commit at refs/stash\n\
+         list              list stash entries\n\
+         pop [<idx>]       apply and drop the stash at <idx> (default: 0, the most recent)\n\
+         apply [<idx>]     apply the stash at <idx> without dropping it\n\
+         drop [<idx>]      drop the stash at <idx> without applying"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -809,6 +824,8 @@ mod tests {
             remotes: Default::default(),
             create_default_gytignore: false,
             sign_required: false,
+            ci_mode: Default::default(),
+            ci_job_modes: Default::default(),
         };
         cfg.write(&repo.gyt_dir).unwrap();
     }

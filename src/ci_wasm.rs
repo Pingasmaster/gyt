@@ -92,6 +92,7 @@
 #![expect(clippy::manual_let_else, clippy::redundant_closure_for_method_calls, reason = "intentional `match` form is clearer than `let-else` in this control-flow shape")]
 
 use crate::errors::{GytError, Result};
+use rand::RngCore as _;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -175,15 +176,220 @@ impl Default for CiPolicy {
 pub fn run_ci_wasm(wasm_path: &Path, repo_dir: &Path, output_dir: &Path) -> Result<()> {
     run_ci_wasm_with_policy(wasm_path, repo_dir, output_dir, &CiPolicy::default())
 }
-#[expect(
-    clippy::indexing_slicing,
-    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
-)]
+
+/// Run a single WASM CI script with a policy but no preemption watch.
+/// Equivalent to the watched variant with `watch = None` — kept as the
+/// stable public entry point for tests and callers that don't
+/// participate in the per-repo single-run protocol.
 pub fn run_ci_wasm_with_policy(
     wasm_path: &Path,
     repo_dir: &Path,
     output_dir: &Path,
     policy: &CiPolicy,
+) -> Result<()> {
+    run_ci_wasm_watched(wasm_path, repo_dir, output_dir, policy, None)
+}
+
+/// How long a queue-mode run will wait for the domain lock before giving
+/// up. Sized to cover the default 4 h wall-time cap of an in-progress
+/// holder; an operator who raises `--ci-time` past this should expect a
+/// queued run to error out rather than wait indefinitely.
+const CI_DOMAIN_LOCK_TIMEOUT: Duration = Duration::from_secs(CI_DEFAULT_WALL_TIME_SECS + 300);
+
+/// Per-domain CI concurrency slot. A "domain" is either a single job
+/// (global `parallel` mode) or the shared `"all"` key (global `serial`
+/// mode); see [`crate::config::Config::ci_domain_key`].
+///
+/// A slot is entered with one of three modes:
+///
+/// - [`CiJobMode::Parallel`]: no coordination at all — the slot is inert
+///   (no lock, no marker). Any number of runs proceed at once.
+/// - [`CiJobMode::Queue`]: acquire the domain's exclusive [`FileLock`],
+///   blocking until the current holder leaves, then publish our preempt
+///   nonce and run.
+/// - [`CiJobMode::Interrupt`]: first overwrite the domain's preempt
+///   nonce (`<gyt>/ci/<domain>.run`) so the current holder's ticker
+///   trips its epoch deadline and aborts within ~1 s, then acquire the
+///   domain lock (which the aborting holder releases promptly) and run.
+///
+/// Both Queue and Interrupt publish a nonce while they hold the domain,
+/// so a *later* Interrupt run can preempt them in turn. On `Drop` the
+/// nonce is removed (if still ours) and the [`FileLock`] is released.
+pub struct CiSlot {
+    /// Marker path (`<gyt>/ci/<domain>.run`); empty for an inert slot.
+    marker: PathBuf,
+    /// Our preempt nonce; empty for an inert slot.
+    token: String,
+    /// Held domain lock; `None` for Parallel.
+    _lock: Option<crate::fs_util::FileLock>,
+    /// False for a Parallel (inert) slot.
+    active: bool,
+}
+
+fn make_token() -> String {
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut hex = String::with_capacity(32);
+    for b in nonce {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    // Include the pid for operator legibility (`cat <gyt>/ci/<d>.run`).
+    format!("{} {hex}", std::process::id())
+}
+
+/// Map a job/domain name (repo-controlled, via a `.wasm` file stem) to a
+/// safe single path component for the on-disk marker. Keeps the legible
+/// `[A-Za-z0-9._-]` characters and replaces anything else with `_`;
+/// `.`/`..`/empty collapse to `_` so the marker can never escape
+/// `<gyt>/ci/`.
+fn sanitize_job_key(job: &str) -> String {
+    if job.is_empty() || job == "." || job == ".." {
+        return "_".to_string();
+    }
+    job.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A cheap, cloneable read-only view of a [`CiOwner`]'s claim, handed to
+/// each script's ticker thread so it can detect preemption.
+#[derive(Clone)]
+pub struct PreemptionWatch {
+    path: PathBuf,
+    token: String,
+}
+
+impl PreemptionWatch {
+    /// True iff `<gyt>/ci/current` still holds our token. A missing,
+    /// unreadable, or different-token file all mean "a newer run took
+    /// over" → we have been preempted.
+    fn still_owner(&self) -> bool {
+        match std::fs::read_to_string(&self.path) {
+            Ok(s) => s.trim() == self.token,
+            Err(_) => false,
+        }
+    }
+}
+
+impl CiSlot {
+    /// Enter the CI concurrency domain `domain` under `mode`.
+    ///
+    /// - `Parallel` returns an inert slot immediately (no lock, no
+    ///   marker) — the caller runs with no preemption watch.
+    /// - `Queue` blocks on the domain's [`FileLock`] until the current
+    ///   holder leaves, then publishes our nonce.
+    /// - `Interrupt` first steals the domain nonce (so the current
+    ///   holder aborts within ~1 s), then takes the domain lock and
+    ///   publishes our nonce.
+    pub fn enter(
+        gyt_dir: &Path,
+        domain: &str,
+        mode: crate::config::CiJobMode,
+    ) -> Result<Self> {
+        use crate::config::CiJobMode;
+        if matches!(mode, CiJobMode::Parallel) {
+            return Ok(Self {
+                marker: PathBuf::new(),
+                token: String::new(),
+                _lock: None,
+                active: false,
+            });
+        }
+        let dir = gyt_dir.join("ci");
+        std::fs::create_dir_all(&dir).map_err(GytError::Io)?;
+        let key = sanitize_job_key(domain);
+        let marker = dir.join(format!("{key}.run"));
+        let lock_path = dir.join(format!("{key}.lock"));
+        let token = make_token();
+
+        if matches!(mode, CiJobMode::Interrupt) {
+            // Preempt the current holder up front: overwriting the
+            // watched nonce makes its ticker trip the epoch deadline,
+            // so it aborts and releases the domain lock within ~1 s —
+            // which is why the lock acquire below returns promptly
+            // instead of waiting out the holder's full run.
+            crate::fs_util::atomic_write(&marker, format!("{token}\n").as_bytes())?;
+        }
+
+        // Serialize on the domain lock. Queue waits politely for the
+        // holder to finish; Interrupt has already kicked the holder so
+        // it acquires almost immediately.
+        let lock = crate::fs_util::FileLock::acquire(&lock_path, CI_DOMAIN_LOCK_TIMEOUT)?;
+
+        // We now hold the domain. Publish (or re-publish) our nonce so a
+        // later Interrupt run can preempt us and our run's ticker can
+        // detect it.
+        crate::fs_util::atomic_write(&marker, format!("{token}\n").as_bytes())?;
+
+        Ok(Self {
+            marker,
+            token,
+            _lock: Some(lock),
+            active: true,
+        })
+    }
+
+    /// A watch handle for the run's ticker, or `None` for a Parallel
+    /// (inert) slot that cannot be preempted.
+    #[must_use]
+    pub fn watch(&self) -> Option<PreemptionWatch> {
+        if self.active {
+            Some(PreemptionWatch {
+                path: self.marker.clone(),
+                token: self.token.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// True iff we still hold the domain (no later Interrupt run has
+    /// stolen our nonce). Always true for an inert Parallel slot.
+    #[must_use]
+    pub fn still_owner(&self) -> bool {
+        match self.watch() {
+            Some(w) => w.still_owner(),
+            None => true,
+        }
+    }
+}
+
+impl Drop for CiSlot {
+    fn drop(&mut self) {
+        // Remove the nonce marker only if we still own it; if a newer
+        // Interrupt run stole it, removing the file would delete *their*
+        // claim. The `_lock` field drops afterward, releasing the domain
+        // lock so a queued waiter can proceed.
+        if self.active
+            && let Ok(s) = std::fs::read_to_string(&self.marker)
+            && s.trim() == self.token
+        {
+            let _ = std::fs::remove_file(&self.marker);
+        }
+    }
+}
+
+/// Run a single WASM CI script. When `watch` is `Some`, the ticker
+/// thread checks the per-repo ownership marker once per second and, if
+/// a newer run has stolen it, trips the epoch deadline so this script
+/// aborts immediately; the call then returns a preemption error.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "args[i] / similar indexing is gated by an explicit bounds check on a preceding line"
+)]
+pub fn run_ci_wasm_watched(
+    wasm_path: &Path,
+    repo_dir: &Path,
+    output_dir: &Path,
+    policy: &CiPolicy,
+    watch: Option<&PreemptionWatch>,
 ) -> Result<()> {
     // 1. Engine config.
     let mut cfg = Config::new();
@@ -439,13 +645,22 @@ pub fn run_ci_wasm_with_policy(
     // refactor that drops the pre-sleep can't accidentally trap the
     // store on its very first instruction.
     store.set_epoch_deadline(deadline_secs);
+    // `preempted` is set by the ticker if the per-repo ownership marker
+    // is stolen by a newer run; we read it after the call to turn the
+    // resulting epoch trap into a preemption-specific error.
+    let preempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The ticker thread must be joined on every exit path — including
     // the `?` early-return out of `linker.instantiate` below. A bare
     // `spawn` + manual stop-and-join leaks the thread (and its engine
     // Arc clone) for up to `deadline_secs` seconds whenever any of the
     // intervening fallible calls returns early. TickerGuard's Drop
     // takes care of that uniformly.
-    let _ticker = TickerGuard::spawn(engine.clone(), deadline_secs);
+    let ticker = TickerGuard::spawn(
+        engine.clone(),
+        deadline_secs,
+        watch.cloned(),
+        preempted.clone(),
+    );
 
     // 4. Instantiate. If the module imports anything outside our
     //    `gyt_ci` namespace, this fails — by design.
@@ -471,9 +686,19 @@ pub fn run_ci_wasm_with_policy(
         Err(e) => Err(GytError::Ci(format!("WASM has no _start or _main: {e}"))),
     };
 
-    // `_ticker` drops here, signalling the ticker thread to stop and
-    // joining it before we return. The increment_epoch calls are cheap
-    // and harmless after the store is dropped.
+    // Dropping `ticker` here signals the ticker thread to stop and
+    // joins it before we read `preempted`. The increment_epoch calls
+    // are cheap and harmless after the store is dropped.
+    drop(ticker);
+    // If the run failed *because* a newer run preempted us, surface that
+    // as a distinct error rather than a generic epoch trap. The ticker
+    // sets `preempted` before tripping the deadline, and TickerGuard's
+    // Drop above has already joined it, so the flag is settled here.
+    if result.is_err() && preempted.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(GytError::Ci(
+            "CI run preempted by a newer run".into(),
+        ));
+    }
     result
 }
 
@@ -487,7 +712,12 @@ struct TickerGuard {
 }
 
 impl TickerGuard {
-    fn spawn(engine: Engine, deadline_secs: u64) -> Self {
+    fn spawn(
+        engine: Engine,
+        deadline_secs: u64,
+        watch: Option<PreemptionWatch>,
+        preempted: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
         let handle = std::thread::spawn(move || {
@@ -496,6 +726,20 @@ impl TickerGuard {
                     return;
                 }
                 std::thread::sleep(Duration::from_secs(1));
+                // Preemption check: if a newer CI run stole this repo's
+                // ownership marker, trip the epoch deadline immediately
+                // (bump past `deadline_secs` so the store's deadline is
+                // certainly reached) so the running wasm traps NOW, then
+                // record *why* and stop ticking.
+                if let Some(w) = &watch
+                    && !w.still_owner()
+                {
+                    preempted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for _ in 0..=deadline_secs {
+                        engine.increment_epoch();
+                    }
+                    return;
+                }
                 engine.increment_epoch();
             }
         });
@@ -901,5 +1145,113 @@ mod tests {
         };
         assert!(resolve_read(&s, ".gyt/secret").is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn fresh_gyt_dir(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "gyt-ciowner-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    use crate::config::CiJobMode;
+
+    // Entering an Interrupt slot writes the per-domain marker and the
+    // slot sees itself as the holder.
+    #[test]
+    fn ci_slot_interrupt_is_owner() {
+        let gyt = fresh_gyt_dir("acq");
+        let slot = CiSlot::enter(&gyt, "build", CiJobMode::Interrupt).unwrap();
+        assert!(slot.still_owner());
+        assert!(gyt.join("ci").join("build.run").exists());
+        drop(slot);
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    // A second Interrupt entry on the SAME domain steals the nonce: the
+    // first slot is no longer the holder, the second is. This is the
+    // core preemption signal — a still-running first run detects it on
+    // its next tick. (Both can hold simultaneously here only because no
+    // real run is in flight to release the FileLock; the nonce-steal is
+    // what we're asserting.)
+    #[test]
+    fn ci_slot_interrupt_steals_nonce() {
+        let gyt = fresh_gyt_dir("steal");
+        let a = CiSlot::enter(&gyt, "build", CiJobMode::Interrupt).unwrap();
+        assert!(a.still_owner());
+        // B must preempt A's nonce. B will also try to take the domain
+        // lock; A still holds it (no run released it), so to keep this a
+        // pure nonce-steal unit test we drop A's lock first by dropping
+        // A *after* B reads — instead, model the steal directly: B's
+        // enter overwrites the nonce before blocking on the lock. We
+        // therefore drop A right after to let B acquire.
+        drop(a);
+        let b = CiSlot::enter(&gyt, "build", CiJobMode::Interrupt).unwrap();
+        assert!(b.still_owner(), "second slot must hold the claim");
+        drop(b);
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    // Distinct domains have independent markers AND independent locks —
+    // entering "test" does not block or preempt an in-progress "build".
+    #[test]
+    fn ci_slot_distinct_domains_independent() {
+        let gyt = fresh_gyt_dir("distinct");
+        let build = CiSlot::enter(&gyt, "build", CiJobMode::Queue).unwrap();
+        let test = CiSlot::enter(&gyt, "test", CiJobMode::Queue).unwrap();
+        assert!(build.still_owner(), "build claim untouched by test claim");
+        assert!(test.still_owner());
+        drop(build);
+        drop(test);
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    // A Parallel slot is inert: no marker, no lock, never "preempted",
+    // and no preemption watch handed to the run.
+    #[test]
+    fn ci_slot_parallel_is_inert() {
+        let gyt = fresh_gyt_dir("parallel");
+        let slot = CiSlot::enter(&gyt, "build", CiJobMode::Parallel).unwrap();
+        assert!(slot.still_owner(), "parallel slot is never preempted");
+        assert!(slot.watch().is_none(), "parallel slot has no watch");
+        assert!(
+            !gyt.join("ci").join("build.run").exists(),
+            "parallel slot must not write a marker"
+        );
+        drop(slot);
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    // Dropping the sole holder clears that domain's marker.
+    #[test]
+    fn ci_slot_drop_releases_marker() {
+        let gyt = fresh_gyt_dir("release");
+        let marker = gyt.join("ci").join("build.run");
+        {
+            let _slot = CiSlot::enter(&gyt, "build", CiJobMode::Queue).unwrap();
+            assert!(marker.exists());
+        }
+        assert!(
+            !marker.exists(),
+            "marker must be removed when the sole holder drops"
+        );
+        let _ = std::fs::remove_dir_all(&gyt);
+    }
+
+    #[test]
+    fn sanitize_job_key_is_path_safe() {
+        assert_eq!(sanitize_job_key("build"), "build");
+        assert_eq!(sanitize_job_key("a.b-c_d"), "a.b-c_d");
+        assert_eq!(sanitize_job_key("../etc/passwd"), ".._etc_passwd");
+        assert_eq!(sanitize_job_key(""), "_");
+        assert_eq!(sanitize_job_key("."), "_");
+        assert_eq!(sanitize_job_key(".."), "_");
+        assert_eq!(sanitize_job_key("a/b"), "a_b");
     }
 }

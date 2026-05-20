@@ -17,7 +17,7 @@
 // existing fast-forward gate on refs/heads/* is what enforces merge
 // safety on the wire.
 
-use crate::ci_wasm::{collect_wasm_scripts, run_ci_wasm};
+use crate::ci_wasm::{CiPolicy, collect_wasm_scripts, run_ci_wasm_watched};
 use crate::cmd::merge as merge_cmd;
 use crate::config::Config;
 use crate::errors::{GytError, Result};
@@ -647,10 +647,25 @@ fn cmd_ci_run(args: &[String]) -> Result<()> {
             "pr #{n}: no .wasm scripts in .gyt-ci/"
         )));
     }
+    // Per-job concurrency control, same model as `gyt ci`: the global
+    // `[ci] mode` plus per-job `[ci.<job>] mode` overrides in
+    // .gyt/config.toml decide whether each job runs in parallel, queues
+    // behind an in-progress run, or interrupts it. CiSlot::enter
+    // realizes that (block / preempt / inert).
+    let cfg = crate::config::Config::load(&repo)?;
     let mut result = String::from("pass");
     for w in &wasms {
-        if let Err(e) = run_ci_wasm(w, &repo.workdir, &out_dir) {
-            let name = w.file_name().unwrap().to_string_lossy();
+        let name = w.file_name().unwrap().to_string_lossy();
+        let job = w
+            .file_stem()
+            .map_or_else(|| name.clone().into_owned(), |s| s.to_string_lossy().into_owned());
+        let mode = cfg.effective_ci_job_mode(&job);
+        let domain = cfg.ci_domain_key(&job);
+        let slot = crate::ci_wasm::CiSlot::enter(&repo.gyt_dir, &domain, mode)?;
+        let watch = slot.watch();
+        let res = run_ci_wasm_watched(w, &repo.workdir, &out_dir, &CiPolicy::default(), watch.as_ref());
+        drop(slot);
+        if let Err(e) = res {
             result = format!("fail: {name}: {e}");
             break;
         }
